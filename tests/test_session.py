@@ -58,3 +58,20 @@ async def test_active_query_guards_state_and_interrupts(session):
     await session.interrupt()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_resume_reads_current_records_and_reuses_session_probe_folder(session):
+    session.workspace.log_transcript("user", text="original investigation")
+    session.workspace.log_transcript("meta", sdk_session_id="sdk-session")
+    session.workspace.start_probe("print(3)", "3", "test")
+    session.workspace.notes.add_evidence("Value = 3.", ["source"])
+    session.reset_client_session()
+    session.workspace.notes.strike_evidence("E001")
+    resumed = session.resume_session("S001")
+    assert resumed["id"] == "S001"
+    assert session.workspace.start_probe("print(4)", "4", "test").name == "P002"
+    with patch("xprober.session.ClaudeSDKClient", FakeClient):
+        await session.query("continue")
+    assert "<del>" in FakeClient.prompts[-1]
+    assert "Value = 3." in FakeClient.prompts[-1]

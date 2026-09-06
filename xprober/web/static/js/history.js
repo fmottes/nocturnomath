@@ -121,6 +121,10 @@ export function clearChat() {
 export function replaySession(records, contextRestored, carryChatContext) {
   clearChat();
 
+  const outcomes = new Set(records.filter((rec) =>
+    rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));
+  const starts = new Map(records.filter((rec) => rec.kind === "probe_started")
+    .map((rec) => [rec.probe_id, rec]));
   records.forEach((rec) => {
     switch (rec.kind) {
       case "user":
@@ -132,12 +136,26 @@ export function replaySession(records, contextRestored, carryChatContext) {
         finalizeAssistantTurn();
         break;
 
+      case "probe_started":
+        if (!outcomes.has(rec.probe_id)) {
+          appendProbeFinish(rec.expected, rec.code,
+            `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], []);
+        }
+        break;
+
+      case "probe_failed": {
+        const start = starts.get(rec.probe_id) || {};
+        appendProbeFinish(start.expected || "", start.code || "",
+          `${rec.probe_id}: failed. ${rec.text || ""}`, [], []);
+        break;
+      }
+
       case "run":
         appendProbeFinish(
           rec.expected || "",
           rec.code || "",
-          rec.output || "",
-          (rec.images || []).map((name) => `/figures/${name}`),
+          [rec.probe_id, rec.output, rec.execution_note, rec.status].filter(Boolean).join("\n"),
+          (rec.images || []).map((name) => `/api/asset?path=${encodeURIComponent(name)}`),
           []
         );
         break;
@@ -146,8 +164,10 @@ export function replaySession(records, contextRestored, carryChatContext) {
         appendProbeVerdict(rec.text || "");
         break;
 
-      case "note":
-        appendNoteNotification(rec.note_kind || "fact", rec.text || "");
+      case "evidence":
+      case "thought":
+      case "evidence_struck":
+        appendNoteNotification(rec.kind, `${rec.entry_id}: ${rec.text || ""}`);
         break;
 
       default:
@@ -158,7 +178,7 @@ export function replaySession(records, contextRestored, carryChatContext) {
   let resumeNote;
   if (!carryChatContext) {
     resumeNote =
-      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `xprober/notes/notes.md` — it does not read the conversation above.";
+      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `evidence.md` and `thoughts.md` — it does not read the conversation above.";
   } else if (contextRestored) {
     resumeNote =
       "Resumed this chat. The agent still has its original context; the kernel keeps whatever state it holds now.";

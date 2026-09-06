@@ -59,10 +59,13 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             opened = client.post("/api/workspace", json={"path": str(workspace)})
             assert opened.status_code == 200
             assert opened.json()["workspace"]["is_open"] is True
-            assert opened.json()["workspace"]["notes_path"] == "xprober/notes/notes.md"
-            assert (workspace / "xprober" / "notes" / "notes.md").is_file()
-            assert (workspace / "xprober" / "transcripts").is_dir()
-            assert (workspace / "xprober" / "figures").is_dir()
+            assert (
+                opened.json()["workspace"]["evidence_path"]
+                == "xprober/notes/evidence.md"
+            )
+            assert (workspace / "xprober" / "notes" / "evidence.md").is_file()
+            assert (workspace / "xprober" / "sessions" / "S001").is_dir()
+            assert (workspace / "xprober" / "notes").is_dir()
             assert (workspace / "xprober" / "scratch").is_dir()
 
 
@@ -82,7 +85,8 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
     report_figures = tmp_path / "report-figures"
     report_figures.mkdir()
     (report_figures / "embedded.png").write_bytes(b"embedded-figure")
-    [figure_name] = session.workspace.save_plots([b"png-data"])
+    probe = session.workspace.start_probe("plot()", "a plot", "test")
+    session.workspace.finish_probe(probe, "", [b"png-data"], "completed", None)
     app = create_app(session)
     with TestClient(app) as client:
         workspace = client.get("/api/workspace")
@@ -98,13 +102,21 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         assert static_script.headers["cache-control"] == "no-store"
         assert client.get("/static/css/base.css").status_code == 200
         plots = client.get("/api/plots").json()["plots"]
-        assert plots[0]["url"] == f"/figures/{figure_name}"
+        assert (
+            plots[0]["url"]
+            == "/api/asset?path=xprober/sessions/S001/probes/P001/plot-1.png"
+        )
         assert client.get(plots[0]["url"]).content == b"png-data"
         assert (
-            client.get("/api/asset", params={"path": "report-figures/embedded.png"}).content
+            client.get(
+                "/api/asset", params={"path": "report-figures/embedded.png"}
+            ).content
             == b"embedded-figure"
         )
-        assert client.get("/api/asset", params={"path": "../outside.png"}).status_code == 403
+        assert (
+            client.get("/api/asset", params={"path": "../outside.png"}).status_code
+            == 403
+        )
 
 
 def test_websocket_event_contract(session):
@@ -133,3 +145,37 @@ def test_busy_http_mutations_return_conflict(session):
             ).status_code
             == 409
         )
+
+
+def test_record_citations_resolve_to_saved_artifacts_and_entries(session):
+    import re
+
+    workspace = session.workspace
+    probe = workspace.start_probe("print(3)", "3", "test")
+    workspace.finish_probe(probe, "3\n", [b"png-data"], "completed", None)
+    sources = workspace.evidence_sources(
+        ["S001/P001/output.txt", "S001/P001/plot-1.png"]
+    )
+    workspace.notes.add_evidence("Value = 3.", sources)
+    workspace.notes.add_thought("[E001] supports a positive value.", [])
+    workspace.notes.add_thought(
+        "[T001] is valid only under the conditions of [E001].", ["T001"]
+    )
+    workspace.notes.strike_evidence("E001")
+    with TestClient(create_app(session)) as client:
+        for document in (workspace.notes.evidence_path, workspace.notes.thoughts_path):
+            for link in re.findall(r"\]\(([^)]+)\)", document.read_text()):
+                target, _, anchor = link.partition("#")
+                relative = (
+                    (document.parent / target).resolve().relative_to(workspace.path)
+                )
+                response = client.get("/api/asset", params={"path": str(relative)})
+                assert response.status_code == 200
+                if anchor:
+                    assert f'id="{anchor}"' in response.text
+        with client.websocket_connect("/ws") as websocket:
+            init = websocket.receive_json()
+            assert init["workspace"]["thoughts_path"] == "xprober/notes/thoughts.md"
+            websocket.send_json({"action": "query", "text": "/notes"})
+            text = websocket.receive_json()["text"]
+            assert "# Evidence" in text and "# Thoughts" in text and "<del>" in text

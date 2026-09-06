@@ -202,7 +202,7 @@ export function appendNoteNotification(kind, text) {
 
   const badge = document.createElement("span");
   badge.className = "note-badge";
-  badge.textContent = kind === "fact" ? "Fact" : "Dead End";
+  badge.textContent = ({ evidence: "Evidence", thought: "Thought", evidence_struck: "Struck" })[kind] || kind;
 
   const content = document.createElement("span");
   content.textContent = text;

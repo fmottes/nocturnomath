@@ -29,10 +29,10 @@ function handleServerEvent(event) {
       loadPlots();
       break;
 
-    case "note_added":
-      appendNoteNotification(event.kind, event.text);
-      if (state.autoSync && state.activeDoc === state.workspace?.notes_path) {
-        loadDocument(state.workspace.notes_path);
+    case "record_changed":
+      appendNoteNotification(event.kind, `${event.entry_id}: ${event.text}`);
+      if (state.autoSync && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)) {
+        loadDocument(state.activeDoc);
       }
       break;
 
@@ -67,7 +67,7 @@ function handleServerEvent(event) {
       appendSystemMessage(
         state.carryChatContext
           ? "Keeping context from here on. The agent sees this conversation as it grows; earlier messages are not recovered."
-          : "Discarding context. Every message starts fresh from the system prompt plus `xprober/notes/notes.md`."
+          : "Discarding context. Every message starts fresh from the system prompt plus `evidence.md` and `thoughts.md`."
       );
       break;
 

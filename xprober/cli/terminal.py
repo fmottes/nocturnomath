@@ -25,8 +25,8 @@ async def render_event(event_type: str, event: dict[str, Any]):
         print(f"\n  [run] expected: {event['expected']}")
     elif event_type == "probe_finish":
         print("\n" + event["output"])
-    elif event_type == "note_added":
-        print(f"  [note] {event['kind']}: {event['text']}")
+    elif event_type == "record_changed":
+        print(f"  [{event['entry_id']}] {event['kind']}: {event['text']}")
     elif event_type == "probe_verdict":
         print(f"  [verdict] {event['text']}")
     elif event_type == "kernel_restarted":
@@ -75,7 +75,7 @@ async def run_terminal(args: argparse.Namespace):
             if line == "/exit":
                 return
             if line == "/notes":
-                print(session.notes_path.read_text())
+                print(session.workspace.notes.read())
                 continue
             if line == "/restart":
                 session.kernel.restart()

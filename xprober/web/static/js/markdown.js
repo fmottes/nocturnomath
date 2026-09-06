@@ -15,6 +15,13 @@ export function renderMarkdown(markdown) {
     return `<pre><code class="language-${lang}">${code}</code></pre>`;
   });
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // Keep scientific record anchors, strikes, and citations usable without the CDN renderer.
+  html = html.replace(/&lt;a id="([ET]\d+)"&gt;&lt;\/a&gt;/g, '<a id="$1"></a>');
+  html = html.replace(/&lt;(\/?del)&gt;/g, "<$1>");
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, target) => {
+    if (/^(?:javascript|data|vbscript):/i.test(target.trim())) return label;
+    return `<a href="${target.replace(/"/g, "&quot;")}">${label}</a>`;
+  });
   html = html.replace(/^### (.*$)/gim, "<h3>$1</h3>");
   html = html.replace(/^## (.*$)/gim, "<h2>$1</h2>");
   html = html.replace(/^# (.*$)/gim, "<h1>$1</h1>");

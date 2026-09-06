@@ -4,6 +4,7 @@ import ast
 import asyncio
 import base64
 import re
+import threading
 from typing import TYPE_CHECKING
 
 from claude_agent_sdk import tool
@@ -38,7 +39,7 @@ def builds_machinery(code: str) -> bool:
 
 
 def build_tools(session: "ExplorationSession"):
-    """Create the four SDK tools that operate on a session."""
+    """Create the exploration and scientific record tools for a session."""
 
     @tool(
         "run",
@@ -105,17 +106,78 @@ def build_tools(session: "ExplorationSession"):
                 "Note: this is building machinery. Is there a flatter version that answers the question?"
             )
 
+        if session.kernel.busy or (
+            session._probe_task and not session._probe_task.done()
+        ):
+            return failure("A probe is still executing or saving its artifacts.")
+        workspace = session.workspace
+        transcript_path = session.transcript_path
+        probe_path = workspace.start_probe(code, expected, session.model)
+        source_id = f"{workspace.session_id}/{probe_path.name}"
+        session.log_transcript(
+            "probe_started", probe_id=source_id, expected=expected, code=code
+        )
+        cancelled = threading.Event()
+
+        def execute_and_save():
+            try:
+                text, images, kernel_note = session.kernel.execute(
+                    code, session.timeout_s
+                )
+            except Exception as exc:
+                workspace.finish_probe(probe_path, str(exc), [], "failed", str(exc))
+                workspace.log_transcript(
+                    "probe_failed",
+                    transcript_path=transcript_path,
+                    probe_id=source_id,
+                    text=str(exc),
+                )
+                raise
+            status = "completed"
+            if cancelled.is_set():
+                status = "interrupted"
+            elif session.kernel.errored:
+                status = "error"
+            elif kernel_note:
+                status = "incomplete"
+            workspace.finish_probe(probe_path, text, images, status, kernel_note)
+            paths = [
+                f"{probe_path.relative_to(workspace.path).as_posix()}/plot-{i}.png"
+                for i in range(1, len(images) + 1)
+            ]
+            workspace.log_transcript(
+                "run",
+                transcript_path=transcript_path,
+                probe_id=source_id,
+                expected=expected,
+                code=code,
+                output=text,
+                images=paths,
+                execution_note=kernel_note,
+                status=status,
+            )
+            return text, images, kernel_note, paths
+
         await session.emit(
             "probe_start",
+            probe_id=source_id,
             expected=expected,
             code=code,
             kernel_alive=session.kernel.is_alive(),
         )
-        text, images, kernel_note = await asyncio.to_thread(
-            session.kernel.execute, code, session.timeout_s
-        )
+        execution = asyncio.create_task(asyncio.to_thread(execute_and_save))
+        session._probe_task = execution
+        try:
+            text, images, kernel_note, plot_paths = await asyncio.shield(execution)
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Preserve the worker until its output is saved, even when its caller is cancelled.
+            try:
+                await asyncio.shield(execution)
+            except asyncio.CancelledError:
+                pass
+            raise
 
-        plot_paths = session.workspace.save_plots(images)
         encoded_images = [base64.b64encode(image).decode() for image in images]
         shown = images[: session.image_cap]
         if len(images) > session.image_cap:
@@ -132,34 +194,36 @@ def build_tools(session: "ExplorationSession"):
             session._results_since_note += 1
             if session._results_since_note == 1:
                 preface.append(
-                    "Note: this result is not recorded. If it settled something "
-                    "about the system, or ruled something out, call `note` now: "
+                    "Note: this result is saved, but has no evidence entry yet. If it settled something "
+                    "about the system, or ruled something out, call `evidence` with the saved source now: "
                     "one finding, one line."
                 )
             else:
                 preface.append(
                     f"Note: {session._results_since_note} probes have produced a "
-                    "result since the last `note`. Record them as separate `note` "
+                    "result since the last `evidence`. Record them as separate `evidence` "
                     "calls, one finding each; do not pack several findings into "
                     "one line. If one of them was not worth keeping, say so."
                 )
 
-        body = text.strip() or "(no text output)"
+        body = f"Probe {source_id}\nSource: {source_id}/output.txt\n" + (
+            text.strip() or "(no text output)"
+        )
         if plot_paths:
-            body += "\n\n" + "\n".join("saved: " + path for path in plot_paths)
+            body += "\n\n" + "\n".join(
+                f"Source: {source_id}/plot-{i}.png" for i in range(1, len(images) + 1)
+            )
         if kernel_note:
             body += "\n" + kernel_note
         output = "\n".join(preface) + "\n\n" + body if preface else body
 
-        session.log_transcript(
-            "run", expected=expected, code=code, output=output, images=plot_paths
-        )
         await session.emit(
             "probe_finish",
+            probe_id=source_id,
             expected=expected,
             code=code,
             output=output,
-            plot_urls=[f"/figures/{path}" for path in plot_paths],
+            plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
             plot_images=encoded_images,
         )
 
@@ -174,40 +238,84 @@ def build_tools(session: "ExplorationSession"):
             )
         return {"content": content}
 
-    @tool(
-        "note",
-        "Append one line to xprober/notes/notes.md. `kind` is 'fact' (something learned about the system) "
-        "or 'dead_end' (something tried that gave nothing).",
-        {"kind": str, "text": str},
-    )
-    async def note(args):
-        kind = args["kind"]
-        text = args.get("text", "").strip()
-        if kind not in ("fact", "dead_end"):
-            return {
-                "content": [
-                    {"type": "text", "text": "kind must be 'fact' or 'dead_end'."}
-                ],
-                "is_error": True,
-            }
-        if not text or "\n" in text or "\r" in text:
-            return {
-                "content": [
-                    {"type": "text", "text": "text must be one non-empty line."}
-                ],
-                "is_error": True,
-            }
+    def failure(message):
+        return {"content": [{"type": "text", "text": message}], "is_error": True}
 
-        heading = session.workspace.add_note(kind, text)
-        session._results_since_note = 0
-        session.log_transcript("note", note_kind=kind, text=text)
+    async def record_changed(kind, entry_id, text, **fields):
+        session.log_transcript(kind, entry_id=entry_id, text=text, **fields)
         await session.emit(
-            "note_added",
-            kind=kind,
-            text=text,
-            notes_content=session.notes_path.read_text(),
+            "record_changed", kind=kind, entry_id=entry_id, text=text, **fields
         )
-        return {"content": [{"type": "text", "text": f"Noted under {heading}."}]}
+        return {"content": [{"type": "text", "text": f"Recorded {entry_id}."}]}
+
+    @tool(
+        "evidence",
+        "Append a factual observation to xprober/notes/evidence.md. Maximum 250 characters "
+        "of plain text, with conditions; no interpretation or citations to entries. "
+        "sources is a list of saved artifacts such as S001/P001/output.txt or "
+        "S001/P001/plot-1.png returned by run. Returns a stable E ID.",
+        {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "sources": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["text", "sources"],
+        },
+    )
+    async def evidence(args):
+        try:
+            links = session.workspace.evidence_sources(args["sources"])
+            entry_id = session.workspace.notes.add_evidence(args["text"], links)
+        except (ValueError, FileNotFoundError) as exc:
+            return failure(str(exc))
+        session._results_since_note = 0
+        return await record_changed(
+            "evidence", entry_id, args["text"], sources=args["sources"]
+        )
+
+    @tool(
+        "thought",
+        "Append an interpretation, conjecture, explanation, or question to "
+        "xprober/notes/thoughts.md. Aim for one direct paragraph (80–150 words); equations "
+        "are welcome. Cite supporting entries as [E001] or [T001]; links are generated. "
+        "replaces lists old T IDs to strike in full, or [] for a new thought. A replacement "
+        "must explain the correction and retain any still-valid reasoning. Returns a stable T ID.",
+        {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "replaces": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["text", "replaces"],
+        },
+    )
+    async def thought(args):
+        try:
+            entry_id = session.workspace.notes.add_thought(
+                args["text"], args["replaces"]
+            )
+        except ValueError as exc:
+            return failure(str(exc))
+        return await record_changed(
+            "thought", entry_id, args["text"], replaces=args["replaces"]
+        )
+
+    @tool(
+        "strike_evidence",
+        "Strike an invalid evidence entry in full, preserving its text and sources. "
+        "No explanation or replacement link is added to evidence.md. Record a corrected "
+        "observation separately with evidence; explanations belong in thoughts.",
+        {"entry_id": str},
+    )
+    async def strike_evidence(args):
+        try:
+            session.workspace.notes.strike_evidence(args["entry_id"])
+        except ValueError as exc:
+            return failure(str(exc))
+        return await record_changed(
+            "evidence_struck", args["entry_id"], "Evidence struck as invalid."
+        )
 
     @tool(
         "verdict",
@@ -258,4 +366,4 @@ def build_tools(session: "ExplorationSession"):
             ]
         }
 
-    return [run, note, verdict, restart_kernel]
+    return [run, evidence, thought, strike_evidence, verdict, restart_kernel]

@@ -272,8 +272,8 @@
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
-.note-notification.fact .note-badge { color: var(--ok); }
-.note-notification.dead_end .note-badge { color: var(--warn); }
+.note-notification.evidence .note-badge { color: var(--ok); }
+.note-notification.evidence_struck .note-badge { color: var(--warn); }
 .note-notification span:last-child { color: var(--ink); }
 
 /* Composer */

@@ -44,6 +44,7 @@ class ExplorationSession:
         self._is_busy = False
         self._current_client: ClaudeSDKClient | None = None
         self._current_task: asyncio.Task | None = None
+        self._probe_task: asyncio.Task | None = None
         self._session_initialized = False
         self._results_since_note = 0
         self._pending_verdict: str | None = None
@@ -59,20 +60,15 @@ class ExplorationSession:
         return self.workspace.path
 
     @property
-    def notes_path(self) -> Path:
-        return self.workspace.notes_path
-
-    @property
-    def figures_path(self) -> Path:
-        return self.workspace.figures_path
-
-    @property
     def transcript_path(self) -> Path:
         return self.workspace.transcript_path
 
     def has_active_query(self) -> bool:
-        return self._is_busy or (
-            self._current_task is not None and not self._current_task.done()
+        return (
+            self._is_busy
+            or self.kernel.busy
+            or (self._probe_task is not None and not self._probe_task.done())
+            or (self._current_task is not None and not self._current_task.done())
         )
 
     def require_idle(self, action: str):
@@ -144,7 +140,7 @@ class ExplorationSession:
         self._results_since_note = 0
         self._pending_verdict = None
         if self.carry_chat_context:
-            self._session_initialized = sdk_id is not None
+            self._session_initialized = False
             self._resume_prefix = None if sdk_id else self.workspace.recap(records)
         else:
             self._session_initialized = False
@@ -153,7 +149,7 @@ class ExplorationSession:
         self.log_transcript("resumed")
         logger.info(f"Resumed chat {path.name}")
         return {
-            "id": path.name,
+            "id": path.parent.name,
             "records": records,
             "carry_chat_context": self.carry_chat_context,
             "context_restored": self.carry_chat_context and sdk_id is not None,
@@ -217,7 +213,8 @@ class ExplorationSession:
                 resume_prefix = self._resume_prefix
                 self._resume_prefix = None
                 if self.carry_chat_context and resume_prefix:
-                    prefix = resume_prefix
+                    prefix = self.opening_notes() + resume_prefix
+                    self._session_initialized = True
                 elif not self.carry_chat_context or not self._session_initialized:
                     prefix = self.opening_notes()
                     self._session_initialized = True

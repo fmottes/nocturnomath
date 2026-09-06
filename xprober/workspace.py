@@ -2,12 +2,12 @@
 
 import json
 import logging
+import re
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
-from .prompt import NOTES_TEMPLATE
+from .notes import ResearchNotes, write_text
 
 logger = logging.getLogger("xprober")
 
@@ -27,70 +27,138 @@ class Workspace:
         self.path.mkdir(parents=True, exist_ok=True)
         self.xprober_path = self.path / "xprober"
         self.notes_dir_path = self.xprober_path / "notes"
-        self.transcripts_path = self.xprober_path / "transcripts"
-        self.figures_path = self.xprober_path / "figures"
+        self.sessions_path = self.xprober_path / "sessions"
         self.scratch_path = self.xprober_path / "scratch"
         for directory in (
             self.notes_dir_path,
-            self.transcripts_path,
-            self.figures_path,
+            self.sessions_path,
             self.scratch_path,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-        self.notes_path = self.notes_dir_path / "notes.md"
-        if not self.notes_path.exists():
-            self.notes_path.write_text(NOTES_TEMPLATE)
+        self.notes = ResearchNotes(self.notes_dir_path)
         self.start_new_transcript()
 
     def start_new_transcript(self):
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        self.transcript_path = (
-            self.transcripts_path
-            / f"transcript-{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
-        )
+        numbers = [
+            int(path.name[1:])
+            for path in self.sessions_path.iterdir()
+            if re.fullmatch(r"S\d+", path.name)
+        ]
+        number = max(numbers, default=0) + 1
+        while True:
+            path = self.sessions_path / f"S{number:03d}"
+            try:
+                path.mkdir()
+                break
+            except FileExistsError:
+                number += 1
+        self.transcript_path = path / "transcript.jsonl"
+        self.probes_path.mkdir()
 
-    def log_transcript(self, kind: str, **fields):
-        record = {"t": time.strftime("%H:%M:%S"), "kind": kind, **fields}
+    @property
+    def session_id(self) -> str:
+        return self.transcript_path.parent.name
+
+    @property
+    def probes_path(self) -> Path:
+        return self.transcript_path.parent / "probes"
+
+    def log_transcript(
+        self, kind: str, *, transcript_path: Path | None = None, **fields
+    ):
+        record = {
+            "t": time.strftime("%H:%M:%S"),
+            "timestamp": time.time(),
+            "kind": kind,
+            **fields,
+        }
         try:
-            with self.transcript_path.open("a") as transcript:
+            with (transcript_path or self.transcript_path).open("a") as transcript:
                 transcript.write(json.dumps(record) + "\n")
         except Exception as exc:
             logger.warning(f"Failed to log transcript: {exc}")
 
     def opening_notes(self) -> str:
-        if not self.notes_path.exists():
-            return ""
-        body = self.notes_path.read_text().strip()
-        if not any(line.startswith("- ") for line in body.splitlines()):
-            return ""
-        return "What is already known about this system:\n\n" + body + "\n\n---\n\n"
+        return (
+            "Scientific record (struck entries are invalid; thoughts are interpretations, "
+            "not observations). Relative links are based in xprober/notes/.\n\n"
+            + self.notes.read()
+            + "\n---\n\n"
+        )
 
-    def add_note(self, kind: str, text: str) -> str:
-        heading = "## Facts" if kind == "fact" else "## Dead ends"
-        if not self.notes_path.exists():
-            self.notes_path.write_text(NOTES_TEMPLATE)
-        lines = self.notes_path.read_text().splitlines()
-        if heading not in lines:
-            lines.extend(["", heading, ""])
-        start = lines.index(heading)
-        end = start + 1
-        while end < len(lines) and not lines[end].startswith("## "):
-            end += 1
-        while end > start + 1 and not lines[end - 1].strip():
-            end -= 1
-        lines.insert(end, "- " + text)
-        self.notes_path.write_text("\n".join(lines) + "\n")
-        return heading
+    def start_probe(self, code: str, expected: str, model: str) -> Path:
+        numbers = [
+            int(path.name[1:])
+            for path in self.probes_path.iterdir()
+            if re.fullmatch(r"P\d+", path.name)
+        ]
+        number = max(numbers, default=0) + 1
+        while True:
+            path = self.probes_path / f"P{number:03d}"
+            try:
+                path.mkdir()
+                break
+            except FileExistsError:
+                number += 1
+        write_text(path / "code.py", code)
+        write_text(
+            path / "probe.json",
+            json.dumps(
+                {
+                    "id": path.name,
+                    "expected": expected,
+                    "model": model,
+                    "session": self.session_id,
+                    "started": time.time(),
+                    "status": "started",
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        return path
 
-    def save_plots(self, images: list[bytes]) -> list[str]:
-        stamp = f"{time.strftime('%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        filenames = []
-        for index, image in enumerate(images):
-            filename = f"plot-{stamp}-{index}.png"
-            (self.figures_path / filename).write_bytes(image)
-            filenames.append(filename)
-        return filenames
+    @staticmethod
+    def finish_probe(
+        path: Path, output: str, images: list[bytes], status: str, note: str | None
+    ):
+        # The path is captured before execution; changing UI state cannot redirect a result.
+        write_text(path / "output.txt", output)
+        for index, image in enumerate(images, 1):
+            (path / f"plot-{index}.png").write_bytes(image)
+        metadata = json.loads((path / "probe.json").read_text())
+        metadata.update(status=status, finished=time.time(), execution_note=note)
+        write_text(path / "probe.json", json.dumps(metadata, indent=2) + "\n")
+
+    def evidence_sources(self, sources: list[str]) -> list[str]:
+        """Accept only artifacts belonging to a persisted probe outcome."""
+        links = []
+        for source in dict.fromkeys(sources):
+            if not re.fullmatch(
+                r"S\d{3,}/P\d{3,}/(?:output\.txt|plot-[1-9]\d*\.png)", source
+            ):
+                raise ValueError(
+                    "Sources must look like S001/P001/output.txt or S001/P001/plot-1.png."
+                )
+            session_id, probe_id, filename = source.split("/")
+            artifact = self.sessions_path / session_id / "probes" / probe_id / filename
+            if (
+                not artifact.resolve().is_relative_to(self.sessions_path.resolve())
+                or not artifact.is_file()
+            ):
+                raise ValueError(f"Source does not exist: {source}.")
+            metadata = json.loads((artifact.parent / "probe.json").read_text())
+            if metadata["status"] == "started":
+                raise ValueError(
+                    f"Probe {artifact.parent.name} has no recorded outcome yet."
+                )
+            relative = f"../sessions/{session_id}/probes/{probe_id}"
+            links.append(
+                f"[{source}]({relative}/{filename}) "
+                f"([code]({relative}/code.py), [run]({relative}/probe.json))"
+            )
+        return links
 
     def list_markdown_files(self) -> list[dict[str, Any]]:
         files = []
@@ -110,7 +178,8 @@ class Workspace:
                             "path": str(relative),
                             "size": stat.st_size,
                             "modified": stat.st_mtime,
-                            "is_notes": path == self.notes_path,
+                            "is_notes": path
+                            in (self.notes.evidence_path, self.notes.thoughts_path),
                         }
                     )
                 except Exception as exc:
@@ -147,33 +216,28 @@ class Workspace:
 
     def list_plots(self) -> list[dict[str, Any]]:
         plots = []
-        if self.figures_path.exists():
-            paths = sorted(
-                self.figures_path.glob("plot-*.png"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
+        for path in self.sessions_path.glob("S*/probes/P*/plot-*.png"):
+            stat = path.stat()
+            relative = path.relative_to(self.path).as_posix()
+            plots.append(
+                {
+                    "filename": f"{path.parents[2].name}/{path.parent.name}/{path.name}",
+                    "url": f"/api/asset?path={relative}",
+                    "modified": stat.st_mtime,
+                    "size": stat.st_size,
+                }
             )
-            for path in paths:
-                stat = path.stat()
-                plots.append(
-                    {
-                        "filename": path.name,
-                        "url": f"/figures/{path.name}",
-                        "modified": stat.st_mtime,
-                        "size": stat.st_size,
-                    }
-                )
+        plots.sort(key=lambda item: item["modified"], reverse=True)
         return plots
 
     def transcript_file(self, session_id: str) -> Path:
-        name = Path(session_id).name
-        if not name.startswith("transcript-") or not name.endswith(".jsonl"):
-            raise ValueError("Not a transcript file")
-        path = (self.transcripts_path / name).resolve()
-        if not str(path).startswith(str(self.transcripts_path.resolve())):
+        if not re.fullmatch(r"S\d{3,}", session_id):
+            raise ValueError("Use a session ID such as S001.")
+        path = (self.sessions_path / session_id / "transcript.jsonl").resolve()
+        if not path.is_relative_to(self.sessions_path.resolve()):
             raise ValueError("Transcript path outside workspace")
         if not path.is_file():
-            raise FileNotFoundError(f"No transcript {name}")
+            raise FileNotFoundError(f"No transcript for {session_id}")
         return path
 
     @staticmethod
@@ -202,9 +266,9 @@ class Workspace:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []
-        if not self.transcripts_path.exists():
+        if not self.sessions_path.exists():
             return sessions
-        for path in self.transcripts_path.glob("transcript-*.jsonl"):
+        for path in self.sessions_path.glob("S*/transcript.jsonl"):
             records = self.read_transcript(path)
             if not records:
                 continue
@@ -216,22 +280,22 @@ class Workspace:
             title = user_texts[0] if user_texts else "(no prompt)"
             if len(title) > 120:
                 title = title[:120] + "…"
-            stamp = path.stem.removeprefix("transcript-")
-            try:
-                started = time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
-            except ValueError:
-                started = path.stat().st_mtime
+            started = records[0].get("timestamp", path.stat().st_mtime)
             sessions.append(
                 {
-                    "id": path.name,
+                    "id": path.parent.name,
                     "title": title,
                     "started": started,
                     "modified": path.stat().st_mtime,
                     "turns": len(user_texts),
-                    "probes": sum(1 for r in records if r.get("kind") == "run"),
-                    "notes": sum(1 for r in records if r.get("kind") == "note"),
+                    "probes": sum(
+                        1 for r in records if r.get("kind") == "probe_started"
+                    ),
+                    "notes": sum(
+                        1 for r in records if r.get("kind") in ("evidence", "thought")
+                    ),
                     "context_restorable": self.sdk_id(records) is not None,
-                    "is_current": path.name == self.transcript_path.name,
+                    "is_current": path == self.transcript_path,
                 }
             )
         sessions.sort(key=lambda item: item["modified"], reverse=True)
@@ -256,9 +320,9 @@ class Workspace:
                     + "\nIt printed: "
                     + _clip(record.get("output", ""), 400)
                 )
-            elif kind == "note":
+            elif kind in ("evidence", "thought", "evidence_struck", "verdict"):
                 lines.append(
-                    f"You noted ({record.get('note_kind', 'fact')}): "
+                    f"Recorded {kind} {record.get('entry_id', '')}: "
                     + record.get("text", "")
                 )
         body = "\n\n".join(lines)

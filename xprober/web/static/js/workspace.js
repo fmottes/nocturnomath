@@ -23,7 +23,7 @@ export function applyWorkspace(ws) {
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
   setCarryContext(ws.carry_chat_context);
 
-  const notesPath = ws.notes_path || "xprober/notes/notes.md";
+  const notesPath = ws.evidence_path || "xprober/notes/evidence.md";
   if (!state.activeDoc || !ws.markdown_files?.some((f) => f.path === state.activeDoc)) {
     state.activeDoc = notesPath;
   }
@@ -129,7 +129,7 @@ export function updateFileSelector(files) {
 
   if (!files.length) {
     const opt = document.createElement("option");
-    opt.value = state.workspace?.notes_path || "xprober/notes/notes.md";
+    opt.value = state.workspace?.evidence_path || "xprober/notes/evidence.md";
     opt.textContent = opt.value;
     elements.fileSelect.appendChild(opt);
     return;
@@ -152,9 +152,9 @@ export function updateFileSelector(files) {
   }
 }
 
-export async function loadDocument(filePath) {
+export async function loadDocument(filePath, anchor = "") {
   if (!state.workspace?.is_open) return;
-  if (!filePath) filePath = state.workspace.notes_path;
+  if (!filePath) filePath = state.workspace.evidence_path;
   state.activeDoc = filePath;
   elements.docPathLabel.textContent = filePath;
 
@@ -169,9 +169,27 @@ export async function loadDocument(filePath) {
     const content = data.content || "";
 
     // Render markdown
-    elements.markdownContainer.innerHTML = renderMarkdown(content);
+    if (filePath.endsWith(".md")) {
+      elements.markdownContainer.innerHTML = renderMarkdown(content);
+    } else {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = content;
+      pre.appendChild(code);
+      elements.markdownContainer.replaceChildren(pre);
+    }
     rewriteEmbeddedImageUrls(elements.markdownContainer, filePath);
+    rewriteDocumentLinks(elements.markdownContainer, filePath);
     highlightBlocks(elements.markdownContainer);
+    if (![...elements.fileSelect.options].some((option) => option.value === filePath)) {
+      elements.fileSelect.add(new Option(filePath, filePath));
+    }
+    elements.fileSelect.value = filePath;
+    if (anchor) {
+      const target = [...elements.markdownContainer.querySelectorAll("[id]")]
+        .find((element) => element.id === anchor);
+      target?.scrollIntoView({ block: "start" });
+    }
 
     // Raw content
     elements.rawMarkdownContainer.querySelector("code").textContent = content;
@@ -183,6 +201,26 @@ export async function loadDocument(filePath) {
     console.error("Error loading document:", e);
     elements.markdownContainer.innerHTML = `<p class="empty-state">Failed to load document: ${e.message}</p>`;
   }
+}
+
+function rewriteDocumentLinks(container, documentPath) {
+  container.querySelectorAll("a[href]").forEach((link) => {
+    const source = link.getAttribute("href")?.trim();
+    if (!source || source.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(source)) return;
+    const target = new URL(source, `https://workspace.invalid/${documentPath}`);
+    const path = decodeURIComponent(target.pathname.slice(1));
+    const anchor = decodeURIComponent(target.hash.slice(1));
+    link.href = `/api/asset?path=${encodeURIComponent(path)}`;
+    link.addEventListener("click", (event) => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      if (/\.png$/i.test(path)) {
+        openLightbox(link.href, path, state.plots || []);
+      } else {
+        loadDocument(path, anchor);
+      }
+    });
+  });
 }
 
 function rewriteEmbeddedImageUrls(container, documentPath) {

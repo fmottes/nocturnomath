@@ -94,18 +94,12 @@ def create_app(
                 "kernel_busy": False,
                 "is_busy": False,
                 "carry_chat_context": True,
-                "notes_path": "xprober/notes/notes.md",
-                "notes_content": "",
+                "evidence_path": "xprober/notes/evidence.md",
+                "thoughts_path": "xprober/notes/thoughts.md",
                 "markdown_files": [],
                 "plots": [],
                 "navigator_root": str(runtime.navigator_root),
             }
-        notes_content = ""
-        if session.notes_path.exists():
-            try:
-                notes_content = session.notes_path.read_text(encoding="utf-8")
-            except Exception as exc:
-                logger.warning(f"Could not read {session.notes_path}: {exc}")
         return {
             "is_open": True,
             "path": str(session.workspace_path),
@@ -114,8 +108,8 @@ def create_app(
             "kernel_busy": session.kernel.busy,
             "is_busy": session._is_busy,
             "carry_chat_context": session.carry_chat_context,
-            "notes_path": str(session.notes_path.relative_to(session.workspace_path)),
-            "notes_content": notes_content,
+            "evidence_path": "xprober/notes/evidence.md",
+            "thoughts_path": "xprober/notes/thoughts.md",
             "markdown_files": session.list_markdown_files(),
             "plots": session.list_plots(),
         }
@@ -142,16 +136,6 @@ def create_app(
         if not index_path.exists():
             raise HTTPException(status_code=404, detail="index.html not found")
         return FileResponse(index_path)
-
-    @app.get("/figures/{filename}")
-    async def get_figure(filename: str):
-        session = active_session()
-        file_path = (session.figures_path / filename).resolve()
-        if not str(file_path).startswith(str(session.figures_path.resolve())):
-            raise HTTPException(status_code=403, detail="Forbidden")
-        if not file_path.is_file():
-            raise HTTPException(status_code=404, detail="Image not found")
-        return FileResponse(file_path)
 
     @app.get("/api/workspace")
     async def get_workspace_info():
@@ -342,11 +326,7 @@ def create_app(
                         )
                         continue
                     if text == "/notes":
-                        notes = (
-                            session.notes_path.read_text()
-                            if session.notes_path.exists()
-                            else ""
-                        )
+                        notes = session.workspace.notes.read()
                         await runtime.broadcast(
                             "system_message", {"text": f"```markdown\n{notes}\n```"}
                         )

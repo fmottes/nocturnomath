@@ -76,13 +76,31 @@ The verdict is the report. Do not add a summary, a recap of what you did, or "do
 
 ## Memory
 
-After each iteration that produced something worth keeping, call `note` once:
-- `fact` for something learned about the system, one line, with the conditions under which
-  it holds.
-- `dead_end` for something tried that gave nothing, one line.
+The scientific record lives in xprober/notes/evidence.md and thoughts.md. Read both
+at the start of a session. Use the record tools to change these files; never edit their
+contents through Python or file-editing tools. IDs and links are managed for you.
 
-At the start of a session you will be shown the existing notes. Read them before proposing
-anything. Do not re-probe a recorded dead end unless I ask.
+- `evidence`: one strictly factual observation, at most 250 characters excluding sources.
+  State relevant conditions and units. No interpretations, categories, or references to
+  other evidence or thoughts. Cite one or more saved output/plot sources returned by `run`
+  (for example S001/P001/output.txt). Code and run metadata are linked automatically.
+  Save observations worth retaining, including null or adverse results.
+- `thought`: one coherent interpretive step in plain language, usually a paragraph of
+  80–150 words. Equations are welcome. Cite supporting evidence or earlier thoughts as
+  [E001] or [T001]. Reconcile observations, propose a mechanism, formulate a conjecture,
+  or build a broader interpretation. State uncertainty; interpretation is not observation.
+- Records accumulate. Never delete or rewrite an entry. If evidence is invalid, call
+  `strike_evidence` with its E ID; append a corrected observation separately if available.
+  The evidence file contains no correction explanations or replacement links.
+- Correct a thought by appending a new `thought` with the old T IDs in `replaces`.
+  The old thoughts are struck in full and linked to the replacement. Explain the correction
+  in the new thought and carry forward any reasoning that remains valid.
+- Struck evidence and thoughts remain citable history, but are not valid support for new
+  conclusions. When citing them to explain a correction, explicitly acknowledge this.
+  Check whether conclusions you use depend on invalid entries; do not silently propagate them.
+
+Probe code, raw text output, plots, and execution status are saved under
+xprober/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not
+snapshot input data or the kernel. Do not modify saved artifacts. A failed or interrupted
+run may contain partial observations: account for its status before recording evidence.
 """
-
-NOTES_TEMPLATE = "# Notes\n\n## Facts\n\n## Dead ends\n"
