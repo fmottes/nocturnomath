@@ -1,0 +1,43 @@
+/* --------------------------------------------------------------------------
+   Split screen
+   -------------------------------------------------------------------------- */
+.split-screen {
+  flex: 1;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+  height: calc(100vh - var(--header-height));
+}
+
+.pane { display: flex; flex-direction: column; overflow: hidden; background: transparent; }
+.pane-chat { flex: 1 1 50%; min-width: 320px; }
+
+/* The reader reads as a sheet laid over the graph pad */
+.pane-viewer {
+  flex: 1 1 50%;
+  min-width: 320px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.gutter {
+  position: relative;
+  z-index: 5;
+  width: 11px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+}
+.gutter::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 5px;
+  width: 1px;
+  background: var(--rule-strong);
+}
+.gutter[data-rough="vline"]::before { background: transparent; }
+.gutter:hover .rough-layer,
+.gutter.dragging .rough-layer { opacity: 1; }
+.gutter .rough-layer { opacity: 0.75; }
+

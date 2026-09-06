@@ -1,0 +1,39 @@
+/* --------------------------------------------------------------------------
+   Lightbox
+   -------------------------------------------------------------------------- */
+.lightbox-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(22, 24, 29, 0.7);
+  cursor: zoom-out;
+}
+.lightbox-content { position: relative; max-width: 92vw; max-height: 92vh; display: flex; flex-direction: column; align-items: center; }
+.lightbox-content img {
+  max-width: 100%;
+  max-height: 82vh;
+  object-fit: contain;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid var(--rule-strong);
+}
+.lightbox-close {
+  position: absolute;
+  top: -34px;
+  right: 0;
+  background: transparent;
+  border: none;
+  font-size: 1.6rem;
+  line-height: 1;
+  color: var(--paper);
+  cursor: pointer;
+}
+.lightbox-caption { margin-top: 10px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--paper); }
+
+.hidden { display: none !important; }
+
+/* Purely decorative motion, switched off by the header toggle or by the
+   system setting. Nothing here carries information on its own. */

@@ -1,0 +1,125 @@
+/* ==========================================================================
+   Xprober — lab notebook / engineering graph paper
+   Warm paper, faint blue grid, single ink blue, precise data, drafted chrome.
+   ========================================================================== */
+
+:root {
+  /* Paper */
+  --paper: #faf8f2;
+  --sheet: rgba(255, 255, 255, 0.72);
+  --sheet-solid: #fffefb;
+  --sheet-sunk: rgba(30, 58, 138, 0.03);
+
+  /* Grid */
+  --grid-minor: rgba(30, 58, 138, 0.07);
+  --grid-major: rgba(30, 58, 138, 0.14);
+  --grid-step: 20px;   /* ~5 mm */
+  --grid-block: 100px; /* 5 minor squares */
+
+  /* Ink */
+  --ink: #16181d;
+  --ink-soft: #4b5159;
+  --ink-faint: #858b95;
+  --blue: #1e3a8a;
+  --blue-soft: #3b56a8;
+  --blue-wash: #eaeef8;
+  --rule: #cdd2dd;
+  --rule-strong: #a8b0c2;
+
+  /* One highlighter, for genuinely important results only */
+  --highlighter: #fde68a;
+
+  --ok: #15803d;
+  --warn: #b45309;
+  --danger: #b3261e;
+
+  /* Legacy aliases still referenced from app.js */
+  --accent-success: var(--ok);
+  --accent-warning: var(--warn);
+  --accent-danger: var(--danger);
+  --text-secondary: var(--ink-soft);
+
+  --font-hand: "Architects Daughter", "Segoe Print", cursive;
+  --font-sans: Inter, "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --header-height: 54px;
+
+  /* Depth comes from cross-hatching, never from shadow or gradient */
+  --hatch: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cdefs%3E%3Cpattern id='h' width='8' height='8' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 8L8 0M0 0L8 8' stroke='%231e3a8a' stroke-width='0.5' opacity='0.45'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='8' height='8' fill='url(%23h)'/%3E%3C/svg%3E");
+  --hatch-dense: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='5' height='5'%3E%3Cdefs%3E%3Cpattern id='h' width='5' height='5' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 5L5 0M0 0L5 5' stroke='%231e3a8a' stroke-width='0.6' opacity='0.6'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='5' height='5' fill='url(%23h)'/%3E%3C/svg%3E");
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* --------------------------------------------------------------------------
+   Paper: warm off-white, engineering grid, faint grain. Fixed to viewport.
+   -------------------------------------------------------------------------- */
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--ink);
+  line-height: 1.55;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--paper);
+  background-image:
+    repeating-linear-gradient(to right, var(--grid-major) 0 1px, transparent 1px var(--grid-block)),
+    repeating-linear-gradient(to bottom, var(--grid-major) 0 1px, transparent 1px var(--grid-block)),
+    repeating-linear-gradient(to right, var(--grid-minor) 0 1px, transparent 1px var(--grid-step)),
+    repeating-linear-gradient(to bottom, var(--grid-minor) 0 1px, transparent 1px var(--grid-step));
+  background-attachment: fixed;
+}
+
+/* Paper grain, sitting behind the interface so it never touches data */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.22;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23g)' opacity='0.5'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  mix-blend-mode: multiply;
+}
+
+.app-container {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--rule); border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--rule-strong); background-clip: content-box; }
+
+/* --------------------------------------------------------------------------
+   Drafted chrome (rough.js). Elements keep a precise 1px border as the
+   no-script fallback; sketch.js hides it once it has drawn the real line.
+   -------------------------------------------------------------------------- */
+.rough-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 0;
+}
+[data-rough] { position: relative; }
+[data-rough] > *:not(.rough-layer) { position: relative; z-index: 1; }
+[data-rough="box"] { border-color: transparent !important; }
+[data-rough="rule"] { border-bottom-color: transparent !important; }
+[data-rough="rule-top"] { border-top-color: transparent !important; }
+[data-rough="edge"] { border-left-color: transparent !important; }

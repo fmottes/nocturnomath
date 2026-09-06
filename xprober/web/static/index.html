@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xprober</title>
+  <meta name="description" content="Local web app dashboard for hypothesis-driven scientific exploration with persistent Jupyter kernel and live markdown reader.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Markdown & Code Highlighting Libraries with Fallback -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- Hand-drafted chrome: rough.js frames, rough-notation annotations -->
+  <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/rough-notation@0.5.1/lib/rough-notation.iife.js"></script>
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/layout.css">
+  <link rel="stylesheet" href="/static/css/chat.css">
+  <link rel="stylesheet" href="/static/css/viewer.css">
+  <link rel="stylesheet" href="/static/css/modals.css">
+  <link rel="stylesheet" href="/static/css/lightbox.css">
+  <link rel="stylesheet" href="/static/css/responsive.css">
+</head>
+<body>
+  <section class="landing-screen" id="landing-screen">
+    <div class="landing-card">
+      <span class="landing-kicker">Local exploration workspace</span>
+      <h1>Choose a folder to begin</h1>
+      <p>
+        Xprober keeps its notes, figures, and chat history inside the folder you open.
+        Nothing is created until you choose that workspace.
+      </p>
+      <button class="btn btn-primary landing-open-button" id="btn-open-workspace" type="button">
+        Open a folder workspace
+      </button>
+    </div>
+  </section>
+
+  <div class="app-container hidden" id="workspace-app">
+    <!-- Top Navigation Header -->
+    <header class="app-header" id="app-header">
+      <div class="header-left">
+        <div class="brand">
+          <span class="brand-title">Xprober</span>
+        </div>
+        <span class="badge model-badge" id="model-badge">claude-opus-5</span>
+      </div>
+
+      <!-- Workspace Folder Selector -->
+      <div class="header-center">
+        <div class="workspace-pill" id="workspace-pill" title="Click to change workspace folder">
+          <span class="pill-label">wd</span>
+          <span class="workspace-path" id="workspace-path">Loading workspace...</span>
+          <button class="btn btn-xs btn-outline" id="btn-change-folder" type="button">Change</button>
+        </div>
+      </div>
+
+      <!-- Controls & Status -->
+      <div class="header-right">
+        <div class="status-indicator" id="kernel-status" title="Kernel status">
+          <span class="status-dot green" id="kernel-dot"></span>
+          <span class="status-text" id="kernel-text">Kernel ready</span>
+        </div>
+        <button class="btn btn-sm btn-ghost" id="btn-new-session" title="Start new session (same kernel)" type="button">
+          <span>New session</span>
+        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-history" title="Resume a past chat from this workspace" type="button">
+          <span>History</span>
+        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-restart-kernel" title="Restart Jupyter kernel (clears in-memory state)" type="button">
+          <span>Restart kernel</span>
+        </button>
+        <button class="btn btn-sm btn-danger-outline hidden" id="btn-interrupt" title="Interrupt running probe" type="button">
+          <span>Interrupt</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Split Screen -->
+    <main class="split-screen" id="split-screen">
+      <!-- Left Half: Chat Dashboard -->
+      <section class="pane pane-chat" id="pane-chat">
+        <div class="chat-header">
+          <div class="pane-title">
+            <span>Exploration log</span>
+          </div>
+          <div class="chat-header-actions">
+            <label class="toggle-label switch-label" id="context-control" title="Keep the conversation across messages, as the CLI does. Off: every message starts fresh from the system prompt plus notes.md.">
+              <span class="toggle-text">Keep context</span>
+              <input type="checkbox" id="context-toggle" class="switch-input" checked>
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+            <span class="badge" id="chat-status-badge">Idle</span>
+          </div>
+        </div>
+
+        <!-- Chat Messages -->
+        <div class="chat-messages" id="chat-messages">
+          <!-- Initial Welcome Card -->
+          <div class="message-card system-welcome" id="system-welcome">
+            <div class="welcome-header">
+              <h3>Scientific exploration mode</h3>
+            </div>
+            <p>I help you learn about systems quickly by proposing the simplest probe, executing it in the persistent Jupyter kernel, and assessing what it means.</p>
+            <div class="exploration-steps">
+              <div class="step-item"><strong>1. Idea</strong> One hypothesis and a concrete prediction (<code>expected</code>)</div>
+              <div class="step-item"><strong>2. Code</strong> Simplest readable probe, flat script, no machinery</div>
+              <div class="step-item"><strong>3. Result</strong> A plot or metric that answers the question</div>
+              <div class="step-item"><strong>4. Verdict</strong> Rule hypotheses in or out, plus notes</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Chat Input Form -->
+        <div class="chat-input-container">
+          <!-- Slash command helper chips -->
+          <div class="command-chips">
+            <button type="button" class="chip" data-cmd="/new">/new</button>
+            <button type="button" class="chip" data-cmd="/restart">/restart</button>
+            <button type="button" class="chip" data-cmd="/notes">/notes</button>
+            <span class="chips-hint">Enter to send, Shift+Enter for a new line</span>
+          </div>
+
+          <form class="chat-form" id="chat-form">
+            <textarea
+              id="prompt-input"
+              class="prompt-input"
+              rows="2"
+              placeholder="Ask the agent to probe the system, e.g. inspect the files in this folder, check data columns, test a model"
+              required
+            ></textarea>
+            <div class="input-actions">
+              <button type="submit" class="btn btn-primary" id="btn-send">
+                <span id="send-btn-text">Send</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- Draggable Gutter / Divider -->
+      <div class="gutter" id="gutter" title="Drag to resize panes"></div>
+
+      <!-- Right Half: Markdown & Media Viewer -->
+      <section class="pane pane-viewer" id="pane-viewer">
+        <div class="viewer-header">
+          <!-- Left: Tab navigation -->
+          <div class="viewer-tabs">
+            <button class="tab-btn active" id="tab-doc" data-tab="doc" type="button">
+              Document
+            </button>
+            <button class="tab-btn" id="tab-plots" data-tab="plots" type="button">
+              Figures <span class="badge badge-sm" id="plots-count">0</span>
+            </button>
+          </div>
+
+          <!-- Right: Document Actions -->
+          <div class="viewer-actions">
+            <!-- File Selector Dropdown -->
+            <div class="file-selector-wrapper" id="file-selector-wrapper">
+              <select id="file-select" class="file-select" title="Select markdown document">
+                <option value="notes.md">notes.md</option>
+              </select>
+            </div>
+
+            <!-- Raw / Rendered Toggle -->
+            <button class="btn btn-xs btn-ghost" id="btn-toggle-raw" type="button" title="Toggle raw markdown / rendered view">
+              Raw
+            </button>
+
+            <!-- Copy Content Button -->
+            <button class="btn btn-xs btn-ghost" id="btn-copy-doc" type="button" title="Copy markdown to clipboard">
+              Copy
+            </button>
+
+            <!-- Refresh Button -->
+            <button class="btn btn-xs btn-ghost" id="btn-refresh-doc" type="button" title="Reload active document">
+              Reload
+            </button>
+          </div>
+        </div>
+
+        <!-- Document Viewer Content Area -->
+        <div class="viewer-content">
+          <!-- Document Reader Tab View -->
+          <div class="tab-view active" id="view-doc">
+            <div class="doc-header-info" id="doc-header-info">
+              <span class="doc-path-label" id="doc-path-label">notes.md</span>
+              <span class="doc-meta-label" id="doc-meta-label"></span>
+            </div>
+            <article class="markdown-body" id="markdown-container">
+              <!-- Rendered markdown inserted here -->
+            </article>
+            <pre class="raw-markdown hidden" id="raw-markdown-container"><code></code></pre>
+          </div>
+
+          <!-- Plots Gallery Tab View -->
+          <div class="tab-view hidden" id="view-plots">
+            <div class="plots-gallery-header">
+              <span class="gallery-title">Generated figures</span>
+              <button class="btn btn-xs btn-outline" id="btn-refresh-plots" type="button">Refresh</button>
+            </div>
+            <div class="plots-grid" id="plots-grid">
+              <div class="empty-state">No figures yet. Run a probe that produces a plot.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Chat History Modal -->
+    <div class="modal-backdrop hidden" id="history-modal">
+      <div class="modal-dialog modal-dialog-wide">
+        <div class="modal-header">
+          <h3>Resume a past chat</h3>
+          <button class="modal-close" id="history-modal-close" type="button">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-help">
+            Chats recorded under <code>scratch/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>notes.md</code>.
+          </p>
+          <div class="session-list" id="session-list">
+            <div class="empty-state">Loading sessions&hellip;</div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-xs btn-outline" id="btn-refresh-sessions">Refresh</button>
+            <button type="button" class="btn btn-ghost" id="history-modal-cancel">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Image Lightbox Modal -->
+    <div class="lightbox-backdrop hidden" id="lightbox-modal">
+      <div class="lightbox-content">
+        <button class="lightbox-close" id="lightbox-close" type="button">&times;</button>
+        <img id="lightbox-img" src="" alt="Enlarged plot">
+        <div class="lightbox-caption" id="lightbox-caption"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- The workspace picker is outside #workspace-app so it remains visible
+       while the dashboard is hidden on the landing screen. -->
+  <div class="modal-backdrop hidden" id="folder-modal">
+    <div class="modal-dialog modal-dialog-folder">
+      <div class="modal-header">
+        <h3 id="folder-modal-title">Open a workspace folder</h3>
+        <button class="modal-close" id="modal-close" type="button">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-help" id="folder-modal-help">
+          Browse to an existing folder. Once opened, the agent will create and manage <code>notes.md</code> and <code>scratch/</code> there.
+        </p>
+        <form id="folder-form">
+          <div class="form-group">
+            <label for="new-folder-input">Folder path</label>
+            <div class="folder-path-control">
+              <input
+                type="text"
+                id="new-folder-input"
+                class="form-input"
+                placeholder="/absolute/path/to/project"
+                required
+              >
+              <button type="button" class="btn btn-xs btn-outline" id="btn-folder-go">Browse</button>
+            </div>
+          </div>
+
+          <div class="folder-navigator" aria-label="Folder navigator">
+            <div class="folder-navigator-header">
+              <button type="button" class="btn btn-xs btn-outline" id="btn-folder-up">Up</button>
+              <span class="folder-navigator-path" id="folder-browser-path">Loading folders…</span>
+            </div>
+            <div class="folder-list" id="folder-list" role="list"></div>
+          </div>
+          <p class="folder-picker-error hidden" id="folder-picker-error" role="alert"></p>
+
+          <div class="modal-actions">
+            <button type="button" class="btn btn-ghost" id="modal-cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="modal-submit">Open folder</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/js/main.js"></script>
+  <script src="/static/js/sketch.js"></script>
+</body>
+</html>

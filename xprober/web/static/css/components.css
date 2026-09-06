@@ -1,0 +1,158 @@
+/* --------------------------------------------------------------------------
+   Header
+   -------------------------------------------------------------------------- */
+.app-header {
+  height: var(--header-height);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--rule-strong);
+  z-index: 10;
+}
+
+.header-left { display: flex; align-items: center; gap: 12px; }
+
+.brand-title {
+  font-family: var(--font-hand);
+  font-size: 1.35rem;
+  line-height: 1;
+  color: var(--blue);
+  letter-spacing: 0.01em;
+}
+
+.model-badge {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.01em;
+}
+
+.header-center { flex: 1; display: flex; justify-content: center; max-width: 560px; }
+
+.workspace-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px 4px 8px;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.workspace-pill:hover { border-color: var(--blue); }
+
+.pill-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--blue);
+  padding-right: 8px;
+  border-right: 1px solid var(--rule);
+}
+
+.workspace-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-right { display: flex; align-items: center; gap: 6px; }
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px 4px 0;
+  margin-right: 4px;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  border-right: 1px solid var(--rule);
+}
+
+/* Static indicator: state is carried by fill and by the label, not by motion */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border: 1px solid var(--blue);
+  background: transparent;
+}
+.status-dot.green { background: var(--blue); }
+.status-dot.busy { background-image: var(--hatch-dense); }
+.status-dot.red { background: var(--danger); border-color: var(--danger); }
+
+/* --------------------------------------------------------------------------
+   Buttons, chips, badges
+   -------------------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 6px 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+  transition: color 0.12s ease, border-color 0.12s ease, background-color 0.12s ease;
+}
+.btn:hover:not(:disabled) { color: var(--blue); border-color: var(--blue); background: var(--blue-wash); }
+.btn:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+
+.btn-sm { padding: 5px 10px; font-size: 0.78125rem; }
+.btn-xs { padding: 3px 8px; font-size: 0.71875rem; }
+
+.btn-primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: var(--paper);
+  font-weight: 500;
+}
+.btn-primary:hover:not(:disabled) { background: #16296b; border-color: #16296b; color: var(--paper); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost { background: transparent; border-color: transparent; }
+.btn-outline { background: transparent; }
+
+.btn-danger-outline { background: transparent; border-color: var(--danger); color: var(--danger); }
+.btn-danger-outline:hover:not(:disabled) { background: var(--danger); border-color: var(--danger); color: var(--paper); }
+
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px solid var(--rule);
+}
+.badge-sm { font-size: 0.625rem; padding: 1px 5px; }
+
+.chip {
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.71875rem;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px dashed var(--rule-strong);
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.chip:hover { color: var(--blue); border-color: var(--blue); border-style: solid; }
+

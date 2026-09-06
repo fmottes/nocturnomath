@@ -1,0 +1,9 @@
+@media (prefers-reduced-motion: reduce) {
+  /* The system preference is the default, but an explicit "on" from the
+     header toggle wins, so the control always matches what is on screen. */
+  html:not([data-motion="on"]) * { animation: none !important; transition: none !important; }
+}
+html[data-motion="off"] * {
+  animation: none !important;
+  transition: none !important;
+}

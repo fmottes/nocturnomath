@@ -1,0 +1,315 @@
+/* --------------------------------------------------------------------------
+   Left pane: exploration log
+   -------------------------------------------------------------------------- */
+.chat-header,
+.viewer-header {
+  height: 42px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--rule-strong);
+}
+
+.pane-title {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--blue);
+}
+
+/* The header holds a toggle as well as the status badge, so it lays them out. */
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#context-control {
+  padding-right: 12px;
+  border-right: 1px solid var(--rule);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 22px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* Welcome / method card */
+.message-card.system-welcome {
+  padding: 18px 20px;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+}
+.welcome-header h3 {
+  font-family: var(--font-hand);
+  font-size: 1.2rem;
+  font-weight: 400;
+  color: var(--blue);
+  margin-bottom: 8px;
+}
+.system-welcome p {
+  font-size: 0.8125rem;
+  color: var(--ink-soft);
+  margin-bottom: 14px;
+  max-width: 62ch;
+}
+
+.exploration-steps {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+}
+.step-item {
+  padding: 9px 11px;
+  background: var(--sheet-solid);
+  font-size: 0.78125rem;
+  color: var(--ink-soft);
+}
+.step-item strong {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--blue);
+  margin-bottom: 2px;
+}
+.step-item code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: var(--blue);
+  background: var(--blue-wash);
+  padding: 0 3px;
+}
+
+/* Messages */
+.chat-bubble { display: flex; flex-direction: column; gap: 5px; max-width: 94%; }
+.chat-bubble.user { align-self: flex-end; align-items: flex-end; }
+.chat-bubble.agent { align-self: flex-start; }
+
+.bubble-meta {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.chat-bubble.user .bubble-body {
+  padding: 10px 13px;
+  font-size: 0.84375rem;
+  color: var(--ink);
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+}
+
+/* The agent writes straight onto the page, marked by an ink rule */
+.chat-bubble.agent .bubble-body {
+  padding: 2px 0 2px 14px;
+  font-size: 0.875rem;
+  color: var(--ink);
+  border-left: 1px solid var(--blue);
+}
+
+.chat-bubble.system { align-self: stretch; max-width: 100%; }
+.chat-bubble.system .bubble-body {
+  padding: 7px 11px;
+  font-family: var(--font-mono);
+  font-size: 0.71875rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  background: var(--sheet-sunk);
+  border-left: 2px solid var(--rule-strong);
+}
+.chat-bubble.system .bubble-body p { margin: 0; }
+.chat-bubble.system .bubble-body code { background: none; padding: 0; color: var(--blue); }
+
+/* Probe card */
+.probe-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 15px 13px 27px;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+}
+/* Hatched spine: depth without a shadow */
+.probe-card::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: 5px;
+  width: 10px;
+  background-image: var(--hatch);
+  z-index: 1;
+}
+
+.probe-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.probe-pill {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--blue);
+}
+
+.probe-expected {
+  padding: 7px 10px;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  background: var(--blue-wash);
+}
+.probe-expected strong {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--blue);
+  margin-right: 6px;
+}
+
+/* Closes the card the way .probe-expected opens it: same banner, other end,
+   and a different wash so a prediction is never mistaken for a result. */
+.probe-verdict {
+  padding: 7px 10px;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  background: var(--sheet-solid);
+  border-top: 1px solid var(--rule);
+  white-space: pre-wrap;
+}
+.probe-verdict strong {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ok);
+  margin-right: 6px;
+}
+
+.probe-code-details { border: 1px solid var(--rule); background: var(--sheet-solid); }
+.probe-code-summary {
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 0.71875rem;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+}
+.probe-code-summary:hover { color: var(--blue); }
+.probe-code-block {
+  padding: 10px 12px;
+  border-top: 1px solid var(--rule);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  color: var(--ink);
+}
+
+.probe-output-box {
+  padding: 9px 11px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-soft);
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule);
+}
+
+/* Figures are never hand-drawn: precise frame, no tilt, no scaling */
+.probe-images { display: flex; flex-wrap: wrap; gap: 12px; }
+.probe-img-thumb {
+  width: 250px;
+  max-height: 190px;
+  object-fit: contain;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid var(--rule-strong);
+  cursor: zoom-in;
+  transition: border-color 0.12s ease;
+}
+.probe-img-thumb:hover { border-color: var(--blue); }
+
+/* Recorded findings */
+.note-notification {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 11px;
+  font-size: 0.8125rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+}
+.note-badge {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.note-notification.fact .note-badge { color: var(--ok); }
+.note-notification.dead_end .note-badge { color: var(--warn); }
+.note-notification span:last-child { color: var(--ink); }
+
+/* Composer */
+.chat-input-container {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 13px 18px 15px;
+  border-top: 1px solid var(--rule-strong);
+}
+.command-chips { display: flex; align-items: center; gap: 7px; }
+.chips-hint {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+}
+
+.chat-form { display: flex; gap: 10px; align-items: flex-end; }
+.prompt-input {
+  flex: 1;
+  min-height: 46px;
+  max-height: 170px;
+  padding: 11px 12px;
+  resize: none;
+  outline: none;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+  border-radius: 0;
+}
+.prompt-input::placeholder { color: var(--ink-faint); }
+.prompt-input:focus { border-color: var(--blue); }
+.input-actions button { height: 46px; padding: 0 20px; }
+

@@ -1,0 +1,297 @@
+/* --------------------------------------------------------------------------
+   Right pane: document and figures
+   -------------------------------------------------------------------------- */
+.viewer-tabs { display: flex; gap: 2px; }
+.tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color 0.12s ease;
+}
+.tab-btn:hover { color: var(--ink-soft); }
+.tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+.viewer-actions { display: flex; align-items: center; gap: 8px; }
+
+.file-select {
+  max-width: 190px;
+  padding: 4px 8px;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink);
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+}
+.file-select:focus { border-color: var(--blue); }
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-label input[type="checkbox"] { accent-color: var(--blue); }
+
+/* Slide switch. Square linework rather than a pill, so it reads as a panel
+   switch on an instrument and not as a phone setting. */
+.switch-label { gap: 8px; }
+
+/* Names a UI control inside running prose, so it never breaks across lines. */
+.nowrap { white-space: nowrap; }
+
+.switch-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
+
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 30px;
+  height: 15px;
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 9px;
+  height: 9px;
+  background: var(--ink-faint);
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.switch-input:checked + .switch {
+  background: var(--blue-wash);
+  border-color: var(--blue);
+}
+
+.switch-input:checked + .switch::after {
+  background: var(--blue);
+  transform: translateX(15px);
+}
+
+.switch-label:hover .switch { border-color: var(--blue-soft); }
+.switch-input:focus-visible + .switch { outline: 1px solid var(--blue); outline-offset: 2px; }
+
+.viewer-content { flex: 1; overflow-y: auto; position: relative; }
+.tab-view { min-height: 100%; display: flex; flex-direction: column; }
+.tab-view.hidden { display: none; }
+
+.doc-header-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 30px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  border-bottom: 1px solid var(--rule);
+}
+.doc-path-label { color: var(--blue); }
+.doc-meta-label { color: var(--ink-faint); }
+
+/* --------------------------------------------------------------------------
+   Markdown
+   -------------------------------------------------------------------------- */
+.markdown-body {
+  padding: 26px 30px 60px;
+  max-width: 78ch;
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  color: var(--ink);
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  font-family: var(--font-hand);
+  font-weight: 400;
+  color: var(--blue);
+  line-height: 1.25;
+}
+.markdown-body h1 {
+  font-size: 1.55rem;
+  margin: 0 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--blue);
+}
+.markdown-body h2 {
+  font-size: 1.25rem;
+  margin: 28px 0 12px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--rule);
+}
+.markdown-body h3 { font-size: 1.0625rem; margin: 20px 0 8px; }
+.markdown-body p, .markdown-body ul, .markdown-body ol { margin-bottom: 14px; }
+.markdown-body ul, .markdown-body ol { padding-left: 22px; }
+.markdown-body li { margin-bottom: 5px; }
+.markdown-body li::marker { color: var(--blue); }
+.markdown-body strong { font-weight: 600; }
+.markdown-body a { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }
+.markdown-body hr { border: none; border-top: 1px solid var(--rule); margin: 24px 0; }
+
+.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  color: var(--blue);
+  background: var(--blue-wash);
+  padding: 1px 4px;
+}
+.markdown-body pre {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule);
+}
+.markdown-body pre code {
+  background: none;
+  padding: 0;
+  color: var(--ink);
+  font-size: 0.78125rem;
+  line-height: 1.6;
+}
+.markdown-body blockquote {
+  margin-bottom: 14px;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--blue);
+  color: var(--ink-soft);
+}
+
+/* Data tables stay precise and monospaced */
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 18px;
+  font-family: var(--font-mono);
+  font-size: 0.78125rem;
+}
+.markdown-body th,
+.markdown-body td {
+  padding: 6px 10px;
+  border: 1px solid var(--rule);
+  text-align: left;
+}
+.markdown-body th {
+  font-weight: 600;
+  color: var(--blue);
+  background: var(--blue-wash);
+  border-bottom-color: var(--rule-strong);
+}
+.markdown-body td:not(:first-child) { text-align: right; }
+.markdown-body img { max-width: 100%; border: 1px solid var(--rule-strong); background: #fff; }
+
+/* Highlighter, reserved for results the agent marked as important */
+.markdown-body mark {
+  background: var(--highlighter);
+  color: var(--ink);
+  padding: 0 2px;
+}
+
+.raw-markdown {
+  padding: 24px 30px;
+  font-family: var(--font-mono);
+  font-size: 0.78125rem;
+  line-height: 1.65;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Syntax colours kept to the ink palette */
+.hljs { background: transparent; color: var(--ink); }
+.hljs-comment, .hljs-quote { color: var(--ink-faint); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name { color: var(--blue); font-weight: 500; }
+.hljs-string, .hljs-attr, .hljs-regexp { color: #8a5a2b; }
+.hljs-number, .hljs-literal { color: #7a3e9d; }
+.hljs-title, .hljs-function .hljs-title, .hljs-class .hljs-title { color: var(--ink); font-weight: 600; }
+.hljs-meta, .hljs-params { color: var(--ink-soft); }
+
+/* --------------------------------------------------------------------------
+   Figures gallery
+   -------------------------------------------------------------------------- */
+.plots-gallery-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 22px;
+  border-bottom: 1px solid var(--rule);
+}
+.gallery-title {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--blue);
+}
+
+.plots-grid {
+  padding: 22px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 18px;
+  align-content: start;
+}
+
+.plot-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+  transition: border-color 0.12s ease;
+}
+.plot-card:hover { border-color: var(--blue); }
+.plot-card-img-wrap {
+  height: 185px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 6px;
+  background: #ffffff;
+  cursor: zoom-in;
+}
+.plot-card img { width: 100%; height: 100%; object-fit: contain; }
+.plot-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--ink-soft);
+  border-top: 1px solid var(--rule);
+}
+.plot-card-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Margin note voice, used only where there is nothing to show */
+.empty-state {
+  grid-column: 1 / -1;
+  padding: 44px 20px;
+  text-align: center;
+  font-family: var(--font-hand);
+  font-size: 1.0625rem;
+  color: var(--ink-faint);
+}
+

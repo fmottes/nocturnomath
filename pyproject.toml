@@ -1,0 +1,41 @@
+[project]
+name = "xprober"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.152",
+    "fastapi>=0.115.0",
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.10.0",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "uvicorn>=0.34.0",
+    "websockets>=13.0",
+]
+
+[project.scripts]
+xprober-web = "xprober.cli.web:main"
+xprober-cli = "xprober.cli.terminal:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["xprober"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.12.12",
+]
+
+[tool.ruff.lint]
+# Ruff's defaults otherwise. BLE001 fires on every boundary guard in the server:
+# an event subscriber, a transcript append, a websocket send, the HTTP 500
+# fallback. Catching broadly there is the point — one caller misbehaving must not
+# take down a long-running session — and each site logs or reports what it caught.
+ignore = ["BLE001"]
