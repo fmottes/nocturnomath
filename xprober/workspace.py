@@ -136,6 +136,15 @@ class Workspace:
             "size": stat.st_size,
         }
 
+    def asset_file(self, relative_path: str) -> Path:
+        """Return a workspace-local asset path for a rendered Markdown document."""
+        target = (self.path / relative_path).resolve()
+        if not target.is_relative_to(self.path):
+            raise ValueError("Asset path outside workspace")
+        if not target.is_file():
+            raise FileNotFoundError(f"Asset {relative_path} not found")
+        return target
+
     def list_plots(self) -> list[dict[str, Any]]:
         plots = []
         if self.figures_path.exists():

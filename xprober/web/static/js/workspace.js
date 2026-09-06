@@ -170,6 +170,7 @@ export async function loadDocument(filePath) {
 
     // Render markdown
     elements.markdownContainer.innerHTML = renderMarkdown(content);
+    rewriteEmbeddedImageUrls(elements.markdownContainer, filePath);
     highlightBlocks(elements.markdownContainer);
 
     // Raw content
@@ -182,6 +183,23 @@ export async function loadDocument(filePath) {
     console.error("Error loading document:", e);
     elements.markdownContainer.innerHTML = `<p class="empty-state">Failed to load document: ${e.message}</p>`;
   }
+}
+
+function rewriteEmbeddedImageUrls(container, documentPath) {
+  const documentDir = documentPath.includes("/")
+    ? documentPath.slice(0, documentPath.lastIndexOf("/"))
+    : "";
+
+  container.querySelectorAll("img[src]").forEach((image) => {
+    const source = image.getAttribute("src")?.trim();
+    if (!source || source.startsWith("/") || source.startsWith("//") ||
+        source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
+      return;
+    }
+
+    const assetPath = documentDir ? `${documentDir}/${source}` : source;
+    image.src = `/api/asset?path=${encodeURIComponent(assetPath)}`;
+  });
 }
 
 export async function loadPlots() {

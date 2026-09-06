@@ -79,6 +79,9 @@ def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
 
 def test_http_workspace_files_and_static_assets(session, tmp_path):
     (tmp_path / "report.md").write_text("# Report")
+    report_figures = tmp_path / "report-figures"
+    report_figures.mkdir()
+    (report_figures / "embedded.png").write_bytes(b"embedded-figure")
     [figure_name] = session.workspace.save_plots([b"png-data"])
     app = create_app(session)
     with TestClient(app) as client:
@@ -97,6 +100,11 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         plots = client.get("/api/plots").json()["plots"]
         assert plots[0]["url"] == f"/figures/{figure_name}"
         assert client.get(plots[0]["url"]).content == b"png-data"
+        assert (
+            client.get("/api/asset", params={"path": "report-figures/embedded.png"}).content
+            == b"embedded-figure"
+        )
+        assert client.get("/api/asset", params={"path": "../outside.png"}).status_code == 403
 
 
 def test_websocket_event_contract(session):

@@ -211,6 +211,16 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
+    @app.get("/api/asset")
+    async def read_asset(path: str):
+        session = active_session()
+        try:
+            return FileResponse(session.workspace.asset_file(path))
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+
     @app.get("/api/plots")
     async def list_plots():
         session = active_session()
