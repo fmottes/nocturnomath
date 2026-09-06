@@ -213,7 +213,7 @@ export function renderPlotsGallery(plots) {
 
     const imgWrap = document.createElement("div");
     imgWrap.className = "plot-card-img-wrap";
-    imgWrap.onclick = () => openLightbox(p.url, p.filename);
+    imgWrap.onclick = () => openLightbox(p.url, p.filename, plots);
 
     const img = document.createElement("img");
     img.src = p.url;

@@ -157,7 +157,11 @@ export function appendProbeFinish(expected, code, output, plotUrls, plotImages) 
       img.className = "probe-img-thumb";
       img.src = url;
       img.alt = `Plot ${i + 1}`;
-      img.onclick = () => openLightbox(url, `Plot ${i + 1}`);
+      img.onclick = () => openLightbox(
+        url,
+        `Plot ${i + 1}`,
+        plotUrls.map((src, index) => ({ src, caption: `Plot ${index + 1}` }))
+      );
       imgContainer.appendChild(img);
     });
 

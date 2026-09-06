@@ -4,7 +4,7 @@ import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlo
 import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260906-1";
 import { loadSessions, replaySession } from "./history.js?v=20260906-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
-import { closeLightbox } from "./ui.js?v=20260906-1";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";
 
 // ============================================================================
 // Server Event Dispatcher
@@ -272,6 +272,17 @@ function setupEventListeners() {
   elements.lightboxClose.addEventListener("click", closeLightbox);
   elements.lightboxModal.addEventListener("click", (e) => {
     if (e.target === elements.lightboxModal) closeLightbox();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!isLightboxOpen()) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeLightbox();
+    } else if (e.key === "ArrowLeft") {
+      if (cycleLightbox(-1)) e.preventDefault();
+    } else if (e.key === "ArrowRight") {
+      if (cycleLightbox(1)) e.preventDefault();
+    }
   });
 
   // Draggable Gutter / Pane Resizing

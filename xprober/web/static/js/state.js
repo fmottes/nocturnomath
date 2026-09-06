@@ -4,6 +4,8 @@ export const state = {
   rawView: false,
   autoSync: true,
   plots: [],
+  lightboxItems: [],
+  lightboxIndex: -1,
   ws: null,
   currentAssistantBubble: null,
   currentProbeCard: null,
