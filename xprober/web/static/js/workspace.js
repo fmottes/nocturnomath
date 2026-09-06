@@ -23,11 +23,16 @@ export function applyWorkspace(ws) {
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
   setCarryContext(ws.carry_chat_context);
 
+  const notesPath = ws.notes_path || "xprober/notes/notes.md";
+  if (!state.activeDoc || !ws.markdown_files?.some((f) => f.path === state.activeDoc)) {
+    state.activeDoc = notesPath;
+  }
+
   // Populate file selector
   updateFileSelector(ws.markdown_files || []);
 
   // Refresh active doc
-  loadDocument(state.activeDoc || "notes.md");
+  loadDocument(state.activeDoc);
 
   // Refresh plots list
   loadPlots();
@@ -124,8 +129,8 @@ export function updateFileSelector(files) {
 
   if (!files.length) {
     const opt = document.createElement("option");
-    opt.value = "notes.md";
-    opt.textContent = "notes.md";
+    opt.value = state.workspace?.notes_path || "xprober/notes/notes.md";
+    opt.textContent = opt.value;
     elements.fileSelect.appendChild(opt);
     return;
   }
@@ -149,7 +154,7 @@ export function updateFileSelector(files) {
 
 export async function loadDocument(filePath) {
   if (!state.workspace?.is_open) return;
-  if (!filePath) filePath = "notes.md";
+  if (!filePath) filePath = state.workspace.notes_path;
   state.activeDoc = filePath;
   elements.docPathLabel.textContent = filePath;
 
@@ -282,7 +287,7 @@ export function openFolderPicker(mode = "open") {
     ? "Open a workspace folder"
     : "Change workspace folder";
   elements.folderModalHelp.innerHTML = opening
-    ? "Browse to an existing folder. Once opened, the agent will create and manage <code>notes.md</code> and <code>scratch/</code> there."
+    ? "Browse to an existing folder. Once opened, the agent will create and manage its files under <code>xprober/</code>."
     : "Choose another existing folder. The agent will keep its kernel and begin a new workspace session there.";
   elements.modalSubmit.textContent = opening ? "Open folder" : "Switch workspace";
   elements.folderModal.classList.remove("hidden");

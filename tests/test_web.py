@@ -40,6 +40,7 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert landing["path"] is None
             assert not (workspace / "notes.md").exists()
             assert not (workspace / "scratch").exists()
+            assert not (workspace / "xprober").exists()
             assert client.get("/api/files").status_code == 409
 
             folders = client.get("/api/folders", params={"path": str(tmp_path)})
@@ -58,8 +59,11 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             opened = client.post("/api/workspace", json={"path": str(workspace)})
             assert opened.status_code == 200
             assert opened.json()["workspace"]["is_open"] is True
-            assert (workspace / "notes.md").is_file()
-            assert (workspace / "scratch").is_dir()
+            assert opened.json()["workspace"]["notes_path"] == "xprober/notes/notes.md"
+            assert (workspace / "xprober" / "notes" / "notes.md").is_file()
+            assert (workspace / "xprober" / "transcripts").is_dir()
+            assert (workspace / "xprober" / "figures").is_dir()
+            assert (workspace / "xprober" / "scratch").is_dir()
 
 
 def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
@@ -75,6 +79,7 @@ def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
 
 def test_http_workspace_files_and_static_assets(session, tmp_path):
     (tmp_path / "report.md").write_text("# Report")
+    [figure_name] = session.workspace.save_plots([b"png-data"])
     app = create_app(session)
     with TestClient(app) as client:
         workspace = client.get("/api/workspace")
@@ -89,6 +94,9 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store"
         assert client.get("/static/css/base.css").status_code == 200
+        plots = client.get("/api/plots").json()["plots"]
+        assert plots[0]["url"] == f"/figures/{figure_name}"
+        assert client.get(plots[0]["url"]).content == b"png-data"
 
 
 def test_websocket_event_contract(session):

@@ -159,7 +159,7 @@ def build_tools(session: "ExplorationSession"):
             expected=expected,
             code=code,
             output=output,
-            plot_urls=[f"/scratch/{path}" for path in plot_paths],
+            plot_urls=[f"/figures/{path}" for path in plot_paths],
             plot_images=encoded_images,
         )
 
@@ -176,7 +176,7 @@ def build_tools(session: "ExplorationSession"):
 
     @tool(
         "note",
-        "Append one line to notes.md. `kind` is 'fact' (something learned about the system) "
+        "Append one line to xprober/notes/notes.md. `kind` is 'fact' (something learned about the system) "
         "or 'dead_end' (something tried that gave nothing).",
         {"kind": str, "text": str},
     )

@@ -20,26 +20,34 @@ class Workspace:
     """Own all filesystem state belonging to one exploration directory."""
 
     def __init__(self, path: Path | str):
-        self.path = Path(path).resolve()
-        self.notes_path = self.path / "notes.md"
-        self.scratch_path = self.path / "scratch"
-        self.transcript_path = self.scratch_path / "pending.jsonl"
         self.set_path(path)
 
     def set_path(self, path: Path | str):
         self.path = Path(path).resolve()
         self.path.mkdir(parents=True, exist_ok=True)
-        self.notes_path = self.path / "notes.md"
+        self.xprober_path = self.path / "xprober"
+        self.notes_dir_path = self.xprober_path / "notes"
+        self.transcripts_path = self.xprober_path / "transcripts"
+        self.figures_path = self.xprober_path / "figures"
+        self.scratch_path = self.xprober_path / "scratch"
+        for directory in (
+            self.notes_dir_path,
+            self.transcripts_path,
+            self.figures_path,
+            self.scratch_path,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        self.notes_path = self.notes_dir_path / "notes.md"
         if not self.notes_path.exists():
             self.notes_path.write_text(NOTES_TEMPLATE)
-        self.scratch_path = self.path / "scratch"
-        self.scratch_path.mkdir(parents=True, exist_ok=True)
         self.start_new_transcript()
 
     def start_new_transcript(self):
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.transcript_path = (
-            self.scratch_path / f"transcript-{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
+            self.transcripts_path
+            / f"transcript-{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
         )
 
     def log_transcript(self, kind: str, **fields):
@@ -80,7 +88,7 @@ class Workspace:
         filenames = []
         for index, image in enumerate(images):
             filename = f"plot-{stamp}-{index}.png"
-            (self.scratch_path / filename).write_bytes(image)
+            (self.figures_path / filename).write_bytes(image)
             filenames.append(filename)
         return filenames
 
@@ -102,7 +110,7 @@ class Workspace:
                             "path": str(relative),
                             "size": stat.st_size,
                             "modified": stat.st_mtime,
-                            "is_notes": relative.name == "notes.md",
+                            "is_notes": path == self.notes_path,
                         }
                     )
                 except Exception as exc:
@@ -130,9 +138,9 @@ class Workspace:
 
     def list_plots(self) -> list[dict[str, Any]]:
         plots = []
-        if self.scratch_path.exists():
+        if self.figures_path.exists():
             paths = sorted(
-                self.scratch_path.glob("plot-*.png"),
+                self.figures_path.glob("plot-*.png"),
                 key=lambda path: path.stat().st_mtime,
                 reverse=True,
             )
@@ -141,7 +149,7 @@ class Workspace:
                 plots.append(
                     {
                         "filename": path.name,
-                        "url": f"/scratch/{path.name}",
+                        "url": f"/figures/{path.name}",
                         "modified": stat.st_mtime,
                         "size": stat.st_size,
                     }
@@ -152,8 +160,8 @@ class Workspace:
         name = Path(session_id).name
         if not name.startswith("transcript-") or not name.endswith(".jsonl"):
             raise ValueError("Not a transcript file")
-        path = (self.scratch_path / name).resolve()
-        if not str(path).startswith(str(self.scratch_path.resolve())):
+        path = (self.transcripts_path / name).resolve()
+        if not str(path).startswith(str(self.transcripts_path.resolve())):
             raise ValueError("Transcript path outside workspace")
         if not path.is_file():
             raise FileNotFoundError(f"No transcript {name}")
@@ -185,9 +193,9 @@ class Workspace:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []
-        if not self.scratch_path.exists():
+        if not self.transcripts_path.exists():
             return sessions
-        for path in self.scratch_path.glob("transcript-*.jsonl"):
+        for path in self.transcripts_path.glob("transcript-*.jsonl"):
             records = self.read_transcript(path)
             if not records:
                 continue

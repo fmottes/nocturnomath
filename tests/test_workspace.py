@@ -9,7 +9,11 @@ def test_workspace_initializes_notes_and_unique_transcripts(tmp_path):
 
     assert workspace.notes_path.read_text() == NOTES_TEMPLATE
     assert workspace.transcript_path != first
-    assert workspace.transcript_path.parent == tmp_path / "scratch"
+    assert workspace.notes_path == tmp_path / "xprober" / "notes" / "notes.md"
+    assert workspace.transcript_path.parent == tmp_path / "xprober" / "transcripts"
+    assert workspace.figures_path == tmp_path / "xprober" / "figures"
+    assert workspace.scratch_path == tmp_path / "xprober" / "scratch"
+    assert workspace.scratch_path.is_dir()
 
 
 def test_notes_files_plots_and_transcript_history(tmp_path):
@@ -22,10 +26,11 @@ def test_notes_files_plots_and_transcript_history(tmp_path):
 
     assert "- the value is positive" in workspace.notes_path.read_text()
     assert [item["path"] for item in workspace.list_markdown_files()] == [
-        "notes.md",
+        "xprober/notes/notes.md",
         "report.md",
     ]
     assert {item["filename"] for item in workspace.list_plots()} == set(plot_names)
+    assert all((workspace.figures_path / name).is_file() for name in plot_names)
     [history] = workspace.list_sessions()
     assert history["title"] == "inspect the data"
     assert history["context_restorable"] is True

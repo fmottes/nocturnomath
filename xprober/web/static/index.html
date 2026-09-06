@@ -84,7 +84,7 @@
             <span>Exploration log</span>
           </div>
           <div class="chat-header-actions">
-            <label class="toggle-label switch-label" id="context-control" title="Keep the conversation across messages, as the CLI does. Off: every message starts fresh from the system prompt plus notes.md.">
+            <label class="toggle-label switch-label" id="context-control" title="Keep the conversation across messages, as the CLI does. Off: every message starts fresh from the system prompt plus xprober/notes/notes.md.">
               <span class="toggle-text">Keep context</span>
               <input type="checkbox" id="context-toggle" class="switch-input" checked>
               <span class="switch" aria-hidden="true"></span>
@@ -158,7 +158,7 @@
             <!-- File Selector Dropdown -->
             <div class="file-selector-wrapper" id="file-selector-wrapper">
               <select id="file-select" class="file-select" title="Select markdown document">
-                <option value="notes.md">notes.md</option>
+                <option value="xprober/notes/notes.md">xprober/notes/notes.md</option>
               </select>
             </div>
 
@@ -184,7 +184,7 @@
           <!-- Document Reader Tab View -->
           <div class="tab-view active" id="view-doc">
             <div class="doc-header-info" id="doc-header-info">
-              <span class="doc-path-label" id="doc-path-label">notes.md</span>
+              <span class="doc-path-label" id="doc-path-label">xprober/notes/notes.md</span>
               <span class="doc-meta-label" id="doc-meta-label"></span>
             </div>
             <article class="markdown-body" id="markdown-container">
@@ -216,7 +216,7 @@
         </div>
         <div class="modal-body">
           <p class="modal-help">
-            Chats recorded under <code>scratch/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>notes.md</code>.
+            Chats recorded under <code>xprober/transcripts/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>xprober/notes/notes.md</code>.
           </p>
           <div class="session-list" id="session-list">
             <div class="empty-state">Loading sessions&hellip;</div>
@@ -249,7 +249,7 @@
       </div>
       <div class="modal-body">
         <p class="modal-help" id="folder-modal-help">
-          Browse to an existing folder. Once opened, the agent will create and manage <code>notes.md</code> and <code>scratch/</code> there.
+          Browse to an existing folder. Once opened, the agent will create and manage its files under <code>xprober/</code>.
         </p>
         <form id="folder-form">
           <div class="form-group">

@@ -1,6 +1,6 @@
 export const state = {
   workspace: null,
-  activeDoc: "notes.md",
+  activeDoc: null,
   rawView: false,
   autoSync: true,
   plots: [],

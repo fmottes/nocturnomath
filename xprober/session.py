@@ -63,8 +63,8 @@ class ExplorationSession:
         return self.workspace.notes_path
 
     @property
-    def scratch_path(self) -> Path:
-        return self.workspace.scratch_path
+    def figures_path(self) -> Path:
+        return self.workspace.figures_path
 
     @property
     def transcript_path(self) -> Path:

@@ -34,6 +34,8 @@ If the idea cannot be stated in three sentences, it is two ideas. Split it.
   `savefig`, and never switch the matplotlib backend (`matplotlib.use`, `switch_backend`).
   Because the kernel is persistent, switching the backend silently stops plot capture for
   the rest of the session — you would stop seeing your own plots.
+- Only if a probe strictly requires a temporary file or artifact, write it under
+  `xprober/scratch/`; otherwise keep the work in memory.
 - If you find yourself building machinery, stop and ask whether a cruder approach answers the
   question.
 

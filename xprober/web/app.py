@@ -94,6 +94,7 @@ def create_app(
                 "kernel_busy": False,
                 "is_busy": False,
                 "carry_chat_context": True,
+                "notes_path": "xprober/notes/notes.md",
                 "notes_content": "",
                 "markdown_files": [],
                 "plots": [],
@@ -113,6 +114,7 @@ def create_app(
             "kernel_busy": session.kernel.busy,
             "is_busy": session._is_busy,
             "carry_chat_context": session.carry_chat_context,
+            "notes_path": str(session.notes_path.relative_to(session.workspace_path)),
             "notes_content": notes_content,
             "markdown_files": session.list_markdown_files(),
             "plots": session.list_plots(),
@@ -141,11 +143,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="index.html not found")
         return FileResponse(index_path)
 
-    @app.get("/scratch/{filename}")
-    async def get_scratch_plot(filename: str):
+    @app.get("/figures/{filename}")
+    async def get_figure(filename: str):
         session = active_session()
-        file_path = (session.scratch_path / filename).resolve()
-        if not str(file_path).startswith(str(session.scratch_path.resolve())):
+        file_path = (session.figures_path / filename).resolve()
+        if not str(file_path).startswith(str(session.figures_path.resolve())):
             raise HTTPException(status_code=403, detail="Forbidden")
         if not file_path.is_file():
             raise HTTPException(status_code=404, detail="Image not found")

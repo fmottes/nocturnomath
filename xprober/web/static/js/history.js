@@ -137,7 +137,7 @@ export function replaySession(records, contextRestored, carryChatContext) {
           rec.expected || "",
           rec.code || "",
           rec.output || "",
-          (rec.images || []).map((name) => `/scratch/${name}`),
+          (rec.images || []).map((name) => `/figures/${name}`),
           []
         );
         break;
@@ -158,7 +158,7 @@ export function replaySession(records, contextRestored, carryChatContext) {
   let resumeNote;
   if (!carryChatContext) {
     resumeNote =
-      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `notes.md` — it does not read the conversation above.";
+      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `xprober/notes/notes.md` — it does not read the conversation above.";
   } else if (contextRestored) {
     resumeNote =
       "Resumed this chat. The agent still has its original context; the kernel keeps whatever state it holds now.";

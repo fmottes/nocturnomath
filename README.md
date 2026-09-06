@@ -1,12 +1,12 @@
 # Xprober
 
-Xprober is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, live markdown memory (`notes.md`), and a split-screen local web app dashboard.
+Xprober is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, live markdown memory (`xprober/notes/notes.md`), and a split-screen local web app dashboard.
 
 ## Features
 
 - **Split-Screen Web App**:
   - **Left Half**: Interactive chat interface with Claude, rich probe execution cards (showing expected outcomes, collapsible Python code, stdout/stderr), inline plot rendering, and kernel status controls.
-  - **Right Half**: Live-rendered Markdown reader (auto-syncing `notes.md`, reports, and other markdown docs) and scratch plots gallery.
+  - **Right Half**: Live-rendered Markdown reader (auto-syncing `xprober/notes/notes.md`, reports, and other markdown docs) and figures gallery.
   - **Draggable Gutter**: Easily resize the split panes to focus on chat or document reading.
   - **Workspace Picker**: The web app opens on a landing page with a visual folder navigator. It does not start a kernel or create workspace files until you open a folder.
 
@@ -53,6 +53,20 @@ uv run xprober-cli
 
 The terminal and web interfaces share the same prompt, tools, persistent kernel,
 notes, transcripts, verdict gating, and context behavior.
+
+Xprober keeps its managed artifacts together inside the selected workspace:
+
+```text
+xprober/
+├── transcripts/
+├── notes/
+│   └── notes.md
+├── figures/
+└── scratch/
+```
+
+The agent uses `xprober/scratch/` only when a probe strictly requires a temporary
+file or artifact; otherwise probe work remains in memory.
 
 ## Project structure
 
