@@ -1,5 +1,5 @@
-import { elements, state } from "./state.js";
-import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js";
+import { elements, state } from "./state.js?v=20260906-1";
+import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260906-1";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -169,4 +169,3 @@ export function replaySession(records, contextRestored, carryChatContext) {
   appendSystemMessage(resumeNote);
   scrollChatToBottom();
 }
-

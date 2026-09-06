@@ -19,6 +19,7 @@ export const elements = {
   landingScreen: document.getElementById("landing-screen"),
   workspaceApp: document.getElementById("workspace-app"),
   btnOpenWorkspace: document.getElementById("btn-open-workspace"),
+  recentWorkspaces: document.getElementById("recent-workspaces"),
   workspacePath: document.getElementById("workspace-path"),
   modelBadge: document.getElementById("model-badge"),
   kernelDot: document.getElementById("kernel-dot"),

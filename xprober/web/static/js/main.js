@@ -1,10 +1,10 @@
-import { elements, state } from "./state.js";
-import { initWebSocket, sendWs } from "./transport.js";
-import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext } from "./workspace.js";
-import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js";
-import { loadSessions, replaySession } from "./history.js";
-import { updateAgentStatus, updateKernelStatus } from "./status.js";
-import { closeLightbox } from "./ui.js";
+import { elements, state } from "./state.js?v=20260906-1";
+import { initWebSocket, sendWs } from "./transport.js?v=20260906-1";
+import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext } from "./workspace.js?v=20260906-1";
+import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260906-1";
+import { loadSessions, replaySession } from "./history.js?v=20260906-1";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
+import { closeLightbox } from "./ui.js?v=20260906-1";
 
 // ============================================================================
 // Server Event Dispatcher

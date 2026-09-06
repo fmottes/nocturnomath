@@ -1,4 +1,4 @@
-import { elements } from "./state.js";
+import { elements } from "./state.js?v=20260906-1";
 
 // ============================================================================
 // Status Updaters
@@ -31,4 +31,3 @@ export function updateAgentStatus(status) {
     elements.btnInterrupt.classList.add("hidden");
   }
 }
-

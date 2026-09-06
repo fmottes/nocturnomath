@@ -76,6 +76,13 @@ def create_app(
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def disable_static_cache(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def workspace_snapshot():
         session = runtime.session
         if session is None:

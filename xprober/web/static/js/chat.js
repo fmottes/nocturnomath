@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js";
-import { highlightBlocks, renderMarkdown } from "./markdown.js";
-import { openLightbox } from "./ui.js";
+import { elements, state } from "./state.js?v=20260906-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260906-1";
+import { openLightbox } from "./ui.js?v=20260906-1";
 
 // ============================================================================
 // Chat UI Rendering
@@ -239,4 +239,3 @@ export function appendErrorMessage(msg) {
   elements.chatMessages.appendChild(bubble);
   scrollChatToBottom();
 }
-

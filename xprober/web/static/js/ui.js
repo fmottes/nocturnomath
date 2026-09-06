@@ -1,4 +1,4 @@
-import { elements } from "./state.js";
+import { elements } from "./state.js?v=20260906-1";
 
 // ============================================================================
 // Lightbox View
@@ -12,4 +12,3 @@ export function openLightbox(imgSrc, caption) {
 export function closeLightbox() {
   elements.lightboxModal.classList.add("hidden");
 }
-

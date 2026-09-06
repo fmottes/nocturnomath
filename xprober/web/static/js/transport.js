@@ -1,4 +1,4 @@
-import { state } from "./state.js";
+import { state } from "./state.js?v=20260906-1";
 
 export function initWebSocket(onMessage, onOpen, onClose) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";

@@ -85,7 +85,9 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
             == "# Report"
         )
         assert client.get("/").status_code == 200
-        assert client.get("/static/js/main.js").status_code == 200
+        static_script = client.get("/static/js/main.js")
+        assert static_script.status_code == 200
+        assert static_script.headers["cache-control"] == "no-store"
         assert client.get("/static/css/base.css").status_code == 200
 
 

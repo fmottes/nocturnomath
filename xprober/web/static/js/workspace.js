@@ -1,7 +1,7 @@
-import { elements, state } from "./state.js";
-import { highlightBlocks, renderMarkdown } from "./markdown.js";
-import { openLightbox } from "./ui.js";
-import { updateAgentStatus, updateKernelStatus } from "./status.js";
+import { elements, state } from "./state.js?v=20260906-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260906-1";
+import { openLightbox } from "./ui.js?v=20260906-1";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -12,10 +12,11 @@ export function applyWorkspace(ws) {
     return;
   }
   state.workspace = ws;
+  recordRecentWorkspace(ws.path);
   elements.landingScreen.classList.add("hidden");
   elements.workspaceApp.classList.remove("hidden");
 
-  elements.workspacePath.textContent = ws.path;
+  elements.workspacePath.textContent = workspaceName(ws.path);
   elements.modelBadge.textContent = ws.model || "claude-opus-5";
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
@@ -32,11 +33,84 @@ export function applyWorkspace(ws) {
   loadPlots();
 }
 
+function workspaceName(path) {
+  const parts = String(path || "").split(/[\\/]+/).filter(Boolean);
+  return parts.at(-1) || path;
+}
+
 export function showLanding(ws) {
   state.workspace = null;
   state.navigatorRoot = ws?.navigator_root || state.navigatorRoot || ".";
   elements.workspaceApp.classList.add("hidden");
   elements.landingScreen.classList.remove("hidden");
+  renderRecentWorkspaces();
+}
+
+const RECENT_WORKSPACES_KEY = "xprober.recent-workspaces";
+const RECENT_WORKSPACE_LIMIT = 6;
+
+function recentWorkspaces() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY) || "[]");
+    return Array.isArray(stored) ? stored.filter((path) => typeof path === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordRecentWorkspace(path) {
+  if (!path) return;
+  const projects = [path, ...recentWorkspaces().filter((item) => item !== path)]
+    .slice(0, RECENT_WORKSPACE_LIMIT);
+  localStorage.setItem(RECENT_WORKSPACES_KEY, JSON.stringify(projects));
+}
+
+function removeRecentWorkspace(path) {
+  localStorage.setItem(
+    RECENT_WORKSPACES_KEY,
+    JSON.stringify(recentWorkspaces().filter((item) => item !== path))
+  );
+}
+
+function renderRecentWorkspaces() {
+  const projects = recentWorkspaces();
+  elements.recentWorkspaces.innerHTML = "";
+  if (!projects.length) return;
+
+  const heading = document.createElement("span");
+  heading.className = "recent-workspaces-label";
+  heading.textContent = "Recent projects";
+  elements.recentWorkspaces.appendChild(heading);
+
+  const list = document.createElement("div");
+  list.className = "recent-workspaces-list";
+  projects.forEach((path) => {
+    const project = document.createElement("button");
+    project.type = "button";
+    project.className = "recent-workspace";
+    project.textContent = path;
+    project.title = path;
+    project.addEventListener("click", () => openRecentWorkspace(path));
+    list.appendChild(project);
+  });
+  elements.recentWorkspaces.appendChild(list);
+}
+
+async function openRecentWorkspace(path) {
+  try {
+    const res = await fetch("/api/workspace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Unable to open project");
+    applyWorkspace(data.workspace);
+  } catch (error) {
+    console.error("Unable to open recent workspace:", error);
+    removeRecentWorkspace(path);
+    renderRecentWorkspaces();
+  }
 }
 
 export function setCarryContext(enabled) {
