@@ -235,6 +235,7 @@ def build_tools(session: "ExplorationSession"):
             output=output,
             text=text,
             status=status,
+            execution_note=kernel_note,
             plot_paths=plot_paths,
             plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
             plot_images=encoded_images,

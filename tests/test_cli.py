@@ -437,6 +437,16 @@ def test_streamed_text_replaces_the_deltas_it_was_built_from(terminal):
     assert terminal.output().count("Second block") == 1
 
 
+def test_a_cancelled_turn_keeps_the_text_streamed_so_far(terminal):
+    terminal.app.render_event("status_change", {"status": "thinking"})
+    terminal.app.render_event("assistant_delta", {"text": "Partial ans"})
+    assert terminal.output() == ""
+    terminal.app.render_event("status_change", {"status": "cancelled"})
+    assert terminal.output().count("Partial ans") == 1
+    terminal.app.render_event("turn_complete", {})
+    assert terminal.output() == ""
+
+
 def test_probe_panels_collapse_the_code_and_cap_the_output(terminal):
     payload = dict(EVENT_PAYLOAD)
     payload["code"] = "a = 1\nb = 2\n"
@@ -447,9 +457,11 @@ def test_probe_panels_collapse_the_code_and_cap_the_output(terminal):
 
     payload["text"] = "\n".join(f"line {number}" for number in range(1, 101))
     payload["status"] = "error"
+    payload["execution_note"] = "Execution stopped after 600 seconds."
     terminal.app.render_event("probe_finish", payload)
     finished = terminal.output()
     assert "error" in finished
+    assert "Execution stopped after 600 seconds." in finished
     assert "line 60" in finished and "line 61" not in finished
     output_path = terminal.session.workspace_path / (
         ".nocturnomath/sessions/S001/probes/P001/output.txt"

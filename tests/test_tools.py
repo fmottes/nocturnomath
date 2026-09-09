@@ -58,6 +58,7 @@ async def test_run_verdict_and_evidence_contract(session, monkeypatch):
     assert finish["code_path"] == start["code_path"]
     assert finish["status"] == "completed"
     assert finish["text"] == "result"
+    assert finish["execution_note"] is None
     assert finish["plot_paths"] == []
     assert "Source:" in finish["output"]
 

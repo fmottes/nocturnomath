@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
@@ -58,6 +59,24 @@ def format_time(epoch_seconds: float) -> str:
     return time.strftime("%b %d %H:%M", time.localtime(epoch_seconds))
 
 
+class Tail:
+    """Show only the last lines of a renderable that fit on the screen.
+
+    A live region taller than the terminal cannot be redrawn in place, so the
+    streamed block would repeat itself; following its tail keeps it bounded.
+    """
+
+    def __init__(self, renderable: Any):
+        self.renderable = renderable
+
+    def __rich_console__(self, console, options):
+        lines = console.render_lines(self.renderable, options, pad=False)
+        keep = max(options.size.height - 2, 1)
+        for line in lines[-keep:]:
+            yield from line
+            yield Segment.line()
+
+
 class TerminalApp:
     """Render runtime events and run slash commands against the shared runtime."""
 
@@ -85,8 +104,8 @@ class TerminalApp:
 
     def show(self, renderable: Any, console: Console | None = None, style=None):
         """Print to the scrollback, pausing the spinner and any streamed block."""
-        self.close_stream()
         self.hide_spinner()
+        self.close_stream()
         (console or self.console).print(
             renderable, style=style, highlight=False, markup=False
         )
@@ -108,7 +127,8 @@ class TerminalApp:
 
     def show_spinner(self, message: str):
         """Report progress transiently; the spinner never reaches the scrollback."""
-        self.close_stream()
+        if self._stream_text:
+            return
         self._spinner_message = message
         if self._spinner is None:
             self._spinner = self.console.status(message, spinner="dots")
@@ -132,25 +152,32 @@ class TerminalApp:
     # --------------------------------------------------------------- streaming
 
     def stream_delta(self, chunk: str):
-        """Grow the live region the assistant is currently writing into."""
-        if self._live is None:
+        """Grow the block the assistant is writing; on a terminal, show its tail live."""
+        if not self._stream_text:
             self.hide_spinner()
-            self._stream_text = ""
+        self._stream_text += chunk
+        if not self.console.is_terminal:
+            return
+        if self._live is None:
             self._live = Live(
-                Markdown(""), console=self.console, vertical_overflow="visible"
+                console=self.console,
+                transient=True,
+                auto_refresh=False,
+                redirect_stdout=False,
+                redirect_stderr=False,
             )
             self._live.start()
-        self._stream_text += chunk
-        self._live.update(Markdown(self._stream_text), refresh=True)
+        self._live.update(Tail(Markdown(self._stream_text)), refresh=True)
 
-    def close_stream(self):
-        if self._live is None:
-            return
-        live, self._live = self._live, None
+    def close_stream(self, final: str | None = None):
+        """Replace the live tail with the block's final text, or what streamed so far."""
         streamed, self._stream_text = self._stream_text, ""
-        live.stop()
-        if streamed and not self.console.is_terminal:
-            self.console.line()
+        if self._live is not None:
+            live, self._live = self._live, None
+            live.stop()
+        text = streamed if final is None else final
+        if text:
+            self.console.print(Markdown(text))
 
     def banner(self):
         session = self.runtime.session
@@ -217,12 +244,8 @@ class TerminalApp:
             self.stream_delta(chunk)
 
     def _render_assistant_text(self, payload):
-        text = payload.get("text", "")
-        if self._live is None:
-            self.show(Markdown(text))
-            return
-        self._live.update(Markdown(text), refresh=True)
-        self.close_stream()
+        self.hide_spinner()
+        self.close_stream(final=payload.get("text", ""))
         self.resume_spinner()
 
     def _render_probe_start(self, payload):
@@ -257,6 +280,9 @@ class TerminalApp:
                 f"\n… {hidden} more lines in {self.probe_file(payload, 'output.txt')}",
                 style="dim",
             )
+        note = payload.get("execution_note")
+        if note:
+            body.append(f"\n{note}", style="yellow")
         for plot in self.plot_paths(payload):
             body.append(f"\nsaved plot: {self.workspace_file(plot)}", style="dim")
         if self._spinner_message:
