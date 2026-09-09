@@ -35,7 +35,8 @@ class CommandCompleter(Completer):
         if not separator:
             yield from self.command_names(name)
             return
-        word = argument.rsplit(" ", 1)[-1]
+        single_path_commands = {"/docs", "/env", "/workspace"}
+        word = argument if name in single_path_commands else argument.rsplit(" ", 1)[-1]
         for value, meta in self.arguments(name):
             if value.startswith(word):
                 yield Completion(
@@ -44,7 +45,7 @@ class CommandCompleter(Completer):
         delegate = {"/env": self.files, "/workspace": self.directories}.get(name)
         if delegate is not None:
             yield from delegate.get_completions(
-                Document(word, len(word)), complete_event
+                Document(argument, len(argument)), complete_event
             )
 
     def command_names(self, prefix: str) -> Iterator[Completion]:

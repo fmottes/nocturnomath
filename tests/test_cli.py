@@ -544,6 +544,8 @@ def test_completer_suggests_command_arguments(completer, terminal):
 
 def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     (terminal.session.workspace_path / "other-workspace").mkdir()
+    (terminal.session.workspace_path / "workspace with spaces").mkdir()
+    (terminal.session.workspace_path / "report with spaces.md").write_text("# Report\n")
     assert "managed" in [text for text, _ in complete(completer, "/env man")]
 
     root = terminal.session.workspace_path
@@ -551,3 +553,12 @@ def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     completions = list(completer.get_completions(document, CompleteEvent()))
     assert [completion.text for completion in completions] == ["-workspace"]
     assert completions[0].display_text.startswith("other-workspace")
+
+    document = Document(f"/workspace {root}/workspace with")
+    completions = list(completer.get_completions(document, CompleteEvent()))
+    assert [completion.text for completion in completions] == [" spaces"]
+    assert completions[0].display_text.startswith("workspace with spaces")
+
+    assert "report with spaces.md" in [
+        text for text, _ in complete(completer, "/docs report with")
+    ]

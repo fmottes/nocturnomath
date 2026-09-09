@@ -52,7 +52,9 @@ function handleServerEvent(event) {
       break;
 
     case "probe_finish":
-      appendProbeFinish(event.expected, event.code, event.text ?? event.output, event.plot_urls, event.plot_images);
+      // Preserve the web app's existing probe card contract: `output` includes
+      // source paths and any guidance emitted alongside the raw kernel text.
+      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images);
       loadPlots();
       break;
 
