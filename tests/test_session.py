@@ -1,16 +1,27 @@
 import asyncio
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock
+
+
+def stream_event(delta, parent_tool_use_id=None):
+    return StreamEvent(
+        uuid="stream-event",
+        session_id="sdk-session",
+        event={"type": "content_block_delta", "index": 0, "delta": delta},
+        parent_tool_use_id=parent_tool_use_id,
+    )
 
 
 class FakeClient:
     prompts: ClassVar[list[str]] = []
+    options_used: ClassVar[list[Any]] = []
 
     def __init__(self, options):
         self.options = options
+        FakeClient.options_used.append(options)
 
     async def __aenter__(self):
         return self
@@ -22,24 +33,51 @@ class FakeClient:
         self.prompts.append(prompt)
 
     async def receive_response(self):
+        yield stream_event({"type": "text_delta", "text": "ans"})
+        yield stream_event({"type": "text_delta", "text": "wer"})
+        yield stream_event({"type": "thinking_delta", "thinking": "musing"})
+        yield stream_event({"type": "text_delta", "text": "sub"}, "tool-use-1")
         yield AssistantMessage(
             content=[TextBlock("answer")], model="test", session_id="sdk-session"
         )
 
 
 @pytest.mark.asyncio
-async def test_query_emits_text_tracks_context_and_logs(session):
+async def test_query_streams_text_tracks_context_and_logs(session):
     events = []
-    session.subscribe(lambda event_type, payload: events.append(event_type))
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
     with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
         await session.query("question")
 
     assert session._sdk_session_id == "sdk-session"
-    assert "assistant_text" in events
-    assert events[0] == "status_change"
-    assert events[-1] == "status_change"
+    assert FakeClient.options_used[-1].include_partial_messages is True
+    assert [event_type for event_type, _ in events] == [
+        "status_change",
+        "assistant_delta",
+        "assistant_delta",
+        "assistant_text",
+        "turn_complete",
+        "status_change",
+    ]
+    payloads = dict(events)
+    deltas = [
+        payload["text"]
+        for event_type, payload in events
+        if event_type == "assistant_delta"
+    ]
+    assert deltas == ["ans", "wer"]
+    assert payloads["assistant_text"]["text"] == "answer"
+    assert payloads["turn_complete"]["full_text"] == "answer"
     records = session.workspace.read_transcript(session.transcript_path)
-    assert [record["kind"] for record in records] == ["kernel_started", "user", "meta", "agent"]
+    assert [record["kind"] for record in records] == [
+        "kernel_started",
+        "user",
+        "meta",
+        "agent",
+    ]
+    assert [record["text"] for record in records if record["kind"] == "agent"] == [
+        "answer"
+    ]
 
 
 @pytest.mark.asyncio

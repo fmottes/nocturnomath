@@ -72,12 +72,18 @@ class ResearchEnvironment:
 
     @staticmethod
     def uv():
+        """Prefer the uv on PATH, then the binary bundled with the uv package."""
         executable = shutil.which("uv")
-        if not executable:
+        if executable:
+            return executable
+        try:
+            from uv import find_uv_bin
+
+            return find_uv_bin()
+        except (ImportError, FileNotFoundError):
             raise ValueError(
                 "uv is required to prepare research environments. Install uv and restart the app."
             )
-        return executable
 
     def process_env(self):
         env = os.environ.copy()

@@ -11,7 +11,7 @@ from nocturnomath.web import create_app
 def sdk_model_catalog():
     with (
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
-        patch("nocturnomath.web.runtime.ClaudeSDKClient") as sdk,
+        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
     ):
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
@@ -121,6 +121,9 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         static_script = client.get("/static/js/main.js")
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store"
+        assert "appendProbeFinish(event.expected, event.code, event.output," in (
+            static_script.text
+        )
         assert client.get("/static/css/base.css").status_code == 200
         plots = client.get("/api/plots").json()["plots"]
         assert (
@@ -148,9 +151,7 @@ def test_current_session_downloads_as_notebook(session):
         session.log_transcript(
             "probe_started", probe_id="S001/P001", expected="3", code="print(3)"
         )
-        session.log_transcript(
-            "run", probe_id="S001/P001", output="3\n", images=[]
-        )
+        session.log_transcript("run", probe_id="S001/P001", output="3\n", images=[])
         response = client.get("/api/session/notebook")
 
     assert response.status_code == 200
@@ -162,7 +163,13 @@ def test_current_session_downloads_as_notebook(session):
 
 
 def test_websocket_event_contract(session):
-    session.query = AsyncMock()
+    async def query(text):
+        await session.emit("assistant_delta", text="streamed ")
+        await session.emit("assistant_delta", text="reply")
+        await session.emit("assistant_text", text="streamed reply")
+        await session.emit("turn_complete", full_text="streamed reply")
+
+    session.query = query
     app = create_app(session)
     with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
         init = websocket.receive_json()
@@ -173,6 +180,23 @@ def test_websocket_event_contract(session):
             "type": "user_message",
             "text": "question",
         }
+        first_delta = websocket.receive_json()
+        second_delta = websocket.receive_json()
+        assert (first_delta["type"], first_delta["text"]) == (
+            "assistant_delta",
+            "streamed ",
+        )
+        assert (second_delta["type"], second_delta["text"]) == (
+            "assistant_delta",
+            "reply",
+        )
+        assistant = websocket.receive_json()
+        assert assistant["type"] == "assistant_text"
+        assert assistant["text"] == "streamed reply"
+        assert isinstance(assistant["timestamp"], float)
+        complete = websocket.receive_json()
+        assert complete["type"] == "turn_complete"
+        assert complete["full_text"] == "streamed reply"
 
 
 def test_new_session_restarts_kernel_and_broadcasts_reset(session):

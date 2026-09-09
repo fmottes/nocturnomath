@@ -52,6 +52,15 @@ async def test_run_verdict_and_evidence_contract(session, monkeypatch):
         "probe_verdict",
         "record_changed",
     ]
+    start = next(payload for name, payload in events if name == "probe_start")
+    finish = next(payload for name, payload in events if name == "probe_finish")
+    assert start["code_path"] == ".nocturnomath/sessions/S001/probes/P001/code.py"
+    assert finish["code_path"] == start["code_path"]
+    assert finish["status"] == "completed"
+    assert finish["text"] == "result"
+    assert finish["execution_note"] is None
+    assert finish["plot_paths"] == []
+    assert "Source:" in finish["output"]
 
 
 @pytest.mark.asyncio
@@ -59,12 +68,23 @@ async def test_run_saves_all_plots_but_caps_sdk_images(session, monkeypatch):
     monkeypatch.setattr("nocturnomath.tools.asyncio.to_thread", run_inline)
     session.image_cap = 1
     session.kernel.result = ("", [b"one", b"two"], None)
+    events = []
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
     result = await tools_by_name(session)["run"].handler(
         {"code": "plot()", "expected": "two plots"}
     )
 
     assert len(session.list_plots()) == 2
     assert [item["type"] for item in result["content"]] == ["text", "image"]
+    finish = next(payload for name, payload in events if name == "probe_finish")
+    assert finish["plot_paths"] == [
+        ".nocturnomath/sessions/S001/probes/P001/plot-1.png",
+        ".nocturnomath/sessions/S001/probes/P001/plot-2.png",
+    ]
+    assert finish["plot_urls"] == [
+        f"/api/asset?path={path}" for path in finish["plot_paths"]
+    ]
+    assert finish["text"] == ""
 
 
 @pytest.mark.asyncio
@@ -107,7 +127,11 @@ async def test_cancelled_probe_keeps_output_and_blocks_workspace_switch(session)
     assert (probe / "plot-1.png").read_bytes() == b"partial plot"
     assert json.loads((probe / "probe.json").read_text())["status"] == "interrupted"
     records = session.workspace.read_transcript(session.transcript_path)
-    assert [record["kind"] for record in records] == ["kernel_started", "probe_started", "run"]
+    assert [record["kind"] for record in records] == [
+        "kernel_started",
+        "probe_started",
+        "run",
+    ]
     assert records[-1]["probe_id"] == "S001/P001"
     assert records[-1]["status"] == "interrupted"
     assert not session.has_active_query()
