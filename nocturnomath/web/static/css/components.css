@@ -140,6 +140,8 @@
 
 .btn-danger-outline { background: transparent; border-color: var(--danger); color: var(--danger); }
 .btn-danger-outline:hover:not(:disabled) { background: var(--danger); border-color: var(--danger); color: var(--paper); }
+.btn-success-outline { background: transparent; border-color: var(--ok); color: var(--ok); }
+.btn-success-outline:hover:not(:disabled) { background: var(--ok); border-color: var(--ok); color: var(--paper); }
 
 .badge {
   display: inline-block;

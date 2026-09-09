@@ -16,8 +16,10 @@ class FakeKernel:
         self.restarts = 0
         self.interrupts = 0
         self.result = ("result", [], None)
+        self.executed_codes = []
 
     def execute(self, code, timeout):
+        self.executed_codes.append(code)
         return self.result
 
     def is_alive(self):

@@ -80,34 +80,54 @@ export function renderSessions(sessions) {
     info.appendChild(title);
     info.appendChild(meta);
 
+    const controls = document.createElement("div");
+    controls.className = "session-controls";
+
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "btn btn-xs btn-outline";
+    btn.className = "btn btn-sm btn-success-outline";
     btn.textContent = s.is_current ? "Reload" : "Resume";
-    btn.addEventListener("click", () => resumeSession(s.id));
+    const mode = document.createElement("select");
+    mode.className = "model-select-native session-resume-mode";
+    mode.setAttribute("aria-label", `Resume mode for ${s.title}`);
+    mode.innerHTML = `<option value="chat">Chat only</option><option value="kernel">With kernel</option>`;
+    btn.addEventListener("click", () => resumeSession(s.id, mode.value === "kernel"));
 
     item.appendChild(info);
-    item.appendChild(btn);
+    controls.appendChild(btn);
+    controls.appendChild(mode);
+    item.appendChild(controls);
     elements.sessionList.appendChild(item);
   });
 }
 
-export async function resumeSession(sessionId) {
+export async function resumeSession(sessionId, restoreKernel = false) {
+  state.historyLoading = true;
+  elements.historyLoading.classList.remove("hidden");
+  elements.historyModal.querySelectorAll("button, select").forEach((control) => {
+    control.disabled = true;
+  });
   try {
     const res = await fetch("/api/session/resume", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: sessionId }),
+      body: JSON.stringify({ id: sessionId, restore_kernel: restoreKernel }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(`Failed to resume chat: ${err.detail || res.status}`);
+      alert(`Failed to resume session: ${err.detail || res.status}`);
       return;
     }
     // The chat is repainted by the "session_resumed" broadcast.
     elements.historyModal.classList.add("hidden");
   } catch (e) {
-    alert(`Error resuming chat: ${e.message}`);
+    alert(`Error resuming session: ${e.message}`);
+  } finally {
+    state.historyLoading = false;
+    elements.historyLoading.classList.add("hidden");
+    elements.historyModal.querySelectorAll("button, select").forEach((control) => {
+      control.disabled = false;
+    });
   }
 }
 
@@ -124,7 +144,7 @@ export function clearChat(showWelcome = true) {
   state.lastProbeCard = null;
 }
 
-export function replaySession(records, contextRestored, carryChatContext, kernelReset = false) {
+export function replaySession(records, contextRestored, carryChatContext, kernelReset = false, kernelRestored = false, probesReplayed = 0) {
   clearChat(false);
 
   const outcomes = new Set(records.filter((rec) =>
@@ -192,7 +212,11 @@ export function replaySession(records, contextRestored, carryChatContext, kernel
     resumeNote =
       "Resumed this chat. The agent's original context was not available, so it will pick up from a recap of the transcript above.";
   }
-  resumeNote += kernelReset ? " A fresh kernel is ready; previous variables are gone." : " The current kernel is unchanged.";
+  if (kernelRestored) {
+    resumeNote += ` The kernel was reconstructed by replaying ${probesReplayed} stored ${probesReplayed === 1 ? "probe" : "probes"} in order.`;
+  } else {
+    resumeNote += kernelReset ? " A fresh kernel is ready; previous variables are gone." : " The current kernel is unchanged.";
+  }
   appendSystemMessage(resumeNote);
   scrollChatToBottom();
 }

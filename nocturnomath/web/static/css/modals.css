@@ -22,6 +22,7 @@
   border: 1px solid var(--rule-strong);
 }
 .modal-dialog-wide { max-width: 700px; }
+.modal-dialog-history { width: 94%; max-width: 840px; }
 .modal-dialog-folder { max-width: 620px; }
 
 .modal-header {
@@ -37,6 +38,8 @@
   font-weight: 400;
   color: var(--blue);
 }
+.history-modal-header { position: relative; justify-content: center; }
+.history-modal-header .modal-close { position: absolute; right: 20px; }
 .modal-close {
   background: transparent;
   border: none;
@@ -192,22 +195,35 @@
   color: var(--ink-faint);
 }
 
-.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 18px; }
+.modal-action-buttons { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.history-loading { color: var(--ink-faint); font-family: var(--font-mono); font-size: 0.75rem; }
 
 .session-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
 .session-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
-  padding: 10px 12px;
   text-align: left;
+}
+.session-info {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
   background: var(--paper);
   border: 1px solid var(--rule);
 }
-.session-item:hover { border-color: var(--rule-strong); }
-.session-item.current { border-left: 2px solid var(--blue); }
-.session-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.session-item:hover .session-info { border-color: var(--rule-strong); }
+.session-item.current .session-info { border-left: 2px solid var(--blue); }
+.session-controls { display: flex; flex: 0 0 94px; flex-direction: column; align-items: flex-start; gap: 6px; }
+.session-controls .btn { width: 94px; align-self: flex-start; }
+.session-resume-mode {
+  width: 94px;
+}
 .session-title { font-size: 0.8125rem; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session-meta {
   display: flex;

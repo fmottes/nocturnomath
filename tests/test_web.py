@@ -171,6 +171,26 @@ def test_new_session_restarts_kernel_and_broadcasts_reset(session):
         assert session.kernel.restarts == 3
 
 
+def test_resume_session_can_restore_kernel(session):
+    session.log_transcript("user", text="question")
+    session.log_transcript("probe_started", probe_id="S001/P001", code="value = 3")
+    session.reset_client_session()
+    app = create_app(session)
+    with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        response = client.post(
+            "/api/session/resume",
+            json={"id": "S001", "restore_kernel": True},
+        )
+        event = websocket.receive_json()
+
+    assert response.status_code == 200
+    assert response.json()["probes_replayed"] == 1
+    assert event["type"] == "session_resumed"
+    assert event["kernel_restored"] is True
+    assert session.kernel.executed_codes == ["value = 3"]
+
+
 def test_model_selection_applies_to_next_query_without_resetting_context(session):
     seen_models = []
 

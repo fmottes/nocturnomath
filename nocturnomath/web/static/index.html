@@ -120,7 +120,7 @@
         <div class="chat-input-container">
           <!-- Slash command helper chips -->
           <div class="command-chips">
-            <select id="model-select" class="file-select" aria-label="Model for next message"></select>
+            <select id="model-select" class="model-select-native" aria-label="Model for next message"></select>
             <span class="chips-hint">Shift+Enter for a new line</span>
           </div>
 
@@ -225,21 +225,23 @@
 
     <!-- Chat History Modal -->
     <div class="modal-backdrop hidden" id="history-modal">
-      <div class="modal-dialog modal-dialog-wide">
-        <div class="modal-header">
-          <h3>Resume a past chat</h3>
+      <div class="modal-dialog modal-dialog-history">
+        <div class="modal-header history-modal-header">
+          <h3>Resume a past session</h3>
           <button class="modal-close" id="history-modal-close" type="button">&times;</button>
         </div>
         <div class="modal-body">
           <p class="modal-help">
-            Chats recorded under <code>.nocturnomath/sessions/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>evidence.md</code> and <code>thoughts.md</code>.
+            Chat only resumes the conversation without rebuilding its saved kernel state. With kernel reruns all stored probe code in order and may take some time.
           </p>
           <div class="session-list" id="session-list">
             <div class="empty-state">Loading sessions&hellip;</div>
           </div>
           <div class="modal-actions">
-            <button type="button" class="btn btn-xs btn-outline" id="btn-refresh-sessions">Refresh</button>
-            <button type="button" class="btn btn-ghost" id="history-modal-cancel">Close</button>
+            <span class="history-loading hidden" id="history-loading">Loading session...</span>
+            <div class="modal-action-buttons">
+              <button type="button" class="btn btn-ghost" id="history-modal-cancel">Close</button>
+            </div>
           </div>
         </div>
       </div>

@@ -110,7 +110,9 @@ function handleServerEvent(event) {
         event.records || [],
         event.context_restored,
         event.carry_chat_context,
-        event.kernel_reset
+        event.kernel_reset,
+        event.kernel_restored,
+        event.probes_replayed
       );
       break;
 
@@ -197,15 +199,14 @@ function setupEventListeners() {
     elements.historyModal.classList.remove("hidden");
     loadSessions();
   });
-  elements.historyModalClose.addEventListener("click", () =>
-    elements.historyModal.classList.add("hidden")
-  );
-  elements.historyModalCancel.addEventListener("click", () =>
-    elements.historyModal.classList.add("hidden")
-  );
-  elements.btnRefreshSessions.addEventListener("click", () => loadSessions());
+  elements.historyModalClose.addEventListener("click", () => {
+    if (!state.historyLoading) elements.historyModal.classList.add("hidden");
+  });
+  elements.historyModalCancel.addEventListener("click", () => {
+    if (!state.historyLoading) elements.historyModal.classList.add("hidden");
+  });
   elements.historyModal.addEventListener("click", (e) => {
-    if (e.target === elements.historyModal) elements.historyModal.classList.add("hidden");
+    if (e.target === elements.historyModal && !state.historyLoading) elements.historyModal.classList.add("hidden");
   });
   elements.contextToggle.addEventListener("change", (e) => {
     sendWs("set_carry_context", { enabled: e.target.checked });

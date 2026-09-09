@@ -75,3 +75,20 @@ async def test_resume_reads_current_records_and_reuses_session_probe_folder(sess
         await session.query("continue")
     assert "<del>" in FakeClient.prompts[-1]
     assert "Value = 3." in FakeClient.prompts[-1]
+
+
+def test_resume_with_kernel_replays_recorded_probe_code_in_order(session):
+    session.log_transcript("user", text="original investigation")
+    session.log_transcript("probe_started", probe_id="S001/P001", code="x = 1")
+    session.log_transcript("run", probe_id="S001/P001", code="x = 1")
+    session.log_transcript("probe_started", probe_id="S001/P002", code="y = x + 1")
+    session.reset_client_session()
+
+    resumed = session.resume_session("S001", restore_kernel=True)
+
+    assert session.kernel.executed_codes == ["x = 1", "y = x + 1"]
+    assert resumed["kernel_restored"] is True
+    assert resumed["probes_replayed"] == 2
+    assert "replaying 2 stored probes" in session._kernel_notice
+    records = session.workspace.read_transcript(session.transcript_path)
+    assert sum(record["kind"] == "run" for record in records) == 1

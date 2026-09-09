@@ -17,6 +17,7 @@ export const state = {
   navigatorRoot: null,
   folderParent: null,
   folderPickerMode: "open",
+  historyLoading: false,
 };
 
 export const elements = {
@@ -61,7 +62,7 @@ export const elements = {
   historyModalClose: document.getElementById("history-modal-close"),
   historyModalCancel: document.getElementById("history-modal-cancel"),
   sessionList: document.getElementById("session-list"),
-  btnRefreshSessions: document.getElementById("btn-refresh-sessions"),
+  historyLoading: document.getElementById("history-loading"),
   folderModal: document.getElementById("folder-modal"),
   modalClose: document.getElementById("modal-close"),
   modalCancel: document.getElementById("modal-cancel"),

@@ -39,6 +39,12 @@
 }
 .file-select:focus { border-color: var(--blue); }
 
+.model-select-native {
+  max-width: 190px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
 .toggle-label {
   display: flex;
   align-items: center;

@@ -164,7 +164,9 @@ class ExplorationSession:
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         return self.workspace.load_session(session_id)
 
-    def resume_session(self, session_id: str) -> dict[str, Any]:
+    def resume_session(
+        self, session_id: str, restore_kernel: bool = False
+    ) -> dict[str, Any]:
         if self.has_active_query():
             raise RuntimeError("Cannot resume while the agent is running a query.")
 
@@ -174,12 +176,20 @@ class ExplorationSession:
         changed = path != self.workspace.transcript_path
         previous_state = self.workspace.session_state()
         self.workspace.use_transcript(path)
-        if changed:
+        if changed or restore_kernel:
             try:
-                self.kernel.restart("historical session resumed")
+                reason = (
+                    "session kernel restored"
+                    if restore_kernel
+                    else "historical session resumed"
+                )
+                self.kernel.restart(reason)
+                replayed = self._replay_probe_code(records) if restore_kernel else 0
             except Exception:
                 self.workspace.restore_session_state(previous_state)
                 raise
+        else:
+            replayed = 0
         self._sdk_session_id = sdk_id
         self._results_since_note = 0
         self._pending_verdict = None
@@ -190,15 +200,39 @@ class ExplorationSession:
             self._session_initialized = False
             self._resume_prefix = None
 
-        self.log_transcript("resumed")
+        if restore_kernel:
+            probe_word = "probe" if replayed == 1 else "probes"
+            self._kernel_notice = (
+                f"\nKernel {self.kernel_id} was reconstructed by replaying {replayed} stored "
+                f"{probe_word} in order. Treat its in-memory state as an approximation of the end "
+                "of the resumed session.\n"
+            )
+        self.log_transcript(
+            "resumed", restore_kernel=restore_kernel, probes_replayed=replayed
+        )
         logger.info(f"Resumed chat {path.name}")
         return {
             "id": path.parent.name,
-            "kernel_reset": changed,
+            "kernel_reset": changed or restore_kernel,
+            "kernel_restored": restore_kernel,
+            "probes_replayed": replayed,
             "records": records,
             "carry_chat_context": self.carry_chat_context,
             "context_restored": self.carry_chat_context and sdk_id is not None,
         }
+
+    def _replay_probe_code(self, records: list[dict[str, Any]]) -> int:
+        """Rebuild kernel state from recorded probes without creating new artifacts."""
+        replayed = 0
+        for record in records:
+            if record.get("kind") != "probe_started":
+                continue
+            code = record.get("code")
+            if not isinstance(code, str) or not code.strip():
+                continue
+            self.kernel.execute(code, self.timeout_s)
+            replayed += 1
+        return replayed
 
     def set_carry_chat_context(self, enabled: bool) -> bool:
         self.require_idle("change context settings")

@@ -34,6 +34,7 @@ class WorkspaceChangeRequest(BaseModel):
 
 class SessionResumeRequest(BaseModel):
     id: str
+    restore_kernel: bool = False
 
 
 def create_app(
@@ -317,7 +318,9 @@ def create_app(
     async def resume_session(request: SessionResumeRequest):
         try:
             session = active_session()
-            data = await runtime.transition(session.resume_session, request.id)
+            data = await runtime.transition(
+                session.resume_session, request.id, request.restore_kernel
+            )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Session not found")
         except ValueError as exc:
