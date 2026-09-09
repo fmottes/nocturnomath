@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import re
 import webbrowser
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -101,43 +100,7 @@ def create_app(
         return response
 
     async def workspace_snapshot():
-        session = runtime.session
-        if session is None:
-            return {
-                "is_open": False,
-                "path": None,
-                "model": runtime.model,
-                "models": runtime.models,
-                "model_labels": runtime.model_labels,
-                "kernel_alive": False,
-                "kernel_busy": False,
-                "is_busy": False,
-                "carry_chat_context": True,
-                "evidence_path": ".nocturnomath/notes/evidence.md",
-                "thoughts_path": ".nocturnomath/notes/thoughts.md",
-                "markdown_files": [],
-                "plots": [],
-                "navigator_root": str(runtime.navigator_root),
-            }
-        return {
-            "is_open": True,
-            "path": str(session.workspace_path),
-            "environment": {
-                "python": str(session.environment.python),
-                "version": session.environment.version,
-            },
-            "model": session.model,
-            "models": runtime.models,
-            "model_labels": runtime.model_labels,
-            "kernel_alive": session.kernel.is_alive(),
-            "kernel_busy": session.kernel.busy,
-            "is_busy": session._is_busy,
-            "carry_chat_context": session.carry_chat_context,
-            "evidence_path": ".nocturnomath/notes/evidence.md",
-            "thoughts_path": ".nocturnomath/notes/thoughts.md",
-            "markdown_files": session.list_markdown_files(),
-            "plots": session.list_plots(),
-        }
+        return runtime.workspace_snapshot()
 
     def active_session() -> ExplorationSession:
         if runtime.session is None:
@@ -275,25 +238,10 @@ def create_app(
     @app.get("/api/session/notebook")
     async def download_notebook():
         require_idle("download the current session")
-        session = active_session()
-        if session.workspace.session_pending:
-            raise HTTPException(
-                status_code=409,
-                detail="The current session has no messages to download.",
-            )
         try:
-            notebook = session.workspace.export_notebook(
-                session.workspace.session_id, session.environment.version
-            )
+            filename, notebook = runtime.export_notebook()
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        workspace_name = re.sub(
-            r"[^A-Za-z0-9._-]+", "-", session.workspace_path.name
-        ).strip(".-")
-        workspace_name = workspace_name or "workspace"
-        filename = (
-            f"nocturnomath-{workspace_name}-{session.workspace.session_id}.ipynb"
-        )
         return Response(
             content=json.dumps(notebook, ensure_ascii=False, indent=1) + "\n",
             media_type="application/x-ipynb+json",
@@ -494,7 +442,9 @@ def create_app(
                     target_path = data.get("path")
                     if target_path:
                         try:
-                            await runtime.transition(runtime.open_workspace, target_path, data.get("python"))
+                            await runtime.transition(
+                                runtime.open_workspace, target_path, data.get("python")
+                            )
                             info = await workspace_snapshot()
                             await runtime.broadcast(
                                 "workspace_updated", {"workspace": info}

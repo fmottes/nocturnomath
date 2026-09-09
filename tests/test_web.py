@@ -11,7 +11,7 @@ from nocturnomath.web import create_app
 def sdk_model_catalog():
     with (
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
-        patch("nocturnomath.web.runtime.ClaudeSDKClient") as sdk,
+        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
     ):
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
