@@ -9,7 +9,7 @@ from typing import Any
 
 from .notes import ResearchNotes, write_text
 
-logger = logging.getLogger("xprober")
+logger = logging.getLogger("nocturnomath")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -25,10 +25,10 @@ class Workspace:
     def set_path(self, path: Path | str):
         self.path = Path(path).resolve()
         self.path.mkdir(parents=True, exist_ok=True)
-        self.xprober_path = self.path / "xprober"
-        self.notes_dir_path = self.xprober_path / "notes"
-        self.sessions_path = self.xprober_path / "sessions"
-        self.scratch_path = self.xprober_path / "scratch"
+        self.nocturnomath_path = self.path / ".nocturnomath"
+        self.notes_dir_path = self.nocturnomath_path / "notes"
+        self.sessions_path = self.nocturnomath_path / "sessions"
+        self.scratch_path = self.nocturnomath_path / "scratch"
         for directory in (
             self.notes_dir_path,
             self.sessions_path,
@@ -82,7 +82,7 @@ class Workspace:
     def opening_notes(self) -> str:
         return (
             "Scientific record (struck entries are invalid; thoughts are interpretations, "
-            "not observations). Relative links are based in xprober/notes/.\n\n"
+            "not observations). Relative links are based in .nocturnomath/notes/.\n\n"
             + self.notes.read()
             + "\n---\n\n"
         )

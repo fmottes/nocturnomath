@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-from xprober.session import ExplorationSession
+from nocturnomath.session import ExplorationSession
 
 
 class FakeKernel:
@@ -37,5 +37,5 @@ class FakeKernel:
 
 @pytest.fixture
 def session(tmp_path):
-    with patch("xprober.session.Kernel", FakeKernel):
+    with patch("nocturnomath.session.Kernel", FakeKernel):
         return ExplorationSession(tmp_path)

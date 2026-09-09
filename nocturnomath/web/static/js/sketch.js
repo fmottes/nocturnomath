@@ -1,5 +1,5 @@
 /**
- * Xprober — hand-drafted chrome.
+ * Nocturnomath — hand-drafted chrome.
  *
  * rough.js draws the structural linework: pane dividers, callout boxes and
  * container frames. Roughness stays low so it reads as a steady hand rather
@@ -26,7 +26,7 @@
   // Motion preference. Only decorative motion is affected: the highlighter
   // drawing itself in. Structural linework is static either way.
   // --------------------------------------------------------------------------
-  var MOTION_KEY = "xprober.motion";
+  var MOTION_KEY = "nocturnomath.motion";
 
   function systemPrefersReduced() {
     return !!(
@@ -293,7 +293,7 @@
     if (log) log.addEventListener("scroll", scheduleReveal, { passive: true });
     window.addEventListener("scroll", scheduleReveal, { passive: true });
     window.addEventListener("resize", scheduleReveal, { passive: true });
-    window.addEventListener("xprober:themechange", redrawAll);
+    window.addEventListener("nocturnomath:themechange", redrawAll);
 
     // Modals are hidden at load, so they have no measurable box until opened.
     ["folder-modal", "history-modal"].forEach(function (id) {

@@ -1,5 +1,5 @@
-from xprober.cli.terminal import build_parser as terminal_parser
-from xprober.cli.web import build_parser as web_parser
+from nocturnomath.cli.terminal import build_parser as terminal_parser
+from nocturnomath.cli.web import build_parser as web_parser
 
 
 def test_web_command_options():

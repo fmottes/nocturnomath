@@ -3,12 +3,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from xprober.web import create_app
+from nocturnomath.web import create_app
 
 
 @pytest.fixture(autouse=True)
 def sdk_model_catalog():
-    with patch("xprober.web.runtime.ClaudeSDKClient") as sdk:
+    with patch("nocturnomath.web.runtime.ClaudeSDKClient") as sdk:
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
                 "models": [
@@ -68,7 +68,7 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
     (tmp_path / ".hidden-folder").mkdir()
     (tmp_path / "not-a-folder.txt").write_text("keep")
 
-    with patch("xprober.session.Kernel", NoopKernel):
+    with patch("nocturnomath.session.Kernel", NoopKernel):
         app = create_app(navigator_root=tmp_path)
         with TestClient(app) as client:
             landing = client.get("/api/workspace").json()
@@ -76,7 +76,7 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert landing["path"] is None
             assert not (workspace / "notes.md").exists()
             assert not (workspace / "scratch").exists()
-            assert not (workspace / "xprober").exists()
+            assert not (workspace / ".nocturnomath").exists()
             assert client.get("/api/files").status_code == 409
 
             folders = client.get("/api/folders", params={"path": str(tmp_path)})
@@ -97,12 +97,12 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert opened.json()["workspace"]["is_open"] is True
             assert (
                 opened.json()["workspace"]["evidence_path"]
-                == "xprober/notes/evidence.md"
+                == ".nocturnomath/notes/evidence.md"
             )
-            assert (workspace / "xprober" / "notes" / "evidence.md").is_file()
-            assert (workspace / "xprober" / "sessions" / "S001").is_dir()
-            assert (workspace / "xprober" / "notes").is_dir()
-            assert (workspace / "xprober" / "scratch").is_dir()
+            assert (workspace / ".nocturnomath" / "notes" / "evidence.md").is_file()
+            assert (workspace / ".nocturnomath" / "sessions" / "S001").is_dir()
+            assert (workspace / ".nocturnomath" / "notes").is_dir()
+            assert (workspace / ".nocturnomath" / "scratch").is_dir()
 
 
 def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
@@ -140,7 +140,7 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         plots = client.get("/api/plots").json()["plots"]
         assert (
             plots[0]["url"]
-            == "/api/asset?path=xprober/sessions/S001/probes/P001/plot-1.png"
+            == "/api/asset?path=.nocturnomath/sessions/S001/probes/P001/plot-1.png"
         )
         assert client.get(plots[0]["url"]).content == b"png-data"
         assert (
@@ -273,7 +273,7 @@ def test_record_citations_resolve_to_saved_artifacts_and_entries(session):
                     assert f'id="{anchor}"' in response.text
         with client.websocket_connect("/ws") as websocket:
             init = websocket.receive_json()
-            assert init["workspace"]["thoughts_path"] == "xprober/notes/thoughts.md"
+            assert init["workspace"]["thoughts_path"] == ".nocturnomath/notes/thoughts.md"
             websocket.send_json({"action": "query", "text": "/notes"})
             text = websocket.receive_json()["text"]
             assert "# Evidence" in text and "# Thoughts" in text and "<del>" in text

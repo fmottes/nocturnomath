@@ -20,7 +20,7 @@ from .prompt import SYSTEM_PROMPT
 from .tools import build_tools
 from .workspace import Workspace
 
-logger = logging.getLogger("xprober")
+logger = logging.getLogger("nocturnomath")
 
 CARRY_CHAT_CONTEXT = True
 

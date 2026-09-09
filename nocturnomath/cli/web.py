@@ -1,4 +1,4 @@
-"""Launch the local Xprober dashboard."""
+"""Launch the local Nocturnomath dashboard."""
 
 import argparse
 import logging
@@ -29,8 +29,8 @@ def main():
     )
     args = build_parser().parse_args()
     navigator_root = Path(args.path).expanduser().resolve()
-    logger = logging.getLogger("xprober.web")
-    logger.info("Starting Xprober; choose a workspace in the browser.")
+    logger = logging.getLogger("nocturnomath.web")
+    logger.info("Starting Nocturnomath; choose a workspace in the browser.")
     if os.environ.get("ANTHROPIC_API_KEY"):
         logger.warning(
             "ANTHROPIC_API_KEY is set and silently takes precedence over your Claude subscription."
@@ -44,7 +44,7 @@ def main():
         image_cap=args.images,
         navigator_root=navigator_root,
     )
-    logger.info(f"Xprober Web App ready at: {url}")
+    logger.info(f"Nocturnomath Web App ready at: {url}")
     server = uvicorn.Server(
         uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     )

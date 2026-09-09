@@ -1,6 +1,6 @@
 import pytest
 
-from xprober.tools import builds_machinery, switches_backend
+from nocturnomath.tools import builds_machinery, switches_backend
 
 
 def tools_by_name(session):
@@ -20,7 +20,7 @@ def test_code_policy_checks():
 
 @pytest.mark.asyncio
 async def test_run_verdict_and_evidence_contract(session, monkeypatch):
-    monkeypatch.setattr("xprober.tools.asyncio.to_thread", run_inline)
+    monkeypatch.setattr("nocturnomath.tools.asyncio.to_thread", run_inline)
     events = []
     session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
     tools = tools_by_name(session)
@@ -56,7 +56,7 @@ async def test_run_verdict_and_evidence_contract(session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_saves_all_plots_but_caps_sdk_images(session, monkeypatch):
-    monkeypatch.setattr("xprober.tools.asyncio.to_thread", run_inline)
+    monkeypatch.setattr("nocturnomath.tools.asyncio.to_thread", run_inline)
     session.image_cap = 1
     session.kernel.result = ("", [b"one", b"two"], None)
     result = await tools_by_name(session)["run"].handler(

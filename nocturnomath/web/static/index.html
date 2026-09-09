@@ -4,11 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
-  <title>Xprober</title>
+  <title>Nocturnomath</title>
   <meta name="description" content="Local web app dashboard for hypothesis-driven scientific exploration with persistent Jupyter kernel and live markdown reader.">
   <script>
     (() => {
-      const key = "xprober.theme";
+      const key = "nocturnomath.theme";
       let theme = null;
       try { theme = window.localStorage.getItem(key); } catch (error) { /* use system preference */ }
       if (theme !== "light" && theme !== "dark") {
@@ -40,7 +40,7 @@
   <section class="landing-screen" id="landing-screen">
     <div class="landing-card">
       <div class="landing-heading">
-        <h1>Xprober</h1>
+        <h1>Nocturnomath</h1>
         <button class="btn btn-xs btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
       </div>
       <button class="btn btn-primary landing-open-button" id="btn-open-workspace" type="button">
@@ -55,7 +55,7 @@
     <header class="app-header" id="app-header">
       <div class="header-left">
         <div class="brand">
-          <span class="brand-title">Xprober</span>
+          <span class="brand-title">Nocturnomath</span>
         </div>
         <button type="button" class="workspace-pill" id="workspace-pill" title="Change workspace folder">
           <span class="workspace-path" id="workspace-path">Loading workspace...</span>
@@ -156,7 +156,7 @@
             <!-- File Selector Dropdown -->
             <div class="file-selector-wrapper hidden" id="file-selector-wrapper">
               <select id="file-select" class="file-select" title="Select markdown document">
-                <option value="xprober/notes/evidence.md">xprober/notes/evidence.md</option>
+                <option value=".nocturnomath/notes/evidence.md">.nocturnomath/notes/evidence.md</option>
               </select>
             </div>
 
@@ -168,7 +168,7 @@
           <!-- Document Reader Tab View -->
           <div class="tab-view active" id="view-doc">
             <div class="doc-header-info" id="doc-header-info">
-              <span class="doc-path-label" id="doc-path-label">xprober/notes/evidence.md</span>
+              <span class="doc-path-label" id="doc-path-label">.nocturnomath/notes/evidence.md</span>
               <span class="doc-meta-label" id="doc-meta-label"></span>
             </div>
             <article class="markdown-body" id="markdown-container">
@@ -216,7 +216,7 @@
         </div>
         <div class="modal-body">
           <p class="modal-help">
-            Chats recorded under <code>xprober/sessions/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>evidence.md</code> and <code>thoughts.md</code>.
+            Chats recorded under <code>.nocturnomath/sessions/</code> in the current workspace folder. Reopening one replays it here and appends new replies to it. Whether the agent is also handed the earlier conversation depends on <span class="nowrap">Keep context</span>; with it off, every query starts fresh from the system prompt and <code>evidence.md</code> and <code>thoughts.md</code>.
           </p>
           <div class="session-list" id="session-list">
             <div class="empty-state">Loading sessions&hellip;</div>
@@ -249,7 +249,7 @@
       </div>
       <div class="modal-body">
         <p class="modal-help" id="folder-modal-help">
-          Browse to an existing folder. Once opened, the agent will create and manage its files under <code>xprober/</code>.
+          Browse to an existing folder. Once opened, the agent will create and manage its files under <code>.nocturnomath/</code>.
         </p>
         <form id="folder-form">
           <div class="form-group">

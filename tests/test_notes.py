@@ -1,6 +1,6 @@
 import pytest
 
-from xprober.notes import ResearchNotes
+from nocturnomath.notes import ResearchNotes
 
 
 @pytest.fixture

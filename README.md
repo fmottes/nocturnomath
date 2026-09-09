@@ -1,6 +1,6 @@
-# Xprober
+# Nocturnomath
 
-Xprober is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, citable evidence and thoughts in Markdown, and a split-screen local web app dashboard.
+Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, citable evidence and thoughts in Markdown, and a split-screen local web app dashboard.
 
 ## Features
 
@@ -25,13 +25,13 @@ uv sync
 Start the web app, then choose a workspace folder in the browser:
 
 ```bash
-uv run xprober-web
+uv run nocturnomath
 ```
 
 Use `--path` / `-p` to set the starting location for the web folder navigator:
 
 ```bash
-uv run xprober-web --path /path/to/project
+uv run nocturnomath --path /path/to/project
 ```
 
 #### CLI Options:
@@ -48,16 +48,16 @@ uv run xprober-web --path /path/to/project
 If you prefer running in the terminal without a web browser:
 
 ```bash
-uv run xprober-cli
+uv run nocturnomath-cli
 ```
 
 The terminal and web interfaces share the same prompt, tools, persistent kernel,
 notes, transcripts, verdict gating, and context behavior.
 
-Xprober keeps its managed artifacts together inside the selected workspace:
+Nocturnomath keeps its managed artifacts together inside the selected workspace:
 
 ```text
-xprober/
+.nocturnomath/
 ├── notes/
 │   ├── evidence.md
 │   └── thoughts.md
@@ -121,17 +121,17 @@ The kernel persists within a session, and the verdict-before-next-run behavior i
 There is no migration or compatibility layer for the previous generic notes/transcript layout.
 Old test artifacts are not imported into the new record.
 
-The agent uses `xprober/scratch/` only when a probe strictly requires a temporary
+The agent uses `.nocturnomath/scratch/` only when a probe strictly requires a temporary
 file or artifact; otherwise probe work remains in memory.
 
 ## Project structure
 
 The Python package is organized by responsibility:
 
-- `xprober/session.py` coordinates Claude conversation state and events.
-- `xprober/tools.py` defines the probing tools.
-- `xprober/workspace.py` owns session folders, probe artifacts, files, and transcripts.
-- `xprober/notes.py` manages numbered evidence, thoughts, citations, and corrections.
-- `xprober/kernel.py` manages the persistent Jupyter kernel.
-- `xprober/web/` contains the FastAPI dashboard and browser assets.
-- `xprober/cli/` contains the web and terminal entry points.
+- `nocturnomath/session.py` coordinates Claude conversation state and events.
+- `nocturnomath/tools.py` defines the probing tools.
+- `nocturnomath/workspace.py` owns session folders, probe artifacts, files, and transcripts.
+- `nocturnomath/notes.py` manages numbered evidence, thoughts, citations, and corrections.
+- `nocturnomath/kernel.py` manages the persistent Jupyter kernel.
+- `nocturnomath/web/` contains the FastAPI dashboard and browser assets.
+- `nocturnomath/cli/` contains the web and terminal entry points.

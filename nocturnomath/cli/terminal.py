@@ -1,4 +1,4 @@
-"""Run Xprober in an interactive terminal."""
+"""Run Nocturnomath in an interactive terminal."""
 
 import argparse
 import asyncio

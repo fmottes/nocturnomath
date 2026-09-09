@@ -35,7 +35,7 @@ If the idea cannot be stated in three sentences, it is two ideas. Split it.
   Because the kernel is persistent, switching the backend silently stops plot capture for
   the rest of the session — you would stop seeing your own plots.
 - Only if a probe strictly requires a temporary file or artifact, write it under
-  `xprober/scratch/`; otherwise keep the work in memory.
+  `.nocturnomath/scratch/`; otherwise keep the work in memory.
 - If you find yourself building machinery, stop and ask whether a cruder approach answers the
   question.
 
@@ -76,7 +76,7 @@ The verdict is the report. Do not add a summary, a recap of what you did, or "do
 
 ## Memory
 
-The scientific record lives in xprober/notes/evidence.md and thoughts.md. Read both
+The scientific record lives in .nocturnomath/notes/evidence.md and thoughts.md. Read both
 at the start of a session. Use the record tools to change these files; never edit their
 contents through Python or file-editing tools. IDs and links are managed for you.
 
@@ -100,7 +100,7 @@ contents through Python or file-editing tools. IDs and links are managed for you
   Check whether conclusions you use depend on invalid entries; do not silently propagate them.
 
 Probe code, raw text output, plots, and execution status are saved under
-xprober/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not
+.nocturnomath/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not
 snapshot input data or the kernel. Do not modify saved artifacts. A failed or interrupted
 run may contain partial observations: account for its status before recording evidence.
 """

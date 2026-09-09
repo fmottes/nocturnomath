@@ -1,4 +1,4 @@
-"""FastAPI application factory for the Xprober dashboard."""
+"""FastAPI application factory for the Nocturnomath dashboard."""
 
 import asyncio
 import logging
@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from ..session import ExplorationSession
 from .runtime import WebRuntime
 
-logger = logging.getLogger("xprober.web")
+logger = logging.getLogger("nocturnomath.web")
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -74,7 +74,7 @@ def create_app(
                 browser_task.cancel()
             runtime.shutdown()
 
-    app = FastAPI(title="Xprober Web App", lifespan=lifespan)
+    app = FastAPI(title="Nocturnomath Web App", lifespan=lifespan)
     app.state.runtime = runtime
     app.state.request_shutdown = None
     app.state.exiting = False
@@ -106,8 +106,8 @@ def create_app(
                 "kernel_busy": False,
                 "is_busy": False,
                 "carry_chat_context": True,
-                "evidence_path": "xprober/notes/evidence.md",
-                "thoughts_path": "xprober/notes/thoughts.md",
+                "evidence_path": ".nocturnomath/notes/evidence.md",
+                "thoughts_path": ".nocturnomath/notes/thoughts.md",
                 "markdown_files": [],
                 "plots": [],
                 "navigator_root": str(runtime.navigator_root),
@@ -122,8 +122,8 @@ def create_app(
             "kernel_busy": session.kernel.busy,
             "is_busy": session._is_busy,
             "carry_chat_context": session.carry_chat_context,
-            "evidence_path": "xprober/notes/evidence.md",
-            "thoughts_path": "xprober/notes/thoughts.md",
+            "evidence_path": ".nocturnomath/notes/evidence.md",
+            "thoughts_path": ".nocturnomath/notes/thoughts.md",
             "markdown_files": session.list_markdown_files(),
             "plots": session.list_plots(),
         }

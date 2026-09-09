@@ -31,7 +31,7 @@ class FakeClient:
 async def test_query_emits_text_tracks_context_and_logs(session):
     events = []
     session.subscribe(lambda event_type, payload: events.append(event_type))
-    with patch("xprober.session.ClaudeSDKClient", FakeClient):
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
         await session.query("question")
 
     assert session._sdk_session_id == "sdk-session"
@@ -71,7 +71,7 @@ async def test_resume_reads_current_records_and_reuses_session_probe_folder(sess
     resumed = session.resume_session("S001")
     assert resumed["id"] == "S001"
     assert session.workspace.start_probe("print(4)", "4", "test").name == "P002"
-    with patch("xprober.session.ClaudeSDKClient", FakeClient):
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
         await session.query("continue")
     assert "<del>" in FakeClient.prompts[-1]
     assert "Value = 3." in FakeClient.prompts[-1]

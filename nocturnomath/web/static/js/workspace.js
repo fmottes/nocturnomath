@@ -33,7 +33,7 @@ export function applyWorkspace(ws) {
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
   setCarryContext(ws.carry_chat_context);
 
-  const notesPath = ws.evidence_path || "xprober/notes/evidence.md";
+  const notesPath = ws.evidence_path || ".nocturnomath/notes/evidence.md";
   if (!state.activeDoc || !ws.markdown_files?.some((f) => f.path === state.activeDoc)) {
     state.activeDoc = notesPath;
   }
@@ -61,7 +61,7 @@ export function showLanding(ws) {
   renderRecentWorkspaces();
 }
 
-const RECENT_WORKSPACES_KEY = "xprober.recent-workspaces";
+const RECENT_WORKSPACES_KEY = "nocturnomath.recent-workspaces";
 const RECENT_WORKSPACE_LIMIT = 6;
 
 function recentWorkspaces() {
@@ -143,7 +143,7 @@ export function updateFileSelector(files) {
 
   if (!files.length) {
     const opt = document.createElement("option");
-    opt.value = state.workspace?.evidence_path || "xprober/notes/evidence.md";
+    opt.value = state.workspace?.evidence_path || ".nocturnomath/notes/evidence.md";
     opt.textContent = opt.value;
     elements.fileSelect.appendChild(opt);
     return;
@@ -392,7 +392,7 @@ export function openFolderPicker(mode = "open") {
     ? "Open a workspace folder"
     : "Change workspace folder";
   elements.folderModalHelp.innerHTML = opening
-    ? "Browse to an existing folder. Once opened, the agent will create and manage its files under <code>xprober/</code>."
+    ? "Browse to an existing folder. Once opened, the agent will create and manage its files under <code>.nocturnomath/</code>."
     : "Choose another existing folder. The agent will keep its kernel and begin a new workspace session there.";
   elements.modalSubmit.textContent = opening ? "Open folder" : "Switch workspace";
   elements.folderModal.classList.remove("hidden");

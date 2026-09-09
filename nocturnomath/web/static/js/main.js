@@ -6,7 +6,7 @@ import { clearChat, loadSessions, replaySession } from "./history.js?v=20260906-
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";
 
-const THEME_KEY = "xprober.theme";
+const THEME_KEY = "nocturnomath.theme";
 
 function applyTheme(theme) {
   const selected = theme === "dark" ? "dark" : "light";
@@ -22,7 +22,7 @@ function applyTheme(theme) {
   } catch (error) {
     // The theme still applies for this page when storage is unavailable.
   }
-  window.dispatchEvent(new CustomEvent("xprober:themechange"));
+  window.dispatchEvent(new CustomEvent("nocturnomath:themechange"));
 }
 
 // ============================================================================
@@ -33,7 +33,7 @@ function handleServerEvent(event) {
     case "service_stopping":
       state.exiting = true;
       elements.btnSend.disabled = true;
-      appendSystemMessage("Xprober is stopping. You can close this tab.");
+      appendSystemMessage("Nocturnomath is stopping. You can close this tab.");
       break;
     case "init":
     case "workspace_updated":
@@ -147,7 +147,7 @@ function setupEventListeners() {
       document.body.replaceChildren();
       const message = document.createElement("p");
       message.className = "empty-state";
-      message.textContent = "Xprober is stopping. You can close this tab.";
+      message.textContent = "Nocturnomath is stopping. You can close this tab.";
       document.body.appendChild(message);
     } catch (error) {
       appendErrorMessage(error.message);

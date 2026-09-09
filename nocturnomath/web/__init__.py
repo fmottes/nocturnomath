@@ -1,4 +1,4 @@
-"""Web application for Xprober."""
+"""Web application for Nocturnomath."""
 
 from .app import create_app
 

@@ -1,6 +1,6 @@
 import pytest
 
-from xprober.workspace import Workspace
+from nocturnomath.workspace import Workspace
 
 
 def test_workspace_initializes_records_and_session_folders(tmp_path):
@@ -13,7 +13,8 @@ def test_workspace_initializes_records_and_session_folders(tmp_path):
     assert workspace.notes.thoughts_path.read_text() == "# Thoughts\n\n"
     assert workspace.transcript_path != first
     assert (
-        workspace.transcript_path == tmp_path / "xprober/sessions/S002/transcript.jsonl"
+        workspace.transcript_path
+        == tmp_path / ".nocturnomath/sessions/S002/transcript.jsonl"
     )
     assert workspace.probes_path.is_dir()
     assert workspace.scratch_path.is_dir()
@@ -39,8 +40,8 @@ def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
         in workspace.notes.evidence_path.read_text()
     )
     assert [item["path"] for item in workspace.list_markdown_files()] == [
-        "xprober/notes/evidence.md",
-        "xprober/notes/thoughts.md",
+        ".nocturnomath/notes/evidence.md",
+        ".nocturnomath/notes/thoughts.md",
         "report.md",
     ]
     assert workspace.list_plots()[0]["filename"] == "S001/P001/plot-1.png"
