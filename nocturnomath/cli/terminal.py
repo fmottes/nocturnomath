@@ -7,7 +7,7 @@ import logging
 import os
 import signal
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -15,16 +15,20 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
-from rich.syntax import Syntax
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from ..runtime import Runtime
 from .common import add_session_arguments
+from .completion import CommandCompleter
 
 logger = logging.getLogger("nocturnomath.cli")
 
 ASSET_PREFIX = "/api/asset?path="
+OUTPUT_LINE_CAP = 60
 
 COMMANDS = [
     ("/help", "", "list these commands"),
@@ -72,22 +76,81 @@ class TerminalApp:
         self.status = "idle"
         self.stopped = False
         self._interrupt_task: asyncio.Task | None = None
+        self._spinner = None
+        self._spinner_message: str | None = None
+        self._live: Live | None = None
+        self._stream_text = ""
 
     # ------------------------------------------------------------------ output
 
+    def show(self, renderable: Any, console: Console | None = None, style=None):
+        """Print to the scrollback, pausing the spinner and any streamed block."""
+        self.close_stream()
+        self.hide_spinner()
+        (console or self.console).print(
+            renderable, style=style, highlight=False, markup=False
+        )
+        self.resume_spinner()
+
     def write(self, text: str, style: str | None = None):
-        self.console.print(text, style=style, highlight=False, markup=False)
+        self.show(text, style=style)
 
     def error(self, message: str):
-        self.error_console.print(
-            f"error: {message}", style="bold red", highlight=False, markup=False
-        )
+        self.show(f"error: {message}", console=self.error_console, style="bold red")
 
     def warn(self, message: str):
-        self.error_console.print(message, style="yellow", highlight=False, markup=False)
+        self.show(message, console=self.error_console, style="yellow")
 
     def markdown(self, text: str):
-        self.console.print(Markdown(text))
+        self.show(Markdown(text))
+
+    # ----------------------------------------------------------------- spinner
+
+    def show_spinner(self, message: str):
+        """Report progress transiently; the spinner never reaches the scrollback."""
+        self.close_stream()
+        self._spinner_message = message
+        if self._spinner is None:
+            self._spinner = self.console.status(message, spinner="dots")
+            self._spinner.start()
+        else:
+            self._spinner.update(message)
+
+    def hide_spinner(self):
+        if self._spinner is not None:
+            self._spinner.stop()
+            self._spinner = None
+
+    def resume_spinner(self):
+        if self._spinner_message:
+            self.show_spinner(self._spinner_message)
+
+    def clear_spinner(self):
+        self.hide_spinner()
+        self._spinner_message = None
+
+    # --------------------------------------------------------------- streaming
+
+    def stream_delta(self, chunk: str):
+        """Grow the live region the assistant is currently writing into."""
+        if self._live is None:
+            self.hide_spinner()
+            self._stream_text = ""
+            self._live = Live(
+                Markdown(""), console=self.console, vertical_overflow="visible"
+            )
+            self._live.start()
+        self._stream_text += chunk
+        self._live.update(Markdown(self._stream_text), refresh=True)
+
+    def close_stream(self):
+        if self._live is None:
+            return
+        live, self._live = self._live, None
+        streamed, self._stream_text = self._stream_text, ""
+        live.stop()
+        if streamed and not self.console.is_terminal:
+            self.console.line()
 
     def banner(self):
         session = self.runtime.session
@@ -111,6 +174,25 @@ class TerminalApp:
             style="dim",
         )
 
+    def bottom_toolbar(self) -> str:
+        session = self.runtime.session
+        if session is None:
+            return f"no workspace · {self.status}"
+        if session.kernel.busy:
+            kernel = "busy"
+        else:
+            kernel = "ready" if session.kernel.is_alive() else "dead"
+        model = session.model
+        if self.pending_model:
+            model += f" → {self.pending_model}"
+        context = "on" if session.carry_chat_context else "off"
+        workspace = session.workspace
+        chat = "new" if workspace.session_pending else workspace.session_id
+        return (
+            f"kernel {kernel} · model {model} · context {context} · "
+            f"chat {chat} · {self.status}"
+        )
+
     def show_help(self):
         table = Table(box=None, pad_edge=False, show_header=False)
         table.add_column(style="bold")
@@ -118,7 +200,7 @@ class TerminalApp:
         table.add_column()
         for name, argument, description in COMMANDS:
             table.add_row(name, argument, description)
-        self.console.print(table)
+        self.show(table)
 
     # ------------------------------------------------------------------ events
 
@@ -129,28 +211,66 @@ class TerminalApp:
             return
         handler(payload)
 
+    def _render_assistant_delta(self, payload):
+        chunk = payload.get("text", "")
+        if chunk:
+            self.stream_delta(chunk)
+
     def _render_assistant_text(self, payload):
-        self.console.print()
-        self.markdown(payload.get("text", ""))
+        text = payload.get("text", "")
+        if self._live is None:
+            self.show(Markdown(text))
+            return
+        self._live.update(Markdown(text), refresh=True)
+        self.close_stream()
+        self.resume_spinner()
 
     def _render_probe_start(self, payload):
-        code = payload.get("code", "")
-        lines = len(code.splitlines())
-        self.console.print()
-        self.write(
-            f"probe {payload.get('probe_id', '')} expects: {payload.get('expected', '')}",
-            style="bold cyan",
+        lines = len(payload.get("code", "").splitlines())
+        body = Text(payload.get("expected", "") or "(no prediction)")
+        body.append(
+            f"\ncode: {lines} line{'' if lines == 1 else 's'} · "
+            f"{self.probe_file(payload, 'code.py')}",
+            style="dim",
         )
-        self.write(f"{lines} line{'' if lines == 1 else 's'} of Python", style="dim")
-        self.console.print(Syntax(code, "python", theme="ansi_dark", word_wrap=True))
+        if self._spinner_message:
+            self._spinner_message = "running probe…"
+        self.show(
+            Panel(
+                body,
+                title=f"probe {payload.get('probe_id', '')}",
+                title_align="left",
+                border_style="cyan",
+            )
+        )
 
     def _render_probe_finish(self, payload):
-        self.write(payload.get("output", ""))
-        plots = [
-            url.removeprefix(ASSET_PREFIX) for url in payload.get("plot_urls") or []
-        ]
-        for plot in plots:
-            self.write(f"saved plot: {self.workspace_file(plot)}", style="dim")
+        status = payload.get("status", "completed")
+        text = payload.get("text")
+        if text is None:
+            text = payload.get("output", "")
+        lines = text.rstrip().splitlines()
+        body = Text("\n".join(lines[:OUTPUT_LINE_CAP]) or "(no text output)")
+        hidden = len(lines) - OUTPUT_LINE_CAP
+        if hidden > 0:
+            body.append(
+                f"\n… {hidden} more lines in {self.probe_file(payload, 'output.txt')}",
+                style="dim",
+            )
+        for plot in self.plot_paths(payload):
+            body.append(f"\nsaved plot: {self.workspace_file(plot)}", style="dim")
+        if self._spinner_message:
+            self._spinner_message = "thinking…"
+        self.show(
+            Panel(
+                body,
+                title=f"probe {payload.get('probe_id', '')} · {status}",
+                title_align="left",
+                border_style="red"
+                if status in ("error", "interrupted", "failed")
+                else "green",
+            )
+        )
 
     def _render_record_changed(self, payload):
         self.write(
@@ -173,10 +293,14 @@ class TerminalApp:
 
     def _render_status_change(self, payload):
         self.status = payload.get("status", "idle")
-        self.write(f"[{self.status}]", style="dim")
+        if self.status == "thinking":
+            self.show_spinner("thinking…")
+        else:
+            self.close_stream()
+            self.clear_spinner()
 
     def _render_turn_complete(self, payload):
-        self.write("— end of turn —", style="dim")
+        self.close_stream()
 
     def _render_system_message(self, payload):
         self.markdown(payload.get("text", ""))
@@ -247,6 +371,23 @@ class TerminalApp:
             session.workspace_path / relative_path if session else Path(relative_path)
         )
 
+    def probe_file(self, payload: dict[str, Any], filename: str) -> Path:
+        code_path = payload.get("code_path")
+        if code_path:
+            return self.workspace_file(str(PurePosixPath(code_path).parent / filename))
+        session_id, _, probe = str(payload.get("probe_id", "")).partition("/")
+        return self.workspace_file(
+            f".nocturnomath/sessions/{session_id}/probes/{probe}/{filename}"
+        )
+
+    def plot_paths(self, payload: dict[str, Any]) -> list[str]:
+        paths = payload.get("plot_paths")
+        if paths is None:
+            paths = [
+                url.removeprefix(ASSET_PREFIX) for url in payload.get("plot_urls") or []
+            ]
+        return paths
+
     def history_path(self) -> Path:
         session = self.runtime.session
         root = session.workspace_path if session else Path.cwd()
@@ -284,6 +425,8 @@ class TerminalApp:
         if self.stopped:
             return
         self.stopped = True
+        self.close_stream()
+        self.clear_spinner()
         await self.runtime.drain()
         self.runtime.shutdown()
 
@@ -317,6 +460,8 @@ class TerminalApp:
             return
         self.pending_model = None
         await self.runtime.wait_for_query()
+        self.close_stream()
+        self.clear_spinner()
 
     async def _command_help(self, argument: str) -> bool:
         self.show_help()
@@ -367,7 +512,7 @@ class TerminalApp:
                 str(record["notes"]),
                 ", ".join(flags),
             )
-        self.console.print(table)
+        self.show(table)
         for record in sessions:
             self.write(f"{record['id']}: {record['title']}", style="dim")
         return True
@@ -521,6 +666,9 @@ def build_prompt_session(app: TerminalApp) -> PromptSession:
         history=FileHistory(str(history_path)),
         multiline=True,
         key_bindings=bindings,
+        completer=CommandCompleter(app.runtime, COMMANDS),
+        complete_while_typing=True,
+        bottom_toolbar=app.bottom_toolbar,
     )
 
 

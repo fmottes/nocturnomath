@@ -9,7 +9,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a 
   - **Right Half**: Live-rendered Markdown reader (auto-syncing `evidence.md`, `thoughts.md`, reports, and other markdown docs) and figures gallery.
   - **Draggable Gutter**: Easily resize the split panes to focus on chat or document reading.
   - **Workspace Picker**: The web app opens on a landing page with a visual folder navigator. It does not start a kernel or create workspace files until you open a folder.
-- **Terminal Client**: The same runtime without a browser: multi-line input with history, Markdown replies, syntax-highlighted probe code, and slash commands covering history, resume, notebook export, model switching, context, environment, workspace, documents, and plots.
+- **Terminal Client**: The same runtime without a browser: multi-line input with history and completion, a state toolbar and a progress spinner, replies streamed as Markdown, compact probe cards that link to the saved code and cap the output, and slash commands covering history, resume, notebook export, model switching, context, environment, workspace, documents, and plots.
 
 ## Quick Start
 
@@ -69,11 +69,25 @@ Ctrl-C interrupts a running kernel run or cancels the running query, and reports
 nothing is running otherwise; it does not quit. Ctrl-D or `/exit` drains the running
 query and probe, releases the kernel, and leaves.
 
-Assistant replies, notes, system messages, and Markdown documents are rendered as
-Markdown; probe code is shown as syntax-highlighted Python. Every event the engine
-emits is printed, including probe predictions and code, probe output and the paths of
-saved plots, recorded evidence and thoughts, verdicts, kernel restarts and
-interruptions, `install_packages` results, and thinking/running/idle status changes.
+Typing `/` completes the command names with their descriptions, and each command
+completes its own arguments: chat ids and `--kernel` for `/resume`, workspace documents
+for `/docs`, catalogue entries for `/model`, `on` and `off` for `/context`, `managed` or
+a Python executable for `/env`, and folders for `/workspace`.
+
+A toolbar under the prompt reports the kernel state (ready, busy, dead), the current
+model and any model queued for the next message, whether chat context is carried, the
+current chat id (`new` until its first message), and the current status. While a query
+runs, a spinner reports thinking or running probe. Neither the toolbar nor the spinner
+is left behind in the scrollback.
+
+Assistant replies stream in as they are written and are replaced by the final text of
+each block, so nothing is printed twice. Notes, system messages, and Markdown documents
+are rendered as Markdown too. Each probe is a card: its prediction and a
+`code: <n> lines · <path>` line pointing at the saved `code.py`, never the code itself.
+When it finishes, the card shows its status and the raw kernel output, capped at 60
+lines with a pointer to the saved `output.txt`, then the path of each saved plot.
+Recorded evidence and thoughts, verdicts, kernel restarts and interruptions, and
+`install_packages` results are printed as they happen.
 
 | Command | Description |
 | --- | --- |
