@@ -206,7 +206,9 @@ The Python package is organized by responsibility:
 Opening a workspace automatically prepares `.nocturnomath/venv`, even if the folder
 already has a `.venv`. The environment starts with ipykernel, matplotlib, numpy, and
 pandas. Packages persist across sessions; kernel variables do not. The first opening
-requires uv and may download packages. Later openings reuse the environment.
+may download packages. Later openings reuse the environment. `uv` is a runtime
+dependency: the `uv` on `PATH` is used when present, otherwise the binary bundled
+with the `uv` Python package.
 
 In Settings → Research environment, or with `/env /path/to/venv/bin/python` in the
 terminal, enter another environment's Python executable if you want to use it instead.

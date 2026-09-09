@@ -158,3 +158,13 @@ def test_installation_targets_selected_python_and_records_failure(session):
     assert record["after"] == session.environment_record != before
     assert record["kernel_id"] == session.kernel_id
     assert not list(session.workspace.probes_path.iterdir())
+
+
+def test_uv_falls_back_to_the_bundled_binary(monkeypatch):
+    monkeypatch.setattr("nocturnomath.environment.shutil.which", lambda name: None)
+    assert ResearchEnvironment.uv().endswith("uv")
+    monkeypatch.setattr(
+        "uv.find_uv_bin", lambda: (_ for _ in ()).throw(FileNotFoundError())
+    )
+    with pytest.raises(ValueError, match="uv is required"):
+        ResearchEnvironment.uv()
