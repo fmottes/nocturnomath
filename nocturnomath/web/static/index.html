@@ -37,7 +37,8 @@
   <link rel="stylesheet" href="/static/css/responsive.css">
 </head>
 <body>
-  <section class="landing-screen" id="landing-screen">
+  <div class="landing-screen" id="app-loading" role="status">Loading…</div>
+  <section class="landing-screen hidden" id="landing-screen">
     <div class="landing-card">
       <div class="landing-heading">
         <h1>Nocturnomath</h1>
@@ -47,7 +48,9 @@
         Open a folder workspace
       </button>
       <div class="recent-workspaces" id="recent-workspaces" aria-label="Recent projects"></div>
+      <p id="recent-workspace-error" class="modal-help" role="alert"></p>
     </div>
+    <p id="recent-workspace-loading" class="landing-loading hidden" role="status">Loading…</p>
   </section>
 
   <div class="app-container hidden" id="workspace-app">
@@ -105,7 +108,7 @@
             </div>
             <p>I help you learn about systems quickly by proposing the simplest probe, executing it in the persistent Jupyter kernel, and assessing what it means.</p>
             <div class="exploration-steps">
-              <div class="step-item"><strong>1. Idea</strong> One hypothesis and a concrete prediction (<code>expected</code>)</div>
+              <div class="step-item"><strong>1. Idea</strong> One hypothesis and a concrete prediction</div>
               <div class="step-item"><strong>2. Code</strong> Simplest readable probe, flat script, no machinery</div>
               <div class="step-item"><strong>3. Result</strong> A plot or metric that answers the question</div>
               <div class="step-item"><strong>4. Verdict</strong> Rule hypotheses in or out, plus notes</div>

@@ -15,6 +15,7 @@ export function nowLabel() {
 
 export function appendUserMessage(text, timeLabel) {
   closeAssistantBubble();
+  document.getElementById("system-welcome")?.remove();
   const bubble = document.createElement("div");
   bubble.className = "chat-bubble user";
 

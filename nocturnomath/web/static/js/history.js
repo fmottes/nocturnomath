@@ -111,16 +111,21 @@ export async function resumeSession(sessionId) {
   }
 }
 
-export function clearChat() {
+const welcomeCard = document.getElementById("system-welcome")?.cloneNode(true);
+
+export function clearChat(showWelcome = true) {
   state.followChat = true;
-  elements.chatMessages.innerHTML = "";
+  elements.chatMessages.replaceChildren();
+  if (showWelcome && welcomeCard) {
+    elements.chatMessages.appendChild(welcomeCard.cloneNode(true));
+  }
   state.currentAssistantBubble = null;
   state.currentProbeCard = null;
   state.lastProbeCard = null;
 }
 
 export function replaySession(records, contextRestored, carryChatContext, kernelReset = false) {
-  clearChat();
+  clearChat(false);
 
   const outcomes = new Set(records.filter((rec) =>
     rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));

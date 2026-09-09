@@ -273,6 +273,11 @@ class Workspace:
             records = self.read_transcript(path)
             if not records:
                 continue
+            if path == self.transcript_path and all(
+                record.get("kind") in {"kernel_started", "meta", "resumed"}
+                for record in records
+            ):
+                continue
             user_texts = [
                 record.get("text", "")
                 for record in records

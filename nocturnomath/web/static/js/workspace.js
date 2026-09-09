@@ -7,6 +7,7 @@ import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-2"
 // Workspace & Files Management
 // ============================================================================
 export function applyWorkspace(ws) {
+  document.getElementById("app-loading").classList.add("hidden");
   if (!ws || !ws.is_open) {
     showLanding(ws);
     return;
@@ -57,6 +58,7 @@ function workspaceName(path) {
 }
 
 export function showLanding(ws) {
+  document.getElementById("app-loading").classList.add("hidden");
   state.workspace = null;
   state.navigatorRoot = ws?.navigator_root || state.navigatorRoot || ".";
   elements.workspaceApp.classList.add("hidden");
@@ -125,19 +127,24 @@ export async function openWorkspace(path, python = null) {
   return data.workspace;
 }
 
+let loadingRecentWorkspace = false;
 async function openRecentWorkspace(path) {
-  openFolderPicker();
-  elements.newFolderInput.value = path;
-  elements.modalSubmit.disabled = true;
-  elements.modalSubmit.textContent = "Preparing environment…";
+  if (loadingRecentWorkspace) return;
+  loadingRecentWorkspace = true;
+  const buttons = [...elements.recentWorkspaces.querySelectorAll("button"), document.getElementById("btn-open-workspace")];
+  const loading = document.getElementById("recent-workspace-loading");
+  const errorLabel = document.getElementById("recent-workspace-error");
+  errorLabel.textContent = "";
+  loading.classList.remove("hidden");
+  buttons.forEach(button => button.disabled = true);
   try {
     await openWorkspace(path);
-    closeFolderPicker();
   } catch (error) {
-    showFolderPickerError(error.message);
+    errorLabel.textContent = error.message;
   } finally {
-    elements.modalSubmit.disabled = false;
-    elements.modalSubmit.textContent = "Open folder";
+    loadingRecentWorkspace = false;
+    loading.classList.add("hidden");
+    buttons.forEach(button => button.disabled = false);
   }
 }
 

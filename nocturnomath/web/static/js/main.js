@@ -325,7 +325,10 @@ document.addEventListener("DOMContentLoaded", () => {
     () => {
       if (state.workspace?.is_open) updateKernelStatus(true, false);
     },
-    () => updateKernelStatus(false, false)
+    () => {
+      updateKernelStatus(false, false);
+      document.getElementById("app-loading").textContent = "Connecting…";
+    }
   );
 });
 

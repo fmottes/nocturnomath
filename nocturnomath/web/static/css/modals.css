@@ -126,10 +126,12 @@
 .landing-screen {
   position: relative;
   z-index: 1;
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   width: 100vw;
   height: 100vh;
-  place-items: center;
   padding: 24px;
 }
 .landing-card {
@@ -216,3 +218,17 @@
   color: var(--ink-faint);
 }
 .session-meta .warn { color: var(--warn); }
+
+.landing-loading {
+  min-height: 1.2em;
+  margin: 18px 0 0;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+.landing-loading.hidden {
+  display: block !important;
+  visibility: hidden;
+}
+#recent-workspace-error:empty { display: none; }
