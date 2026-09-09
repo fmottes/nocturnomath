@@ -225,6 +225,28 @@ class Runtime:
         task = asyncio.create_task(self._run_query(text))
         self.session._current_task = task
 
+    @property
+    def current_task(self) -> asyncio.Task | None:
+        return self.session._current_task if self.session else None
+
+    async def wait_for_query(self):
+        """Wait for the running query without re-raising its cancellation."""
+        task = self.current_task
+        if task:
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def drain(self):
+        """Interrupt the session and let its query and probe finish before shutdown."""
+        session = self.session
+        if session is None:
+            return
+        task = session._current_task
+        await session.interrupt()
+        if task:
+            await asyncio.gather(task, return_exceptions=True)
+        if session._probe_task:
+            await asyncio.gather(session._probe_task, return_exceptions=True)
+
     async def _run_query(self, text: str):
         session = self.session
         if session is None:
