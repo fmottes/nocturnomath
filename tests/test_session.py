@@ -62,8 +62,8 @@ async def test_active_query_guards_state_and_interrupts(session):
 
 @pytest.mark.asyncio
 async def test_resume_reads_current_records_and_reuses_session_probe_folder(session):
-    session.workspace.log_transcript("user", text="original investigation")
-    session.workspace.log_transcript("meta", sdk_session_id="sdk-session")
+    session.log_transcript("user", text="original investigation")
+    session.log_transcript("meta", sdk_session_id="sdk-session")
     session.workspace.start_probe("print(3)", "3", "test")
     session.workspace.notes.add_evidence("Value = 3.", ["source"])
     session.reset_client_session()

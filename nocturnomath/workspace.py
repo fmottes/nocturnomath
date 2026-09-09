@@ -46,15 +46,41 @@ class Workspace:
             if re.fullmatch(r"S\d+", path.name)
         ]
         number = max(numbers, default=0) + 1
+        self.transcript_path = (
+            self.sessions_path / f"S{number:03d}" / "transcript.jsonl"
+        )
+        self._session_pending = True
+
+    def ensure_session(self):
+        """Allocate the prepared session folder when the chat first has activity."""
+        if not self._session_pending:
+            return
+        number = int(self.transcript_path.parent.name[1:])
         while True:
-            path = self.sessions_path / f"S{number:03d}"
+            session_path = self.sessions_path / f"S{number:03d}"
             try:
-                path.mkdir()
+                session_path.mkdir()
                 break
             except FileExistsError:
                 number += 1
-        self.transcript_path = path / "transcript.jsonl"
+        self.transcript_path = session_path / "transcript.jsonl"
         self.probes_path.mkdir()
+        self._session_pending = False
+
+    @property
+    def session_pending(self) -> bool:
+        return self._session_pending
+
+    def use_transcript(self, path: Path):
+        """Select an existing transcript rather than a prepared new session."""
+        self.transcript_path = path
+        self._session_pending = False
+
+    def session_state(self) -> tuple[Path, bool]:
+        return self.transcript_path, self._session_pending
+
+    def restore_session_state(self, state: tuple[Path, bool]):
+        self.transcript_path, self._session_pending = state
 
     @property
     def session_id(self) -> str:
@@ -67,6 +93,8 @@ class Workspace:
     def log_transcript(
         self, kind: str, *, transcript_path: Path | None = None, **fields
     ):
+        if transcript_path is None:
+            self.ensure_session()
         record = {
             "t": time.strftime("%H:%M:%S"),
             "timestamp": time.time(),
@@ -88,6 +116,7 @@ class Workspace:
         )
 
     def start_probe(self, code: str, expected: str, model: str, **context) -> Path:
+        self.ensure_session()
         numbers = [
             int(path.name[1:])
             for path in self.probes_path.iterdir()
@@ -273,17 +302,14 @@ class Workspace:
             records = self.read_transcript(path)
             if not records:
                 continue
-            if path == self.transcript_path and all(
-                record.get("kind") in {"kernel_started", "meta", "resumed"}
-                for record in records
-            ):
-                continue
             user_texts = [
                 record.get("text", "")
                 for record in records
                 if record.get("kind") == "user"
             ]
-            title = user_texts[0] if user_texts else "(no prompt)"
+            if not user_texts:
+                continue
+            title = user_texts[0]
             if len(title) > 120:
                 title = title[:120] + "…"
             started = records[0].get("timestamp", path.stat().st_mtime)

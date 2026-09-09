@@ -3,22 +3,23 @@ import pytest
 from nocturnomath.workspace import Workspace
 
 
-def test_workspace_initializes_records_and_session_folders(tmp_path):
+def test_workspace_defers_session_folder_until_first_activity(tmp_path):
     workspace = Workspace(tmp_path)
     first = workspace.transcript_path
     assert workspace.session_id == "S001"
+    assert not first.parent.exists()
     workspace.start_new_transcript()
 
     assert workspace.notes.evidence_path.read_text() == "# Evidence\n\n"
     assert workspace.notes.thoughts_path.read_text() == "# Thoughts\n\n"
-    assert workspace.transcript_path != first
-    assert (
-        workspace.transcript_path
-        == tmp_path / ".nocturnomath/sessions/S002/transcript.jsonl"
-    )
-    assert workspace.probes_path.is_dir()
+    assert workspace.transcript_path == first
+    assert not workspace.probes_path.exists()
     assert workspace.scratch_path.is_dir()
     assert not (workspace.notes_dir_path / "notes.md").exists()
+
+    workspace.log_transcript("user", text="first question")
+    assert workspace.transcript_path == first
+    assert workspace.probes_path.is_dir()
 
 
 def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
@@ -49,7 +50,7 @@ def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
     assert history["id"] == "S001"
     assert history["context_restorable"] is True
     assert not history["is_current"]
-    workspace.transcript_path = workspace.transcript_file("S001")
+    workspace.use_transcript(workspace.transcript_file("S001"))
     assert workspace.start_probe("print(4)", "4", "test").name == "P002"
     assert workspace.load_session("S001")[0]["text"] == "inspect the data"
 

@@ -98,7 +98,9 @@ ways. The new thought explains the correction and carries forward any valid reas
 Struck entries remain citable history, not valid support for conclusions.
 
 Evidence and thoughts belong to the workspace and can cite probes from any session.
-Starting a new session allocates a new `S` folder and restarts the kernel; resuming appends to its existing folder.
+Starting a new session restarts the kernel and prepares an empty chat. Its numbered `S`
+folder is created only when the first message is accepted. Empty legacy folders are omitted
+from History. Resuming a past session appends to its existing folder.
 
 In the web interface, Evidence and Thoughts open the scientific record directly;
 Documents lists workspace files. Documents refresh automatically. The model selector

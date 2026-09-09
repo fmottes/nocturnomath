@@ -85,7 +85,7 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
                 == ".nocturnomath/notes/evidence.md"
             )
             assert (workspace / ".nocturnomath" / "notes" / "evidence.md").is_file()
-            assert (workspace / ".nocturnomath" / "sessions" / "S001").is_dir()
+            assert not (workspace / ".nocturnomath" / "sessions" / "S001").exists()
             assert (workspace / ".nocturnomath" / "notes").is_dir()
             assert (workspace / ".nocturnomath" / "scratch").is_dir()
 

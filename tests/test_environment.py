@@ -39,6 +39,7 @@ def test_environment_does_not_inherit_app_python_paths(tmp_path, monkeypatch):
 
 
 def test_resume_and_restart_record_fresh_kernel(session):
+    session.log_transcript("user", text="first question")
     original = session.kernel_id
     session.reset_client_session()
     second = session.kernel_id
@@ -52,6 +53,37 @@ def test_resume_and_restart_record_fresh_kernel(session):
     assert json.loads(
         (session.workspace_path / session.environment_record).read_text()
     )["python"]
+
+
+def test_session_folder_is_created_by_first_message(session):
+    prepared = session.transcript_path
+    assert not prepared.parent.exists()
+    assert session.list_sessions() == []
+
+    session.log_transcript("user", text="first question")
+
+    assert prepared.is_file()
+    assert session.workspace.probes_path.is_dir()
+    assert [item["title"] for item in session.list_sessions()] == ["first question"]
+
+
+def test_new_empty_session_reuses_next_number_and_stays_out_of_history(session):
+    session.log_transcript("user", text="kept session")
+    session.reset_client_session()
+    prepared = session.transcript_path
+    assert prepared.parent.name == "S002"
+    assert not prepared.parent.exists()
+    assert [item["id"] for item in session.list_sessions()] == ["S001"]
+
+    session.reset_client_session()
+    assert session.transcript_path == prepared
+    assert not prepared.parent.exists()
+
+
+def test_history_filters_legacy_metadata_only_session(session):
+    session.workspace.ensure_session()
+    session.workspace.log_transcript("kernel_started", kernel_id="old-empty")
+    assert session.list_sessions() == []
 
 
 def test_bad_environment_switch_preserves_workspace_and_kernel(session, tmp_path):
@@ -112,6 +144,7 @@ def test_installation_targets_selected_python_and_records_failure(session):
         kwargs["stdout"].write("package could not be resolved")
         return SimpleNamespace(returncode=1)
 
+    session.activate_session()
     before = session.environment_record
     with patch("nocturnomath.session.subprocess.run", side_effect=fail):
         status, output = session.install_packages(["nonexistent-science-package"])

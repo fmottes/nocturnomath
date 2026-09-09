@@ -110,6 +110,7 @@ def build_tools(session: "ExplorationSession"):
             session._probe_task and not session._probe_task.done()
         ):
             return failure("A probe is still executing or saving its artifacts.")
+        session.activate_session()
         workspace = session.workspace
         transcript_path = session.transcript_path
         probe_path = workspace.start_probe(

@@ -63,7 +63,7 @@ async def run_terminal(args: argparse.Namespace):
 
     signal.signal(signal.SIGINT, on_sigint)
     print(f"research Python: {session.environment.python} ({session.environment.version})")
-    print(f"transcript: {session.transcript_path}")
+    print(f"next transcript: {session.transcript_path} (created with first message)")
     print("commands: /new  /restart  /notes  /exit")
 
     try:

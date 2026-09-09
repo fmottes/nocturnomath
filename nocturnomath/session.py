@@ -55,6 +55,7 @@ class ExplorationSession:
         self._pending_verdict: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
+        self._pending_kernel_start: tuple[str, str] | None = None
 
         self.environment = ResearchEnvironment(workspace_path, python)
         self.kernel = Kernel(cwd=workspace_path, environment=self.environment)
@@ -106,7 +107,17 @@ class ExplorationSession:
                 logger.error(f"Error in event subscriber: {exc}")
 
     def log_transcript(self, kind: str, **fields):
+        self.activate_session()
         self.workspace.log_transcript(kind, **fields)
+
+    def activate_session(self):
+        if not self.workspace.session_pending:
+            return
+        self.workspace.ensure_session()
+        if self._pending_kernel_start:
+            kernel_id, reason = self._pending_kernel_start
+            self._pending_kernel_start = None
+            self._write_kernel_start(kernel_id, reason)
 
     def opening_notes(self) -> str:
         return self.workspace.opening_notes()
@@ -161,13 +172,13 @@ class ExplorationSession:
         records = self.workspace.read_transcript(path)
         sdk_id = self.workspace.sdk_id(records)
         changed = path != self.workspace.transcript_path
-        previous_path = self.workspace.transcript_path
-        self.workspace.transcript_path = path
+        previous_state = self.workspace.session_state()
+        self.workspace.use_transcript(path)
         if changed:
             try:
                 self.kernel.restart("historical session resumed")
             except Exception:
-                self.workspace.transcript_path = previous_path
+                self.workspace.restore_session_state(previous_state)
                 raise
         self._sdk_session_id = sdk_id
         self._results_since_note = 0
@@ -198,7 +209,8 @@ class ExplorationSession:
         self._sdk_session_id = None
         self._resume_prefix = None
         self._session_initialized = False
-        self.log_transcript("meta", carry_chat_context=enabled)
+        if not self.workspace.session_pending:
+            self.log_transcript("meta", carry_chat_context=enabled)
         logger.info(f"carry_chat_context set to {enabled}")
         return enabled
 
@@ -288,12 +300,12 @@ class ExplorationSession:
 
     def reset_client_session(self):
         self.require_idle("start a new session")
-        previous_path = self.workspace.transcript_path
+        previous_state = self.workspace.session_state()
         self.start_new_transcript()
         try:
             self.kernel.restart("new session")
         except Exception:
-            self.workspace.transcript_path = previous_path
+            self.workspace.restore_session_state(previous_state)
             raise
         self._session_initialized = False
         self._sdk_session_id = None
@@ -309,21 +321,29 @@ class ExplorationSession:
         self.environment_record = str(path.relative_to(self.workspace.path))
 
     def record_kernel_start(self, reason):
-        self.record_environment()
         self.kernel_id = uuid.uuid4().hex
-        self.log_transcript(
-            "kernel_started",
-            kernel_id=self.kernel_id,
-            reason=reason,
-            environment=self.environment_record,
-        )
         self._kernel_notice = (
             f"\nKernel {self.kernel_id} started ({reason}). All prior in-memory variables are gone. "
             f"Python: {self.environment.python}. Workspace: {self.workspace.path}. "
             "Reload only what the next probe needs; do not automatically replay old probes.\n"
         )
+        if self.workspace.session_pending:
+            self._pending_kernel_start = (self.kernel_id, reason)
+            return
+        self._pending_kernel_start = None
+        self._write_kernel_start(self.kernel_id, reason)
+
+    def _write_kernel_start(self, kernel_id, reason):
+        self.record_environment()
+        self.workspace.log_transcript(
+            "kernel_started",
+            kernel_id=kernel_id,
+            reason=reason,
+            environment=self.environment_record,
+        )
 
     def install_packages(self, packages):
+        self.activate_session()
         if not packages or any(not p or p.startswith("-") for p in packages):
             raise ValueError("Provide package requirements, not installer options.")
         directory = (
