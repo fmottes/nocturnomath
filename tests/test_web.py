@@ -234,10 +234,14 @@ def test_websocket_event_contract(session):
 
     session.query = query
     app = create_app(session)
+    session.log_transcript("user", text="earlier question")
     with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
         init = websocket.receive_json()
         assert init["type"] == "init"
         assert init["workspace"]["path"] == str(session.workspace_path)
+        assert [
+            r["text"] for r in init["workspace"]["records"] if r["kind"] == "user"
+        ] == ["earlier question"]
         websocket.send_json({"action": "query", "text": "question"})
         assert websocket.receive_json() == {
             "type": "user_message",
@@ -267,7 +271,9 @@ def test_new_session_restarts_kernel_and_broadcasts_reset(session):
         TestClient(create_app(session)) as client,
         client.websocket_connect("/ws") as websocket,
     ):
-        assert websocket.receive_json()["workspace"]["session_id"] == "S001"
+        init = websocket.receive_json()["workspace"]
+        assert init["session_id"] == "S001"
+        assert init["records"] == []
         session.log_transcript("user", text="question")
         websocket.send_json({"action": "new_session"})
         assert websocket.receive_json() == {

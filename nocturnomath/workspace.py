@@ -72,6 +72,12 @@ class Workspace:
     def session_pending(self) -> bool:
         return self._session_pending
 
+    def current_records(self) -> list[dict[str, Any]]:
+        """Transcript of the active session, empty until it has activity."""
+        if self._session_pending or not self.transcript_path.is_file():
+            return []
+        return self.read_transcript(self.transcript_path)
+
     def use_transcript(self, path: Path):
         """Select an existing transcript rather than a prepared new session."""
         self.transcript_path = path

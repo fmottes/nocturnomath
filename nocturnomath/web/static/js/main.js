@@ -2,7 +2,7 @@ import { elements, state } from "./state.js?v=20260909-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
 import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260909-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
-import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260909-3";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260909-3";
 
@@ -37,6 +37,7 @@ function handleServerEvent(event) {
       break;
     case "init":
       applyWorkspace(event.workspace);
+      if (event.workspace?.is_open) restoreChat(event.workspace.records || []);
       break;
     case "workspace_updated":
       clearChat();

@@ -184,6 +184,7 @@ class Runtime:
                 "thoughts_path": THOUGHTS_PATH,
                 "markdown_files": [],
                 "plots": [],
+                "records": [],
                 "navigator_root": str(self.navigator_root),
                 "auth": self.auth.public(),
             }
@@ -191,6 +192,7 @@ class Runtime:
             "is_open": True,
             "path": str(session.workspace_path),
             "session_id": session.workspace.session_id,
+            "records": session.workspace.current_records(),
             "environment": {
                 "python": str(session.environment.python),
                 "version": session.environment.version,

@@ -144,9 +144,40 @@ export function clearChat(showWelcome = true) {
   state.lastProbeCard = null;
 }
 
+// Rebuild the chat from the transcript the browser reconnected to, so a page
+// reload or a dropped socket shows the running session rather than a blank log.
+export function restoreChat(records = []) {
+  clearChat(!records.length);
+  if (!records.length) return;
+  renderRecords(records);
+  scrollChatToBottom();
+}
+
 export function replaySession(records, contextRestored, carryChatContext, kernelReset = false, kernelRestored = false, probesReplayed = 0) {
   clearChat(false);
+  renderRecords(records);
 
+  let resumeNote;
+  if (!carryChatContext) {
+    resumeNote =
+      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `evidence.md` and `thoughts.md` — it does not read the conversation above.";
+  } else if (contextRestored) {
+    resumeNote =
+      "Resumed this chat. The agent still has its original conversation context.";
+  } else {
+    resumeNote =
+      "Resumed this chat. The agent's original context was not available, so it will pick up from a recap of the transcript above.";
+  }
+  if (kernelRestored) {
+    resumeNote += ` The kernel was reconstructed by replaying ${probesReplayed} stored ${probesReplayed === 1 ? "probe" : "probes"} in order.`;
+  } else {
+    resumeNote += kernelReset ? " A fresh kernel is ready; previous variables are gone." : " The current kernel is unchanged.";
+  }
+  appendSystemMessage(resumeNote);
+  scrollChatToBottom();
+}
+
+function renderRecords(records) {
   const outcomes = new Set(records.filter((rec) =>
     rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));
   const starts = new Map(records.filter((rec) => rec.kind === "probe_started")
@@ -200,23 +231,4 @@ export function replaySession(records, contextRestored, carryChatContext, kernel
         break;
     }
   });
-
-  let resumeNote;
-  if (!carryChatContext) {
-    resumeNote =
-      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `evidence.md` and `thoughts.md` — it does not read the conversation above.";
-  } else if (contextRestored) {
-    resumeNote =
-      "Resumed this chat. The agent still has its original conversation context.";
-  } else {
-    resumeNote =
-      "Resumed this chat. The agent's original context was not available, so it will pick up from a recap of the transcript above.";
-  }
-  if (kernelRestored) {
-    resumeNote += ` The kernel was reconstructed by replaying ${probesReplayed} stored ${probesReplayed === 1 ? "probe" : "probes"} in order.`;
-  } else {
-    resumeNote += kernelReset ? " A fresh kernel is ready; previous variables are gone." : " The current kernel is unchanged.";
-  }
-  appendSystemMessage(resumeNote);
-  scrollChatToBottom();
 }
