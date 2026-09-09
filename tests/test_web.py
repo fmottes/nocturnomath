@@ -156,7 +156,7 @@ def test_current_session_downloads_as_notebook(session):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ipynb+json")
     assert response.headers["content-disposition"] == (
-        'attachment; filename="nocturnomath-S001.ipynb"'
+        f'attachment; filename="nocturnomath-{session.workspace_path.name}-S001.ipynb"'
     )
     assert response.json()["cells"][1]["source"] == "### Probe 1.1\n\n**Prediction:** 3"
 

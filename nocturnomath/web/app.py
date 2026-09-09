@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import webbrowser
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -286,7 +287,13 @@ def create_app(
             )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        filename = f"nocturnomath-{session.workspace.session_id}.ipynb"
+        workspace_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", session.workspace_path.name
+        ).strip(".-")
+        workspace_name = workspace_name or "workspace"
+        filename = (
+            f"nocturnomath-{workspace_name}-{session.workspace.session_id}.ipynb"
+        )
         return Response(
             content=json.dumps(notebook, ensure_ascii=False, indent=1) + "\n",
             media_type="application/x-ipynb+json",
