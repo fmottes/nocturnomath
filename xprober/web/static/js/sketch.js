@@ -18,9 +18,9 @@
   if (!rough) return; // CSS keeps precise 1px borders as the fallback
 
   var SVG_NS = "http://www.w3.org/2000/svg";
-  var INK = "#1e3a8a";
-  var RULE = "#a8b0c2";
-  var HIGHLIGHTER = "#fde68a";
+  function cssColor(name, fallback) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+  }
 
   // --------------------------------------------------------------------------
   // Motion preference. Only decorative motion is affected: the highlighter
@@ -61,18 +61,18 @@
 
   // Chrome only. Order is irrelevant; each element is drawn independently.
   var CHROME = [
-    { selector: ".app-header", kind: "rule", stroke: INK, weight: 1.1 },
+    { selector: ".app-header", kind: "rule", color: "--blue", weight: 1.1 },
     { selector: ".chat-header", kind: "rule" },
     { selector: ".viewer-header", kind: "rule" },
     { selector: ".chat-input-container", kind: "rule-top" },
     { selector: ".doc-header-info", kind: "rule" },
     { selector: ".plots-gallery-header", kind: "rule" },
-    { selector: ".gutter", kind: "vline", stroke: INK, weight: 1 },
+    { selector: ".gutter", kind: "vline", color: "--blue", weight: 1 },
     { selector: ".message-card.system-welcome", kind: "box" },
-    { selector: ".probe-card", kind: "box", stroke: INK },
+    { selector: ".probe-card", kind: "box", color: "--blue" },
     { selector: ".chat-bubble.user .bubble-body", kind: "box" },
-    { selector: ".note-notification", kind: "box", stroke: INK },
-    { selector: ".modal-dialog", kind: "box", stroke: INK },
+    { selector: ".note-notification", kind: "box", color: "--blue" },
+    { selector: ".modal-dialog", kind: "box", color: "--blue" },
   ];
 
   var drawn = new WeakMap(); // element -> spec
@@ -118,7 +118,9 @@
     var opts = {
       roughness: spec.kind === "box" ? 0.8 : 0.7,
       bowing: spec.kind === "box" ? 0.6 : 0.35,
-      stroke: spec.stroke || RULE,
+      stroke: spec.color
+        ? cssColor(spec.color, "#1e3a8a")
+        : cssColor("--rule-strong", "#a8b0c2"),
       strokeWidth: spec.weight || 1,
       seed: seedFor(el),
       disableMultiStroke: true, // one steady pass, not a sketchy double line
@@ -240,7 +242,7 @@
 
     var annotation = RoughNotation.annotate(target, {
       type: "highlight",
-      color: HIGHLIGHTER,
+      color: cssColor("--highlighter", "#fde68a"),
       multiline: true,
       animate: motionOn,
       animationDuration: 480,
@@ -291,6 +293,7 @@
     if (log) log.addEventListener("scroll", scheduleReveal, { passive: true });
     window.addEventListener("scroll", scheduleReveal, { passive: true });
     window.addEventListener("resize", scheduleReveal, { passive: true });
+    window.addEventListener("xprober:themechange", redrawAll);
 
     // Modals are hidden at load, so they have no measurable box until opened.
     ["folder-modal", "history-modal"].forEach(function (id) {

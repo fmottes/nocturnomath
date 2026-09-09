@@ -247,7 +247,7 @@
   max-height: 190px;
   object-fit: contain;
   padding: 4px;
-  background: #ffffff;
+  background: var(--image-sheet);
   border: 1px solid var(--rule-strong);
   cursor: zoom-in;
   transition: border-color 0.12s ease;
@@ -312,4 +312,3 @@
 .prompt-input::placeholder { color: var(--ink-faint); }
 .prompt-input:focus { border-color: var(--blue); }
 .input-actions button { height: 46px; padding: 0 20px; }
-

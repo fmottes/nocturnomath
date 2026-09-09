@@ -6,6 +6,25 @@ import { loadSessions, replaySession } from "./history.js?v=20260906-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";
 
+const THEME_KEY = "xprober.theme";
+
+function applyTheme(theme) {
+  const selected = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = selected;
+  document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+    const next = selected === "dark" ? "Light" : "Dark";
+    button.textContent = next;
+    button.title = `Use ${next.toLowerCase()} mode`;
+    button.setAttribute("aria-label", `Use ${next.toLowerCase()} mode`);
+  });
+  try {
+    window.localStorage.setItem(THEME_KEY, selected);
+  } catch (error) {
+    // The theme still applies for this page when storage is unavailable.
+  }
+  window.dispatchEvent(new CustomEvent("xprober:themechange"));
+}
+
 // ============================================================================
 // Server Event Dispatcher
 // ============================================================================
@@ -101,6 +120,13 @@ function handleServerEvent(event) {
 // Event Listeners & Setup
 // ============================================================================
 function setupEventListeners() {
+  document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
+  });
+  applyTheme(document.documentElement.dataset.theme);
+
   // Chat form submit
   elements.chatForm.addEventListener("submit", (e) => {
     e.preventDefault();

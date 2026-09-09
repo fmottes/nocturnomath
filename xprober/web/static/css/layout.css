@@ -16,7 +16,7 @@
 .pane-viewer {
   flex: 1 1 50%;
   min-width: 320px;
-  background: rgba(255, 255, 255, 0.52);
+  background: var(--viewer-sheet);
 }
 
 .gutter {
@@ -40,4 +40,3 @@
 .gutter:hover .rough-layer,
 .gutter.dragging .rough-layer { opacity: 1; }
 .gutter .rough-layer { opacity: 0.75; }
-

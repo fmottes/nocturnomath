@@ -4,11 +4,19 @@
    ========================================================================== */
 
 :root {
+  color-scheme: light;
+
   /* Paper */
   --paper: #faf8f2;
   --sheet: rgba(255, 255, 255, 0.72);
   --sheet-solid: #fffefb;
   --sheet-sunk: rgba(30, 58, 138, 0.03);
+  --viewer-sheet: rgba(255, 255, 255, 0.52);
+  --image-sheet: #ffffff;
+  --backdrop: rgba(22, 24, 29, 0.28);
+  --lightbox-backdrop: rgba(22, 24, 29, 0.7);
+  --overlay-ink: #faf8f2;
+  --row-rule: rgba(205, 210, 221, 0.65);
 
   /* Grid */
   --grid-minor: rgba(30, 58, 138, 0.07);
@@ -23,6 +31,7 @@
   --blue: #1e3a8a;
   --blue-soft: #3b56a8;
   --blue-wash: #eaeef8;
+  --blue-hover: #16296b;
   --rule: #cdd2dd;
   --rule-strong: #a8b0c2;
 
@@ -32,6 +41,10 @@
   --ok: #15803d;
   --warn: #b45309;
   --danger: #b3261e;
+  --syntax-string: #8a5a2b;
+  --syntax-number: #7a3e9d;
+  --grain-opacity: 0.22;
+  --grain-blend: multiply;
 
   /* Legacy aliases still referenced from app.js */
   --accent-success: var(--ok);
@@ -48,6 +61,39 @@
   /* Depth comes from cross-hatching, never from shadow or gradient */
   --hatch: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cdefs%3E%3Cpattern id='h' width='8' height='8' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 8L8 0M0 0L8 8' stroke='%231e3a8a' stroke-width='0.5' opacity='0.45'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='8' height='8' fill='url(%23h)'/%3E%3C/svg%3E");
   --hatch-dense: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='5' height='5'%3E%3Cdefs%3E%3Cpattern id='h' width='5' height='5' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 5L5 0M0 0L5 5' stroke='%231e3a8a' stroke-width='0.6' opacity='0.6'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='5' height='5' fill='url(%23h)'/%3E%3C/svg%3E");
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #10151d;
+  --sheet: rgba(25, 33, 46, 0.8);
+  --sheet-solid: #18202b;
+  --sheet-sunk: rgba(143, 171, 238, 0.07);
+  --viewer-sheet: rgba(20, 27, 38, 0.68);
+  --backdrop: rgba(3, 6, 10, 0.64);
+  --lightbox-backdrop: rgba(3, 6, 10, 0.88);
+  --row-rule: rgba(74, 89, 113, 0.68);
+  --grid-minor: rgba(143, 171, 238, 0.045);
+  --grid-major: rgba(143, 171, 238, 0.09);
+  --ink: #e6e9ee;
+  --ink-soft: #b5bdc9;
+  --ink-faint: #818c9d;
+  --blue: #8fabea;
+  --blue-soft: #adc0ef;
+  --blue-wash: #222e49;
+  --blue-hover: #a9bdf0;
+  --rule: #344156;
+  --rule-strong: #52627c;
+  --highlighter: #80651e;
+  --ok: #68ce86;
+  --warn: #e5a65e;
+  --danger: #f07871;
+  --syntax-string: #dfaa73;
+  --syntax-number: #c99ce8;
+  --grain-opacity: 0.1;
+  --grain-blend: soft-light;
+  --hatch: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cdefs%3E%3Cpattern id='h' width='8' height='8' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 8L8 0M0 0L8 8' stroke='%238fabea' stroke-width='0.5' opacity='0.5'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='8' height='8' fill='url(%23h)'/%3E%3C/svg%3E");
+  --hatch-dense: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='5' height='5'%3E%3Cdefs%3E%3Cpattern id='h' width='5' height='5' patternUnits='userSpaceOnUse'%3E%3Cpath d='M0 5L5 0M0 0L5 5' stroke='%238fabea' stroke-width='0.6' opacity='0.65'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='5' height='5' fill='url(%23h)'/%3E%3C/svg%3E");
 }
 
 * {
@@ -84,10 +130,10 @@ body::before {
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  opacity: 0.22;
+  opacity: var(--grain-opacity);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23g)' opacity='0.5'/%3E%3C/svg%3E");
   background-size: 200px 200px;
-  mix-blend-mode: multiply;
+  mix-blend-mode: var(--grain-blend);
 }
 
 .app-container {

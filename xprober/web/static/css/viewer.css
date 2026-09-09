@@ -199,7 +199,7 @@
   border-bottom-color: var(--rule-strong);
 }
 .markdown-body td:not(:first-child) { text-align: right; }
-.markdown-body img { max-width: 100%; border: 1px solid var(--rule-strong); background: #fff; }
+.markdown-body img { max-width: 100%; border: 1px solid var(--rule-strong); background: var(--image-sheet); }
 
 /* Highlighter, reserved for results the agent marked as important */
 .markdown-body mark {
@@ -222,8 +222,8 @@
 .hljs { background: transparent; color: var(--ink); }
 .hljs-comment, .hljs-quote { color: var(--ink-faint); font-style: italic; }
 .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name { color: var(--blue); font-weight: 500; }
-.hljs-string, .hljs-attr, .hljs-regexp { color: #8a5a2b; }
-.hljs-number, .hljs-literal { color: #7a3e9d; }
+.hljs-string, .hljs-attr, .hljs-regexp { color: var(--syntax-string); }
+.hljs-number, .hljs-literal { color: var(--syntax-number); }
 .hljs-title, .hljs-function .hljs-title, .hljs-class .hljs-title { color: var(--ink); font-weight: 600; }
 .hljs-meta, .hljs-params { color: var(--ink-soft); }
 
@@ -268,7 +268,7 @@
   justify-content: center;
   overflow: hidden;
   padding: 6px;
-  background: #ffffff;
+  background: var(--image-sheet);
   cursor: zoom-in;
 }
 .plot-card img { width: 100%; height: 100%; object-fit: contain; }
@@ -294,4 +294,3 @@
   font-size: 1.0625rem;
   color: var(--ink-faint);
 }
-

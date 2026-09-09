@@ -123,7 +123,7 @@
   color: var(--paper);
   font-weight: 500;
 }
-.btn-primary:hover:not(:disabled) { background: #16296b; border-color: #16296b; color: var(--paper); }
+.btn-primary:hover:not(:disabled) { background: var(--blue-hover); border-color: var(--blue-hover); color: var(--paper); }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .btn-ghost { background: transparent; border-color: transparent; }
@@ -155,4 +155,3 @@
   transition: color 0.12s ease, border-color 0.12s ease;
 }
 .chip:hover { color: var(--blue); border-color: var(--blue); border-style: solid; }
-

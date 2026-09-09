@@ -8,7 +8,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(22, 24, 29, 0.7);
+  background: var(--lightbox-backdrop);
   cursor: zoom-out;
 }
 .lightbox-content { position: relative; max-width: 92vw; max-height: 92vh; display: flex; flex-direction: column; align-items: center; }
@@ -17,7 +17,7 @@
   max-height: 82vh;
   object-fit: contain;
   padding: 8px;
-  background: #ffffff;
+  background: var(--image-sheet);
   border: 1px solid var(--rule-strong);
 }
 .lightbox-close {
@@ -28,10 +28,10 @@
   border: none;
   font-size: 1.6rem;
   line-height: 1;
-  color: var(--paper);
+  color: var(--overlay-ink);
   cursor: pointer;
 }
-.lightbox-caption { margin-top: 10px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--paper); }
+.lightbox-caption { margin-top: 10px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--overlay-ink); }
 
 .hidden { display: none !important; }
 
