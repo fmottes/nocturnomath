@@ -148,9 +148,7 @@ def test_current_session_downloads_as_notebook(session):
         session.log_transcript(
             "probe_started", probe_id="S001/P001", expected="3", code="print(3)"
         )
-        session.log_transcript(
-            "run", probe_id="S001/P001", output="3\n", images=[]
-        )
+        session.log_transcript("run", probe_id="S001/P001", output="3\n", images=[])
         response = client.get("/api/session/notebook")
 
     assert response.status_code == 200

@@ -107,7 +107,11 @@ async def test_cancelled_probe_keeps_output_and_blocks_workspace_switch(session)
     assert (probe / "plot-1.png").read_bytes() == b"partial plot"
     assert json.loads((probe / "probe.json").read_text())["status"] == "interrupted"
     records = session.workspace.read_transcript(session.transcript_path)
-    assert [record["kind"] for record in records] == ["kernel_started", "probe_started", "run"]
+    assert [record["kind"] for record in records] == [
+        "kernel_started",
+        "probe_started",
+        "run",
+    ]
     assert records[-1]["probe_id"] == "S001/P001"
     assert records[-1]["status"] == "interrupted"
     assert not session.has_active_query()
