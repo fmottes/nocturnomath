@@ -37,6 +37,7 @@ class WebRuntime:
         self.session_factory = session_factory
         self.websockets: set[WebSocket] = set()
         self._started = False
+        self.changing = False
         self._subscribed_session: ExplorationSession | None = None
 
     @property
@@ -69,13 +70,14 @@ class WebRuntime:
 
     def shutdown(self):
         self._started = False
+        self.changing = False
         if self._subscribed_session:
             self._subscribed_session.unsubscribe(self.forward_session_event)
             self._subscribed_session = None
         if self.session:
             self.session.shutdown()
 
-    def open_workspace(self, path: Path | str) -> ExplorationSession:
+    def open_workspace(self, path: Path | str, python=None) -> ExplorationSession:
         """Open an existing directory, creating runtime state only after validation."""
         if self.session is not None:
             self.session.require_idle("change workspace")
@@ -86,13 +88,14 @@ class WebRuntime:
         if self.session is None:
             self.session = self.session_factory(
                 workspace_path=target,
+                python=python,
                 model=self.model,
                 timeout_s=self.timeout_s,
                 image_cap=self.image_cap,
             )
             self._subscribe_to_session()
         else:
-            self.session.set_workspace(target)
+            self.session.set_workspace(target, python)
         return self.session
 
     def _subscribe_to_session(self):
@@ -121,7 +124,28 @@ class WebRuntime:
     async def forward_session_event(self, event_type: str, payload: dict[str, Any]):
         await self.broadcast(event_type, payload)
 
+    async def transition(self, operation, *args):
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        if self.session:
+            self.session.require_idle("change kernel or workspace")
+        self.changing = True
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+        finally:
+            self.changing = False
+
     def start_query(self, text: str, model: str | None = None):
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
         if self.session is None:
             raise RuntimeError("Open a workspace folder before starting a query.")
         if self.session.has_active_query():

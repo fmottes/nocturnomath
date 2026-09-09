@@ -199,6 +199,16 @@
           <button class="modal-close" id="settings-close" aria-label="Close settings" type="button">&times;</button>
         </div>
         <div class="modal-body">
+          <h4>Research environment</h4>
+          <p id="environment-info" class="modal-help"></p>
+          <form id="environment-form">
+            <label for="environment-python">Python executable</label>
+            <input id="environment-python" type="text" style="width:100%" placeholder="/path/to/venv/bin/python">
+            <p class="modal-help">Changing environments starts a new session. Existing environments need ipykernel and matplotlib. Package installs will modify the selected environment.</p>
+            <button class="btn btn-outline" type="submit">Use this environment</button>
+            <button class="btn btn-outline" id="environment-managed" type="button">Use managed environment</button>
+            <p id="environment-error" class="modal-help" role="status"></p>
+          </form>
           <h4>Experimental</h4>
           <label class="toggle-label switch-label">
             <span>Keep context</span>
@@ -287,7 +297,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260909-1"></script>
-  <script src="/static/js/sketch.js?v=20260908-1"></script>
+  <script type="module" src="/static/js/main.js?v=20260909-2"></script>
+  <script src="/static/js/sketch.js?v=20260909-2"></script>
 </body>
 </html>

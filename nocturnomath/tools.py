@@ -45,7 +45,7 @@ def build_tools(session: "ExplorationSession"):
         "run",
         "Run Python in the persistent Jupyter kernel. This is the only way to execute anything. "
         "`expected` is your one-line prediction of what this will show; it is required. "
-        "To install a missing library, run `!uv pip install <name>` here (there is no pip).",
+        "Use install_packages to install missing libraries into the selected research environment.",
         {"code": str, "expected": str},
     )
     async def run(args):
@@ -96,7 +96,7 @@ def build_tools(session: "ExplorationSession"):
 
         preface = []
         if not session.kernel.is_alive():
-            session.kernel.restart()
+            await asyncio.to_thread(session.kernel.restart)
             preface.append(
                 "Note: the kernel was dead and has been restarted. Everything in memory is gone; "
                 "reload what you need."
@@ -112,7 +112,13 @@ def build_tools(session: "ExplorationSession"):
             return failure("A probe is still executing or saving its artifacts.")
         workspace = session.workspace
         transcript_path = session.transcript_path
-        probe_path = workspace.start_probe(code, expected, session.model)
+        probe_path = workspace.start_probe(
+            code,
+            expected,
+            session.model,
+            kernel_id=session.kernel_id,
+            environment=session.environment_record,
+        )
         source_id = f"{workspace.session_id}/{probe_path.name}"
         session.log_transcript(
             "probe_started", probe_id=source_id, expected=expected, code=code
@@ -355,7 +361,17 @@ def build_tools(session: "ExplorationSession"):
         {},
     )
     async def restart_kernel(args):
-        session.kernel.restart()
+        if session.kernel.busy or (
+            session._probe_task and not session._probe_task.done()
+        ):
+            return failure("An operation is still running.")
+        task = asyncio.create_task(asyncio.to_thread(session.kernel.restart))
+        session._probe_task = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done():
+                session._probe_task = None
         await session.emit("kernel_restarted")
         return {
             "content": [
@@ -366,4 +382,62 @@ def build_tools(session: "ExplorationSession"):
             ]
         }
 
-    return [run, evidence, thought, strike_evidence, verdict, restart_kernel]
+    @tool(
+        "install_packages",
+        "Install missing packages into the selected research environment. "
+        "State deliberate upgrades before calling. This records installation separately from probes. "
+        "Already imported modules retain their loaded versions until restart_kernel.",
+        {
+            "type": "object",
+            "properties": {
+                "packages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                }
+            },
+            "required": ["packages"],
+        },
+    )
+    async def install_packages(args):
+        if session.kernel.busy or (
+            session._probe_task and not session._probe_task.done()
+        ):
+            return failure("An operation is still running.")
+        task = asyncio.create_task(
+            asyncio.to_thread(session.install_packages, args["packages"])
+        )
+        session._probe_task = task
+        try:
+            status, output = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return failure(str(exc))
+        finally:
+            if task.done():
+                session._probe_task = None
+        await session.emit(
+            "system_message",
+            text=f"Package installation {status}. Installer output saved in this session’s environment_changes folder.",
+        )
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": output
+                    + "\nLoaded modules are unchanged; restart if needed.",
+                }
+            ],
+            "is_error": status != "completed",
+        }
+
+    return [
+        run,
+        evidence,
+        thought,
+        strike_evidence,
+        verdict,
+        restart_kernel,
+        install_packages,
+    ]

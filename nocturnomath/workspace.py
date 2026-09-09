@@ -87,7 +87,7 @@ class Workspace:
             + "\n---\n\n"
         )
 
-    def start_probe(self, code: str, expected: str, model: str) -> Path:
+    def start_probe(self, code: str, expected: str, model: str, **context) -> Path:
         numbers = [
             int(path.name[1:])
             for path in self.probes_path.iterdir()
@@ -108,6 +108,7 @@ class Workspace:
                 {
                     "id": path.name,
                     "expected": expected,
+                    **context,
                     "model": model,
                     "session": self.session_id,
                     "started": time.time(),

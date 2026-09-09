@@ -27,6 +27,9 @@ If the idea cannot be stated in three sentences, it is two ideas. Split it.
 - Don't spend effort optimizing, but use whatever form reads most naturally. Vectorized numpy is
   usually clearer than an explicit loop, so prefer it.
 - No CLI, no config, no logging, no error handling, no tests, no type hints.
+- Use `install_packages` for missing dependencies. It targets the selected workspace environment
+  and records the installation separately. State deliberate upgrades before installing.
+  Loaded modules keep their old versions until a kernel restart. Never install through a probe.
 - The kernel is persistent. Reuse data and objects already loaded; do not reload. If the
   kernel's state is itself the problem — a shadowed name, a stale import, memory filling
   up — call `restart_kernel`, then reload only what the next run needs.

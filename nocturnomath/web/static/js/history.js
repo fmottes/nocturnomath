@@ -1,5 +1,5 @@
-import { elements, state } from "./state.js?v=20260906-1";
-import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260906-1";
+import { elements, state } from "./state.js?v=20260909-2";
+import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260909-2";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -119,7 +119,7 @@ export function clearChat() {
   state.lastProbeCard = null;
 }
 
-export function replaySession(records, contextRestored, carryChatContext) {
+export function replaySession(records, contextRestored, carryChatContext, kernelReset = false) {
   clearChat();
 
   const outcomes = new Set(records.filter((rec) =>
@@ -182,11 +182,12 @@ export function replaySession(records, contextRestored, carryChatContext) {
       "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `evidence.md` and `thoughts.md` — it does not read the conversation above.";
   } else if (contextRestored) {
     resumeNote =
-      "Resumed this chat. The agent still has its original context; the kernel keeps whatever state it holds now.";
+      "Resumed this chat. The agent still has its original conversation context.";
   } else {
     resumeNote =
       "Resumed this chat. The agent's original context was not available, so it will pick up from a recap of the transcript above.";
   }
+  resumeNote += kernelReset ? " A fresh kernel is ready; previous variables are gone." : " The current kernel is unchanged.";
   appendSystemMessage(resumeNote);
   scrollChatToBottom();
 }

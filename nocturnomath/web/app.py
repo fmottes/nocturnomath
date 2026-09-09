@@ -29,6 +29,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 class WorkspaceChangeRequest(BaseModel):
     path: str
+    python: str | None = None
 
 
 class SessionResumeRequest(BaseModel):
@@ -43,6 +44,7 @@ def create_app(
     timeout_s: int = 600,
     image_cap: int = 2,
     navigator_root: Path | str = ".",
+    python: str | None = None,
     session_factory: Callable[..., ExplorationSession] = ExplorationSession,
 ) -> FastAPI:
     """Build the dashboard without opening a workspace until the user chooses one."""
@@ -54,6 +56,8 @@ def create_app(
         navigator_root=navigator_root,
         session_factory=session_factory,
     )
+
+    initial_python = python
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -115,6 +119,10 @@ def create_app(
         return {
             "is_open": True,
             "path": str(session.workspace_path),
+            "environment": {
+                "python": str(session.environment.python),
+                "version": session.environment.version,
+            },
             "model": session.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,
@@ -138,7 +146,7 @@ def create_app(
 
     def require_idle(action: str):
         session = active_session()
-        if session.has_active_query():
+        if runtime.changing or session.has_active_query():
             raise HTTPException(
                 status_code=409,
                 detail=f"Cannot {action} while the agent is running a query.",
@@ -188,8 +196,12 @@ def create_app(
 
     @app.post("/api/workspace")
     async def change_workspace(request: WorkspaceChangeRequest):
+        nonlocal initial_python
         try:
-            runtime.open_workspace(request.path)
+            await runtime.transition(
+                runtime.open_workspace, request.path, request.python or initial_python
+            )
+            initial_python = None
             info = await workspace_snapshot()
             await runtime.broadcast("workspace_updated", {"workspace": info})
             return {"status": "ok", "workspace": info}
@@ -261,7 +273,7 @@ def create_app(
     async def restart_kernel():
         require_idle("restart the kernel")
         session = active_session()
-        session.kernel.restart()
+        await runtime.transition(session.kernel.restart)
         await runtime.broadcast(
             "kernel_restarted", {"kernel_alive": session.kernel.is_alive()}
         )
@@ -277,7 +289,7 @@ def create_app(
     async def new_session():
         try:
             session = active_session()
-            session.reset_client_session()
+            await runtime.transition(session.reset_client_session)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         await runtime.broadcast("session_reset", {})
@@ -305,7 +317,7 @@ def create_app(
     async def resume_session(request: SessionResumeRequest):
         try:
             session = active_session()
-            data = session.resume_session(request.id)
+            data = await runtime.transition(session.resume_session, request.id)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Session not found")
         except ValueError as exc:
@@ -338,12 +350,21 @@ def create_app(
                         {"message": "Open a workspace folder before using the agent."},
                     )
                     continue
+                if runtime.changing:
+                    await runtime.broadcast(
+                        "error",
+                        {
+                            "message": "The research environment is being prepared. Please wait."
+                        },
+                    )
+                    continue
+
                 if action == "query":
                     text = data.get("text", "").strip()
                     if not text:
                         continue
                     if text == "/new":
-                        if session.has_active_query():
+                        if runtime.changing or session.has_active_query():
                             await runtime.broadcast(
                                 "error",
                                 {
@@ -351,11 +372,11 @@ def create_app(
                                 },
                             )
                             continue
-                        session.reset_client_session()
+                        await runtime.transition(session.reset_client_session)
                         await runtime.broadcast("session_reset", {})
                         continue
                     if text == "/restart":
-                        if session.has_active_query():
+                        if runtime.changing or session.has_active_query():
                             await runtime.broadcast(
                                 "error",
                                 {
@@ -363,7 +384,7 @@ def create_app(
                                 },
                             )
                             continue
-                        session.kernel.restart()
+                        await runtime.transition(session.kernel.restart)
                         await runtime.broadcast(
                             "system_message",
                             {"text": "Kernel restarted. In-memory state is cleared."},
@@ -375,7 +396,7 @@ def create_app(
                             "system_message", {"text": f"```markdown\n{notes}\n```"}
                         )
                         continue
-                    if session.has_active_query():
+                    if runtime.changing or session.has_active_query():
                         await runtime.broadcast(
                             "error",
                             {"message": "The agent is already running a query."},
@@ -394,7 +415,7 @@ def create_app(
                 elif action == "interrupt":
                     await session.interrupt()
                 elif action == "restart_kernel":
-                    if session.has_active_query():
+                    if runtime.changing or session.has_active_query():
                         await runtime.broadcast(
                             "error",
                             {
@@ -402,12 +423,12 @@ def create_app(
                             },
                         )
                         continue
-                    session.kernel.restart()
+                    await runtime.transition(session.kernel.restart)
                     await runtime.broadcast(
                         "kernel_restarted", {"kernel_alive": session.kernel.is_alive()}
                     )
                 elif action == "new_session":
-                    if session.has_active_query():
+                    if runtime.changing or session.has_active_query():
                         await runtime.broadcast(
                             "error",
                             {
@@ -415,13 +436,15 @@ def create_app(
                             },
                         )
                         continue
-                    session.reset_client_session()
+                    await runtime.transition(session.reset_client_session)
                     await runtime.broadcast("session_reset", {})
                 elif action == "resume_session":
                     session_id = data.get("id")
                     if session_id:
                         try:
-                            resumed = session.resume_session(session_id)
+                            resumed = await runtime.transition(
+                                session.resume_session, session_id
+                            )
                             await runtime.broadcast("session_resumed", resumed)
                         except Exception as exc:
                             await runtime.broadcast("error", {"message": str(exc)})
@@ -438,7 +461,7 @@ def create_app(
                     target_path = data.get("path")
                     if target_path:
                         try:
-                            runtime.open_workspace(target_path)
+                            await runtime.transition(runtime.open_workspace, target_path, data.get("python"))
                             info = await workspace_snapshot()
                             await runtime.broadcast(
                                 "workspace_updated", {"workspace": info}

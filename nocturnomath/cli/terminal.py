@@ -44,6 +44,7 @@ async def run_terminal(args: argparse.Namespace):
 
     session = ExplorationSession(
         workspace_path=Path(args.path).resolve(),
+        python=args.python,
         model=args.model,
         timeout_s=args.timeout,
         image_cap=args.images,
@@ -61,6 +62,7 @@ async def run_terminal(args: argparse.Namespace):
             raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, on_sigint)
+    print(f"research Python: {session.environment.python} ({session.environment.version})")
     print(f"transcript: {session.transcript_path}")
     print("commands: /new  /restart  /notes  /exit")
 

@@ -43,6 +43,7 @@ def main():
         timeout_s=args.timeout,
         image_cap=args.images,
         navigator_root=navigator_root,
+        python=args.python,
     )
     logger.info(f"Nocturnomath Web App ready at: {url}")
     server = uvicorn.Server(

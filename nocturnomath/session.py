@@ -1,8 +1,11 @@
 """Conversation orchestration for a scientific exploration session."""
 
 import asyncio
+import json
 import logging
+import subprocess
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
+from .environment import ResearchEnvironment
 from .kernel import Kernel
 from .prompt import SYSTEM_PROMPT
 from .tools import build_tools
@@ -35,6 +39,7 @@ class ExplorationSession:
         timeout_s: int = 600,
         image_cap: int = 2,
         carry_chat_context: bool = CARRY_CHAT_CONTEXT,
+        python: str | None = None,
     ):
         self.model = model
         self.timeout_s = timeout_s
@@ -51,8 +56,16 @@ class ExplorationSession:
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
 
-        self.workspace = Workspace(workspace_path)
-        self.kernel = Kernel(cwd=self.workspace.path)
+        self.environment = ResearchEnvironment(workspace_path, python)
+        self.kernel = Kernel(cwd=workspace_path, environment=self.environment)
+        try:
+            self.workspace = Workspace(workspace_path)
+            self.environment.save()
+            self.kernel.on_start = self.record_kernel_start
+            self.record_kernel_start("opened")
+        except Exception:
+            self.kernel.shutdown()
+            raise
         self.tools = build_tools(self)
 
     @property
@@ -101,16 +114,28 @@ class ExplorationSession:
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
 
-    def set_workspace(self, new_dir: Path | str):
+    def set_workspace(self, new_dir: Path | str, python=None):
         self.require_idle("change workspace")
         new_path = Path(new_dir).resolve()
-        self.workspace.set_path(new_path)
+        environment = ResearchEnvironment(new_path, python)
+        kernel = Kernel(cwd=new_path, environment=environment)
+        try:
+            workspace = Workspace(new_path)
+            environment.save()
+        except Exception:
+            kernel.shutdown()
+            raise
+        self.kernel.shutdown()
+        self.workspace = workspace
+        self.environment = environment
+        self.kernel = kernel
+        self.kernel.on_start = self.record_kernel_start
+        self.record_kernel_start("workspace changed")
         self._session_initialized = False
         self._sdk_session_id = None
         self._resume_prefix = None
         self._results_since_note = 0
         self._pending_verdict = None
-        self.kernel.set_cwd(new_path)
         logger.info(f"Switched workspace to: {new_path}")
 
     def list_markdown_files(self) -> list[dict[str, Any]]:
@@ -135,7 +160,15 @@ class ExplorationSession:
         path = self.workspace.transcript_file(session_id)
         records = self.workspace.read_transcript(path)
         sdk_id = self.workspace.sdk_id(records)
+        changed = path != self.workspace.transcript_path
+        previous_path = self.workspace.transcript_path
         self.workspace.transcript_path = path
+        if changed:
+            try:
+                self.kernel.restart("historical session resumed")
+            except Exception:
+                self.workspace.transcript_path = previous_path
+                raise
         self._sdk_session_id = sdk_id
         self._results_since_note = 0
         self._pending_verdict = None
@@ -150,6 +183,7 @@ class ExplorationSession:
         logger.info(f"Resumed chat {path.name}")
         return {
             "id": path.parent.name,
+            "kernel_reset": changed,
             "records": records,
             "carry_chat_context": self.carry_chat_context,
             "context_restored": self.carry_chat_context and sdk_id is not None,
@@ -219,6 +253,8 @@ class ExplorationSession:
                     prefix = self.opening_notes()
                     self._session_initialized = True
 
+                prefix += self._kernel_notice
+                self._kernel_notice = ""
                 prompt = prefix + user_text if prefix else user_text
                 await client.query(prompt)
                 accumulated_text = []
@@ -252,10 +288,91 @@ class ExplorationSession:
 
     def reset_client_session(self):
         self.require_idle("start a new session")
-        self.kernel.restart()
+        previous_path = self.workspace.transcript_path
+        self.start_new_transcript()
+        try:
+            self.kernel.restart("new session")
+        except Exception:
+            self.workspace.transcript_path = previous_path
+            raise
         self._session_initialized = False
         self._sdk_session_id = None
         self._resume_prefix = None
         self._results_since_note = 0
         self._pending_verdict = None
-        self.start_new_transcript()
+
+    def record_environment(self):
+        directory = self.transcript_path.parent / "environments"
+        directory.mkdir(exist_ok=True)
+        path = directory / f"{uuid.uuid4().hex}.json"
+        path.write_text(json.dumps(self.environment.snapshot(), indent=2) + "\n")
+        self.environment_record = str(path.relative_to(self.workspace.path))
+
+    def record_kernel_start(self, reason):
+        self.record_environment()
+        self.kernel_id = uuid.uuid4().hex
+        self.log_transcript(
+            "kernel_started",
+            kernel_id=self.kernel_id,
+            reason=reason,
+            environment=self.environment_record,
+        )
+        self._kernel_notice = (
+            f"\nKernel {self.kernel_id} started ({reason}). All prior in-memory variables are gone. "
+            f"Python: {self.environment.python}. Workspace: {self.workspace.path}. "
+            "Reload only what the next probe needs; do not automatically replay old probes.\n"
+        )
+
+    def install_packages(self, packages):
+        if not packages or any(not p or p.startswith("-") for p in packages):
+            raise ValueError("Provide package requirements, not installer options.")
+        directory = (
+            self.transcript_path.parent / "environment_changes" / uuid.uuid4().hex
+        )
+        directory.mkdir(parents=True)
+        command = [
+            self.environment.uv(),
+            "pip",
+            "install",
+            "--python",
+            str(self.environment.python),
+            *packages,
+        ]
+        metadata = {
+            "command": command,
+            "kernel_id": self.kernel_id,
+            "before": self.environment_record,
+            "started": time.time(),
+            "status": "started",
+        }
+        path = directory / "install.json"
+        path.write_text(json.dumps(metadata, indent=2) + "\n")
+        try:
+            with (directory / "output.txt").open("w") as output:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    cwd=self.workspace.path,
+                    env=self.environment.process_env(),
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    timeout=600,
+                )
+            metadata["status"] = "completed" if result.returncode == 0 else "failed"
+        except Exception as exc:
+            metadata["status"] = "failed"
+            with (directory / "output.txt").open("a") as output:
+                output.write(str(exc))
+        finally:
+            metadata["finished"] = time.time()
+            try:
+                self.record_environment()
+                metadata["after"] = self.environment_record
+            finally:
+                path.write_text(json.dumps(metadata, indent=2) + "\n")
+        self.log_transcript(
+            "packages_installed",
+            **metadata,
+            output=str((directory / "output.txt").relative_to(self.workspace.path)),
+        )
+        return metadata["status"], (directory / "output.txt").read_text()

@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
 
 from nocturnomath.web import create_app
@@ -8,7 +9,10 @@ from nocturnomath.web import create_app
 
 @pytest.fixture(autouse=True)
 def sdk_model_catalog():
-    with patch("nocturnomath.web.runtime.ClaudeSDKClient") as sdk:
+    with (
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+        patch("nocturnomath.web.runtime.ClaudeSDKClient") as sdk,
+    ):
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
                 "models": [
@@ -40,26 +44,7 @@ def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
         assert client.get("/api/workspace").json()["models"] == []
 
 
-class NoopKernel:
-    def __init__(self, cwd=None):
-        self.cwd = cwd
-        self.busy = False
-        self.alive = True
-
-    def is_alive(self):
-        return self.alive
-
-    def set_cwd(self, cwd):
-        self.cwd = cwd
-
-    def restart(self):
-        self.alive = True
-
-    def interrupt(self):
-        pass
-
-    def shutdown(self):
-        self.alive = False
+NoopKernel = FakeKernel
 
 
 def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
@@ -273,7 +258,9 @@ def test_record_citations_resolve_to_saved_artifacts_and_entries(session):
                     assert f'id="{anchor}"' in response.text
         with client.websocket_connect("/ws") as websocket:
             init = websocket.receive_json()
-            assert init["workspace"]["thoughts_path"] == ".nocturnomath/notes/thoughts.md"
+            assert (
+                init["workspace"]["thoughts_path"] == ".nocturnomath/notes/thoughts.md"
+            )
             websocket.send_json({"action": "query", "text": "/notes"})
             text = websocket.receive_json()["text"]
             assert "# Evidence" in text and "# Thoughts" in text and "<del>" in text

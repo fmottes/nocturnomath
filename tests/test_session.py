@@ -39,7 +39,7 @@ async def test_query_emits_text_tracks_context_and_logs(session):
     assert events[0] == "status_change"
     assert events[-1] == "status_change"
     records = session.workspace.read_transcript(session.transcript_path)
-    assert [record["kind"] for record in records] == ["user", "meta", "agent"]
+    assert [record["kind"] for record in records] == ["kernel_started", "user", "meta", "agent"]
 
 
 @pytest.mark.asyncio

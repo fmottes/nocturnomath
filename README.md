@@ -135,3 +135,34 @@ The Python package is organized by responsibility:
 - `nocturnomath/kernel.py` manages the persistent Jupyter kernel.
 - `nocturnomath/web/` contains the FastAPI dashboard and browser assets.
 - `nocturnomath/cli/` contains the web and terminal entry points.
+
+## Research environments
+
+Opening a workspace automatically prepares `.nocturnomath/venv`, even if the folder
+already has a `.venv`. The environment starts with ipykernel, matplotlib, numpy, and
+pandas. Packages persist across sessions; kernel variables do not. The first opening
+requires uv and may download packages. Later openings reuse the environment.
+
+In Settings → Research environment, enter another environment's Python executable
+if you want to use it instead. It must already contain ipykernel and matplotlib;
+Nocturnomath does not automatically modify a manually selected environment during
+selection. Subsequent agent package installations target that environment. The choice
+is remembered in `.nocturnomath/config.json`. Use “Use managed environment” to return
+to the workspace default. Changing environments starts a new session.
+
+Both commands accept `--python /path/to/venv/bin/python` (or `--python managed`).
+For the web command this applies to the first workspace opened. This also allows
+replacing a saved selection whose interpreter is no longer available.
+
+New sessions and workspace changes start fresh kernels. Resuming a different historical
+session restores its conversation but starts with empty Python memory; reloading the
+current session preserves memory. The agent is told when memory has been cleared.
+
+The `install_packages` tool installs into the exact research interpreter. Its command,
+output, and before/after package inventories are saved under the session's
+`environment_changes/` and `environments/` folders. It does not restart the kernel;
+already imported modules keep their loaded versions until the agent restarts it.
+Kernel starts are recorded in the transcript, and each probe records its kernel ID
+and environment inventory path. These inventories document installed packages, not
+input data or a snapshot of live Python objects. Installs outside this tool are not
+tracked until the next environment inventory is captured.

@@ -1,10 +1,10 @@
-import { elements, state } from "./state.js?v=20260906-1";
-import { initWebSocket, sendWs } from "./transport.js?v=20260906-1";
-import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260906-1";
-import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-1";
-import { clearChat, loadSessions, replaySession } from "./history.js?v=20260906-1";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";
+import { elements, state } from "./state.js?v=20260909-2";
+import { initWebSocket, sendWs } from "./transport.js?v=20260909-2";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-2";
+import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-2";
+import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-2";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-2";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260909-2";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -36,7 +36,10 @@ function handleServerEvent(event) {
       appendSystemMessage("Nocturnomath is stopping. You can close this tab.");
       break;
     case "init":
+      applyWorkspace(event.workspace);
+      break;
     case "workspace_updated":
+      clearChat();
       applyWorkspace(event.workspace);
       break;
 
@@ -106,7 +109,8 @@ function handleServerEvent(event) {
       replaySession(
         event.records || [],
         event.context_restored,
-        event.carry_chat_context
+        event.carry_chat_context,
+        event.kernel_reset
       );
       break;
 
@@ -234,23 +238,17 @@ function setupEventListeners() {
     const newPath = elements.newFolderInput.value.trim();
     if (!newPath) return;
 
+    elements.modalSubmit.disabled = true;
+    elements.modalSubmit.textContent = "Preparing environment…";
     try {
-      const res = await fetch("/api/workspace", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: newPath }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        applyWorkspace(data.workspace);
-        closeFolderPicker();
-        appendSystemMessage(`Opened workspace folder: <code>${data.workspace.path}</code>`);
-      } else {
-        const err = await res.json();
-        alert(`Failed to switch folder: ${err.detail || "Unknown error"}`);
-      }
+      await openWorkspace(newPath);
+      closeFolderPicker();
     } catch (err) {
-      alert(`Error switching folder: ${err.message}`);
+      elements.folderPickerError.textContent = err.message;
+      elements.folderPickerError.classList.remove("hidden");
+    } finally {
+      elements.modalSubmit.disabled = false;
+      elements.modalSubmit.textContent = "Open folder";
     }
   });
 
@@ -330,3 +328,25 @@ document.addEventListener("DOMContentLoaded", () => {
     () => updateKernelStatus(false, false)
   );
 });
+
+async function changeEnvironment(python) {
+  const form = document.getElementById("environment-form");
+  const message = document.getElementById("environment-error");
+  form.querySelectorAll("button").forEach(button => button.disabled = true);
+  message.textContent = "Preparing environment…";
+  try {
+    await openWorkspace(state.workspace.path, python);
+    message.textContent = "Environment selected; a fresh session is ready.";
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    form.querySelectorAll("button").forEach(button => button.disabled = false);
+  }
+}
+
+document.getElementById("environment-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const python = document.getElementById("environment-python").value.trim();
+  if (python) changeEnvironment(python);
+});
+document.getElementById("environment-managed").addEventListener("click", () => changeEnvironment("managed"));

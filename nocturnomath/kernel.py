@@ -7,6 +7,17 @@ import time
 from pathlib import Path
 
 from jupyter_client import KernelManager
+from jupyter_client.kernelspec import KernelSpec, KernelSpecManager
+
+
+class SelectedKernelSpecManager(KernelSpecManager):
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+
+    def get_kernel_spec(self, kernel_name):
+        return self.spec
+
 
 # All CSI escapes, not just colours: uv's installer emits cursor moves and line erases too.
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -19,7 +30,9 @@ matplotlib.rcParams["figure.dpi"] = 110
 
 
 class Kernel:
-    def __init__(self, cwd=None):
+    def __init__(self, cwd, environment):
+        self.environment = environment
+        self.on_start = None
         self.km = None
         self.kc = None
         self.busy = False  # read by interrupt handlers in both interfaces
@@ -27,27 +40,36 @@ class Kernel:
         self.cwd = Path(cwd).resolve() if cwd else None
         self.start()
 
-    def start(self):
-        self.km = KernelManager()
-        start_kwargs = {"cwd": str(self.cwd)} if self.cwd else {}
-        self.km.start_kernel(**start_kwargs)
-        self.kc = self.km.client()
-        self.kc.start_channels()
-        self.kc.wait_for_ready(timeout=60)
-        setup_code = SETUP
-        if self.cwd:
-            setup_code += f"\nimport os\nos.chdir({str(self.cwd)!r})\n"
-        self.execute(setup_code, timeout=60)
+    def start(self, reason="opened"):
+        spec = KernelSpec(
+            argv=[
+                str(self.environment.python),
+                "-m",
+                "ipykernel_launcher",
+                "-f",
+                "{connection_file}",
+            ],
+            display_name="Nocturnomath research",
+            language="python",
+        )
+        self.km = KernelManager(kernel_spec_manager=SelectedKernelSpecManager(spec))
+        try:
+            self.km.start_kernel(cwd=str(self.cwd), env=self.environment.process_env())
+            self.kc = self.km.client()
+            self.kc.start_channels()
+            self.kc.wait_for_ready(timeout=60)
+            output, _, note = self.execute(SETUP, timeout=60)
+            if self.errored or note:
+                raise RuntimeError(f"Kernel setup failed: {output} {note or ''}")
+            if self.on_start:
+                self.on_start(reason)
+        except Exception:
+            self.shutdown()
+            raise
 
-    def set_cwd(self, cwd):
-        """Change the current working directory of the running kernel."""
-        self.cwd = Path(cwd).resolve()
-        if self.is_alive():
-            self.execute(f"import os\nos.chdir({str(self.cwd)!r})", timeout=10)
-
-    def restart(self):
+    def restart(self, reason="restarted"):
         self.shutdown()
-        self.start()
+        self.start(reason)
 
     def shutdown(self):
         if self.kc is not None:
@@ -87,7 +109,7 @@ class Kernel:
             if left <= 0:
                 if note is not None:  # the grace period after an interrupt ran out too
                     if self.is_alive():
-                        self.restart()
+                        self.restart("timeout recovery")
                         note += " Kernel did not become idle and was restarted; in-memory state is gone."
                     break
                 self.interrupt()

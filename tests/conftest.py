@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -6,7 +7,8 @@ from nocturnomath.session import ExplorationSession
 
 
 class FakeKernel:
-    def __init__(self, cwd=None):
+    def __init__(self, cwd=None, environment=None):
+        self.on_start = None
         self.cwd = cwd
         self.busy = False
         self.errored = False
@@ -24,7 +26,9 @@ class FakeKernel:
     def set_cwd(self, cwd):
         self.cwd = cwd
 
-    def restart(self):
+    def restart(self, reason="restarted"):
+        if self.on_start:
+            self.on_start(reason)
         self.alive = True
         self.restarts += 1
 
@@ -37,5 +41,20 @@ class FakeKernel:
 
 @pytest.fixture
 def session(tmp_path):
-    with patch("nocturnomath.session.Kernel", FakeKernel):
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
         return ExplorationSession(tmp_path)
+
+
+class FakeEnvironment:
+    def __init__(self, workspace, python=None):
+        self.python = Path(workspace) / ".nocturnomath/venv/bin/python"
+        self.version = "3.12"
+
+    def save(self):
+        pass
+
+    def snapshot(self):
+        return {"python": str(self.python), "version": self.version, "packages": []}

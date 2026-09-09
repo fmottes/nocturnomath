@@ -1,7 +1,7 @@
-import { elements, state } from "./state.js?v=20260906-1";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260906-1";
-import { openLightbox } from "./ui.js?v=20260906-1";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
+import { elements, state } from "./state.js?v=20260909-2";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260909-2";
+import { openLightbox } from "./ui.js?v=20260909-2";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-2";
 
 // ============================================================================
 // Workspace & Files Management
@@ -17,6 +17,9 @@ export function applyWorkspace(ws) {
     fileListSignature = null;
   }
   state.workspace = ws;
+  document.getElementById("environment-info").textContent = ws.environment
+    ? `Python ${ws.environment.version} — ${ws.environment.python}` : "";
+  document.getElementById("environment-python").value = ws.environment?.python || "";
   recordRecentWorkspace(ws.path);
   elements.landingScreen.classList.add("hidden");
   elements.workspaceApp.classList.remove("hidden");
@@ -111,20 +114,30 @@ function renderRecentWorkspaces() {
   elements.recentWorkspaces.appendChild(list);
 }
 
+export async function openWorkspace(path, python = null) {
+  const res = await fetch("/api/workspace", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, python }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Unable to prepare research environment");
+  applyWorkspace(data.workspace);
+  return data.workspace;
+}
+
 async function openRecentWorkspace(path) {
+  openFolderPicker();
+  elements.newFolderInput.value = path;
+  elements.modalSubmit.disabled = true;
+  elements.modalSubmit.textContent = "Preparing environment…";
   try {
-    const res = await fetch("/api/workspace", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Unable to open project");
-    applyWorkspace(data.workspace);
+    await openWorkspace(path);
+    closeFolderPicker();
   } catch (error) {
-    console.error("Unable to open recent workspace:", error);
-    removeRecentWorkspace(path);
-    renderRecentWorkspaces();
+    showFolderPickerError(error.message);
+  } finally {
+    elements.modalSubmit.disabled = false;
+    elements.modalSubmit.textContent = "Open folder";
   }
 }
 
@@ -393,7 +406,7 @@ export function openFolderPicker(mode = "open") {
     : "Change workspace folder";
   elements.folderModalHelp.innerHTML = opening
     ? "Browse to an existing folder. Once opened, the agent will create and manage its files under <code>.nocturnomath/</code>."
-    : "Choose another existing folder. The agent will keep its kernel and begin a new workspace session there.";
+    : "Choose another existing folder. The agent will start a fresh kernel and session using that workspace’s research environment.";
   elements.modalSubmit.textContent = opening ? "Open folder" : "Switch workspace";
   elements.folderModal.classList.remove("hidden");
   browseFolders(state.workspace?.path || state.navigatorRoot || ".");
