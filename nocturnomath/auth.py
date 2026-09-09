@@ -2,49 +2,67 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 
 AuthMethod = Literal["claude_code", "subscription", "api_key"]
 
-# Explicit credentials must not accidentally lose to a higher-priority credential
-# inherited by the Claude subprocess. Empty values disable those inherited sources.
-_COMPETING_AUTH_ENV = {
-    "ANTHROPIC_AUTH_TOKEN": "",
-    "ANTHROPIC_API_KEY": "",
-    "CLAUDE_CODE_OAUTH_TOKEN": "",
-    "CLAUDE_CODE_USE_BEDROCK": "",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS": "",
-    "CLAUDE_CODE_USE_VERTEX": "",
-    "CLAUDE_CODE_USE_FOUNDRY": "",
-    # A manually entered Claude credential must go to Anthropic, even if the
-    # inherited setup uses a gateway. Automatic mode preserves that setup.
-    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+LABELS: dict[str, str] = {
+    "claude_code": "Claude Code (automatic)",
+    "subscription": "Claude subscription",
+    "api_key": "Claude API key",
 }
+
+# Environment credentials the Claude CLI would prefer over one typed into
+# Nocturnomath. Empty values read as unset, so a manual credential wins.
+_CREDENTIAL_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+)
+
+# Inherited settings that decide where automatic mode sends requests, roughly
+# in the order the CLI consults them. Reported to the user, never overridden.
+_INHERITED_ENV = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+def inherited_credential() -> str | None:
+    """Name the environment variable Claude Code will use instead of its saved login."""
+    for name in _INHERITED_ENV:
+        if os.environ.get(name):
+            return name
+    return None
 
 
 @dataclass(frozen=True)
 class ClaudeAuth:
-    """One credential choice, kept only in the running process."""
+    """One credential choice, kept only in the running process.
+
+    The default instance changes nothing: the SDK resolves Claude Code's saved
+    login and environment exactly as it would without Nocturnomath.
+    """
 
     method: AuthMethod = "claude_code"
     credential: str | None = field(default=None, repr=False)
-    source: Literal["claude_code", "interactive"] = "claude_code"
-
-    @classmethod
-    def from_environment(cls) -> ClaudeAuth:
-        """Let Claude Code resolve its own login and environment precedence."""
-        return cls()
 
     @classmethod
     def interactive(cls, method: AuthMethod, credential: str | None) -> ClaudeAuth:
         """Validate a credential entered through one of Nocturnomath's UIs."""
-        if method not in ("claude_code", "subscription", "api_key"):
+        if method not in LABELS:
             raise ValueError("Choose Claude Code, a subscription token, or an API key.")
         if method == "claude_code":
             if credential and credential.strip():
                 raise ValueError("Claude Code login does not take a credential.")
-            return cls.from_environment()
+            return cls()
         value = (credential or "").strip()
         if not value:
             noun = "subscription token" if method == "subscription" else "API key"
@@ -53,28 +71,29 @@ class ClaudeAuth:
             raise ValueError(
                 "The credential must not contain whitespace or control characters."
             )
-        return cls(method, value, "interactive")
+        return cls(method, value)
 
     def sdk_env(self) -> dict[str, str]:
         """Return the environment overlay passed directly to ClaudeAgentOptions."""
         if self.method == "claude_code":
             return {}
-        env = dict(_COMPETING_AUTH_ENV)
-        if self.method == "subscription":
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = self.credential or ""
-        else:
-            env["ANTHROPIC_API_KEY"] = self.credential or ""
+        env = dict.fromkeys(_CREDENTIAL_ENV, "")
+        name = (
+            "CLAUDE_CODE_OAUTH_TOKEN"
+            if self.method == "subscription"
+            else "ANTHROPIC_API_KEY"
+        )
+        env[name] = self.credential or ""
         return env
 
-    def public(self) -> dict[str, str | bool]:
+    def public(self) -> dict[str, str | None]:
         """Describe the selection without exposing the secret."""
-        labels = {
-            "claude_code": "Claude Code (automatic)",
-            "subscription": "Claude subscription",
-            "api_key": "Claude API key",
-        }
-        return {
-            "method": self.method,
-            "source": self.source,
-            "label": labels[self.method],
-        }
+        note = None
+        if self.method == "claude_code":
+            name = inherited_credential()
+            if name:
+                note = (
+                    f"{name} is set in the environment and takes precedence "
+                    "over Claude Code's saved login."
+                )
+        return {"method": self.method, "label": LABELS[self.method], "note": note}

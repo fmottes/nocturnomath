@@ -339,13 +339,15 @@ async def test_auth_command_reads_secrets_outside_command_history(terminal):
         return True
 
     terminal.runtime.discover_models = discover_models
-    terminal.session._sdk_session_id = "old-account-session"
+    terminal.session._sdk_session_id = "resumed-session"
+    terminal.app.pending_model = "sonnet"
 
     await terminal.run("/auth subscription")
     output = terminal.output()
     assert terminal.runtime.auth.method == "subscription"
     assert terminal.runtime.auth.credential == "secret"
-    assert terminal.session._sdk_session_id is None
+    assert terminal.session._sdk_session_id == "resumed-session"
+    assert terminal.app.pending_model == "sonnet"
     assert prompts and "setup-token" in prompts[0]
     assert "secret" not in output
     assert "Selected Claude subscription" in output
@@ -360,6 +362,20 @@ async def test_auth_command_reads_secrets_outside_command_history(terminal):
     await terminal.run("/auth claude-code")
     assert terminal.runtime.auth.method == "claude_code"
     assert "Claude Code (automatic)" in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_auth_prompt_can_be_abandoned_with_eof(terminal):
+    def abandon(prompt):
+        raise EOFError
+
+    terminal.app.credential_reader = abandon
+    terminal.runtime.discover_models = lambda: pytest.fail("must not re-authenticate")
+    previous = terminal.runtime.auth
+
+    assert await terminal.run("/auth api-key") is True
+    assert terminal.runtime.auth is previous
+    assert "Authentication unchanged" in terminal.output()
 
 
 @pytest.mark.asyncio

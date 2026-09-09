@@ -3,7 +3,7 @@ import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
 import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
 import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260909-3";
 
 const THEME_KEY = "nocturnomath.theme";
@@ -44,8 +44,7 @@ function handleServerEvent(event) {
       break;
 
     case "auth_changed":
-      setAuthStatus(event.auth);
-      setModelCatalogue(event.models || [], event.model_labels || {});
+      applyAuthChange(event);
       appendSystemMessage(`Claude authentication changed to ${event.auth?.label || "the selected method"}.`);
       break;
 
@@ -330,6 +329,12 @@ function setupEventListeners() {
   setupGutterResize();
 }
 
+function applyAuthChange(data) {
+  setAuthStatus(data.auth);
+  setModelCatalogue(data.models || [], data.model_labels || {}, data.model);
+  refreshSendButton();
+}
+
 function openAuthModal() {
   elements.authMethod.value = state.auth?.method || "claude_code";
   elements.authCredential.value = "";
@@ -352,13 +357,13 @@ function updateAuthForm() {
   if (method === "subscription") {
     elements.authCredentialLabel.textContent = "Subscription token";
     elements.authCredential.placeholder = "Token from claude setup-token";
-    elements.authHelp.textContent = "Run `claude setup-token` in a terminal, then paste the generated token here.";
+    elements.authHelp.textContent = "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.";
   } else if (method === "api_key") {
     elements.authCredentialLabel.textContent = "API key";
     elements.authCredential.placeholder = "sk-ant-api…";
     elements.authHelp.textContent = "Create a key in the Claude Console. API usage is billed separately from a subscription.";
   } else {
-    elements.authHelp.textContent = "Use the existing Claude Code login or other credentials inherited by this process.";
+    elements.authHelp.textContent = "Use whatever Claude Code is already signed in with, exactly as the Agent SDK would on its own.";
   }
 }
 
@@ -378,8 +383,7 @@ async function submitAuth(event) {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Unable to authenticate with Claude");
-    setAuthStatus(data.auth);
-    setModelCatalogue(data.models || [], data.model_labels || {});
+    applyAuthChange(data);
     elements.authCredential.value = "";
     elements.authModal.classList.add("hidden");
   } catch (error) {

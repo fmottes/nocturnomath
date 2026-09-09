@@ -61,7 +61,7 @@ class ExplorationSession:
         self.timeout_s = timeout_s
         self.image_cap = image_cap
         self.carry_chat_context = carry_chat_context
-        self.auth = auth or ClaudeAuth.from_environment()
+        self.auth = auth or ClaudeAuth()
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
         self._current_client: ClaudeSDKClient | None = None
@@ -264,14 +264,6 @@ class ExplorationSession:
             self.log_transcript("meta", carry_chat_context=enabled)
         logger.info(f"carry_chat_context set to {enabled}")
         return enabled
-
-    def set_auth(self, auth: ClaudeAuth):
-        """Switch credentials without allowing an SDK session to cross accounts."""
-        self.require_idle("change Claude authentication")
-        self.auth = auth
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._session_initialized = False
 
     async def interrupt(self):
         if self.kernel.busy:

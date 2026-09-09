@@ -49,6 +49,7 @@ export const elements = {
   authCredentialLabel: document.getElementById("auth-credential-label"),
   authCredential: document.getElementById("auth-credential"),
   authHelp: document.getElementById("auth-help"),
+  authNote: document.getElementById("auth-note"),
   authError: document.getElementById("auth-error"),
   authCurrent: document.getElementById("auth-current"),
   authSubmit: document.getElementById("auth-submit"),

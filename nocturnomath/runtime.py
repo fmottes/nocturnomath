@@ -33,7 +33,9 @@ class Runtime:
         auth: ClaudeAuth | None = None,
     ):
         self.session = session
-        self.auth = session.auth if session else (auth or ClaudeAuth.from_environment())
+        self._auth = auth or (session.auth if session else ClaudeAuth())
+        if session:
+            session.auth = self._auth
         self.model = session.model if session else model
         self.models = []
         self.model_labels = {}
@@ -50,14 +52,25 @@ class Runtime:
     def has_workspace(self) -> bool:
         return self.session is not None
 
+    @property
+    def auth(self) -> ClaudeAuth:
+        """The credential the next SDK client uses; the session owns it once open."""
+        return self.session.auth if self.session else self._auth
+
+    @auth.setter
+    def auth(self, auth: ClaudeAuth):
+        self._auth = auth
+        if self.session:
+            self.session.auth = auth
+
     def start(self):
         self._started = True
         self._subscribe_to_session()
 
-    async def discover_models(self) -> bool:
+    async def discover_models(self):
         """Read the CLI's model catalog without sending an inference request."""
-        self.models = []
-        self.model_labels = {}
+        models: list[str] = []
+        labels: dict[str, str] = {}
         try:
             async with asyncio.timeout(15):
                 async with ClaudeSDKClient(
@@ -70,46 +83,27 @@ class Runtime:
                 value = model.get("value")
                 if not isinstance(value, str) or not value or value == "default":
                     continue
-                if value not in self.models:
-                    self.models.append(value)
-                self.model_labels[value] = model.get("resolvedModel") or value
-            return bool(self.models)
+                if value not in models:
+                    models.append(value)
+                labels[value] = model.get("resolvedModel") or value
         except Exception as exc:
-            logger.warning("Could not discover Claude models (%s)", type(exc).__name__)
-            return False
+            logger.warning("Could not discover Claude models: %s", exc)
+        self.models = models
+        self.model_labels = labels
 
     async def authenticate(
         self, method: AuthMethod, credential: str | None = None
-    ) -> dict[str, str | bool]:
-        """Select credentials; SDK initialization is not an authentication check.
+    ) -> dict[str, str | None]:
+        """Select the credential for the next SDK client.
 
-        Credential validity is determined by the next inference request. Catalog
-        discovery is best-effort and must not prevent returning to automatic auth.
+        Nothing is verified here: the CLI reports a bad credential on the next
+        message. The model catalogue is refreshed as a courtesy and may be empty.
         """
-        if self.changing:
-            raise RuntimeError(
-                "The research environment is being prepared. Please wait."
-            )
         if self.session:
             self.session.require_idle("change Claude authentication")
-        previous = self.auth
-        previous_models = self.models
-        previous_labels = self.model_labels
-        selected = ClaudeAuth.interactive(method, credential)
-        self.changing = True
-        self.auth = selected
-        try:
-            await self.discover_models()
-            if self.session and selected != previous:
-                self.session.set_auth(selected)
-            return self.auth.public()
-        except BaseException:
-            self.auth = previous
-            self.models = previous_models
-            self.model_labels = previous_labels
-            raise
-        finally:
-            self.changing = False
+        self.auth = ClaudeAuth.interactive(method, credential)
+        await self.discover_models()
+        return self.auth.public()
 
     def shutdown(self):
         self._started = False
@@ -135,8 +129,8 @@ class Runtime:
                 model=self.model,
                 timeout_s=self.timeout_s,
                 image_cap=self.image_cap,
+                auth=self.auth,
             )
-            self.session.set_auth(self.auth)
             self._subscribe_to_session()
         else:
             self.session.set_workspace(target, python)

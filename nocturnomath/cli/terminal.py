@@ -211,9 +211,10 @@ class TerminalApp:
             )
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model}", style="dim")
-            self.write(
-                f"Claude auth: {self.runtime.auth.public()['label']}", style="dim"
-            )
+            auth = self.runtime.auth.public()
+            self.write(f"Claude auth: {auth['label']}", style="dim")
+            if auth["note"]:
+                self.write(auth["note"], style="dim")
             self.write(
                 f"next transcript: {session.transcript_path} "
                 "(created with first message)",
@@ -624,7 +625,10 @@ class TerminalApp:
     async def _command_auth(self, argument: str) -> bool:
         choice = argument or "status"
         if choice == "status":
-            self.write(f"Claude authentication: {self.runtime.auth.public()['label']}")
+            auth = self.runtime.auth.public()
+            self.write(f"Claude authentication: {auth['label']}")
+            if auth["note"]:
+                self.write(auth["note"], style="dim")
             self.write(
                 "Use /auth subscription, /auth api-key, or /auth claude-code to change it.",
                 style="dim",
@@ -647,11 +651,21 @@ class TerminalApp:
                 if method == "subscription"
                 else "Claude API key: "
             )
-            credential = await asyncio.to_thread(self.credential_reader, prompt)
+            try:
+                credential = await asyncio.to_thread(self.credential_reader, prompt)
+            except EOFError:
+                self.write("Authentication unchanged.", style="dim")
+                return True
         auth = await self.runtime.authenticate(method, credential)
-        self.pending_model = None
         self.write(f"Selected {auth['label']}.")
         self.write("Credentials will be checked on your next message.", style="dim")
+        models = self.runtime.models
+        if self.pending_model and models and self.pending_model not in models:
+            self.write(
+                f"Dropped pending model {self.pending_model}: not in the new catalogue.",
+                style="dim",
+            )
+            self.pending_model = None
         self.check_model(self.runtime.model)
         return True
 

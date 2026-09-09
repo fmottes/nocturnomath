@@ -84,7 +84,7 @@ async def test_query_streams_text_tracks_context_and_logs(session):
 
 @pytest.mark.asyncio
 async def test_query_passes_selected_authentication_only_to_the_sdk(session):
-    session.set_auth(ClaudeAuth.interactive("api_key", "top-secret-key"))
+    session.auth = ClaudeAuth.interactive("api_key", "top-secret-key")
     with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
         await session.query("question")
 

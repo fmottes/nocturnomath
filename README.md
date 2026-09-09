@@ -50,9 +50,11 @@ uv run nocturnomath --path /path/to/project
 
 ### Claude authentication
 
-By default, Nocturnomath uses whatever authentication Claude Code already has,
-including its saved login and inherited environment, without changing credential
-precedence. No additional login is required if that setup works.
+By default, Nocturnomath uses whatever Claude Code is already signed in with,
+exactly as the Agent SDK would on its own. If `claude` works in your terminal, no
+additional login is needed. When an environment variable such as
+`ANTHROPIC_API_KEY` or `CLAUDE_CODE_USE_BEDROCK` is set, Claude Code prefers it
+over its saved login; both interfaces say so next to the current method.
 
 The web app's **Claude** button is available on both the landing screen and the
 workspace header. In the terminal, use `/auth`. Both interfaces support:
@@ -64,20 +66,23 @@ workspace header. In the terminal, use `/auth`. Both interfaces support:
   [Claude Console](https://platform.claude.com/settings/keys). Nocturnomath passes it
   to the Agent SDK as `ANTHROPIC_API_KEY`; API usage is billed separately from a
   Claude subscription.
-- **Claude Code (automatic)**: Return to the default behavior, including inherited
-  environment credentials, without changing Claude Code's saved login.
+- **Claude Code (automatic)**: Return to the default behavior without changing
+  Claude Code's saved login.
 
-Manual credentials override inherited credentials and use Anthropic's API endpoint.
-Selecting a method does not verify the credential or make a billable test request;
-authentication errors are reported on the next message. Model discovery alone
-does not establish that a credential is valid. Subscription login uses a token
-from `claude setup-token`; the installed Agent SDK does not expose browser login.
+A credential entered here replaces any credential set in the environment for the
+Claude CLI that Nocturnomath launches. The rest of your Claude Code setup still
+applies, including a gateway `ANTHROPIC_BASE_URL`, a cloud provider selection, or an
+`apiKeyHelper` in `settings.json`, which the CLI consults before a subscription
+token. Selecting a method does not verify the credential or make a billable
+request; authentication errors are reported on the next message. Subscription
+login uses a token from `claude setup-token`; the installed Agent SDK does not
+expose browser login.
 
 A credential entered in either interface is never written to browser storage, shell
 history, transcripts, or workspace files. It remains only in the running process,
 so enter it again after restarting unless you provide it through the environment.
-Changing authentication clears the SDK conversation-resume identifier but does not
-restart the research kernel or erase the visible transcript.
+Changing authentication does not restart the research kernel or interrupt the
+conversation.
 
 ### 3. Terminal Mode (Alternative)
 

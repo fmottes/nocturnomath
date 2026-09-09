@@ -28,7 +28,7 @@ export function applyWorkspace(ws) {
 
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
-  setModelCatalogue(ws.models || [], ws.model_labels || {});
+  setModelCatalogue(ws.models || [], ws.model_labels || {}, ws.model);
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
@@ -58,7 +58,6 @@ export function showLanding(ws) {
   document.getElementById("app-loading").classList.add("hidden");
   state.workspace = null;
   state.navigatorRoot = ws?.navigator_root || state.navigatorRoot || ".";
-  setAuthStatus(ws?.auth);
   elements.workspaceApp.classList.add("hidden");
   elements.landingScreen.classList.remove("hidden");
   renderRecentWorkspaces();
@@ -70,16 +69,21 @@ export function setAuthStatus(auth) {
   const label = auth.label || "Claude authentication";
   elements.btnAuth.textContent = label;
   elements.btnAuthLanding.textContent = label;
-  elements.authSummary.textContent = `Current: ${label}.`;
+  elements.authSummary.textContent = `Current: ${label}.${auth.note ? ` ${auth.note}` : ""}`;
   elements.authCurrent.textContent = `Current: ${label}`;
+  elements.authNote.textContent = auth.note || "";
+  elements.authNote.classList.toggle("hidden", !auth.note);
 }
 
-export function setModelCatalogue(models = [], labels = {}) {
+export function setModelCatalogue(models = [], labels = {}, serverModel = null) {
+  // The dropdown decides the model of the next message, so an unsent choice
+  // survives a catalogue refresh; otherwise follow the server's model.
+  const current = elements.modelSelect.value;
   elements.modelSelect.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
   if (!models.length) elements.modelSelect.add(new Option("No model available", ""));
   elements.modelSelect.disabled = !models.length;
-  const preferred = state.workspace?.model;
-  elements.modelSelect.value = models.includes(preferred) ? preferred : (models[0] || "");
+  const preferred = [current, serverModel].find((model) => models.includes(model));
+  elements.modelSelect.value = preferred || models[0] || "";
 }
 
 const RECENT_WORKSPACES_KEY = "nocturnomath.recent-workspaces";

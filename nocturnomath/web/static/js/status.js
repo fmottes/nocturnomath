@@ -19,7 +19,16 @@ export function updateKernelStatus(alive, busy) {
   }
 }
 
+let agentStatus = "idle";
+
+// Re-derive the Send button from the current status after the model
+// catalogue changes underneath it.
+export function refreshSendButton() {
+  updateAgentStatus(agentStatus);
+}
+
 export function updateAgentStatus(status) {
+  agentStatus = status;
   elements.chatStatusBadge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
   if (status === "thinking" || status === "probing") {
     elements.chatStatusBadge.style.color = "var(--blue)";

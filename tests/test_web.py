@@ -53,6 +53,7 @@ def test_authentication_can_be_changed_before_opening_a_workspace(
         assert response.status_code == 200
         assert response.json()["auth"]["method"] == "subscription"
         assert response.json()["models"] == ["sonnet"]
+        assert response.json()["model"] == "claude-opus-5"
         assert "oauth-secret" not in response.text
         assert event["type"] == "auth_changed"
         assert event["auth"]["method"] == "subscription"
@@ -83,6 +84,7 @@ def test_authentication_rejects_missing_secrets_and_foreign_origins():
             invalid = client.post("/api/auth", json=body)
             assert invalid.status_code == 422
             assert "secret" not in invalid.text
+            assert invalid.json()["detail"][0]["loc"]
 
 
 def test_authentication_ui_is_served_without_embedding_credentials():

@@ -278,20 +278,21 @@
       </div>
       <div class="modal-body">
         <p class="modal-help">
-          Claude Code's existing authentication is used automatically. Manual credentials stay in memory until the app stops and are checked on your next message.
+          By default Nocturnomath uses whatever Claude Code is already signed in with. A token or key entered here is passed only to the Claude CLI, stays in memory until the app stops, and is checked on your next message.
         </p>
+        <p class="modal-help hidden" id="auth-note"></p>
         <form id="auth-form">
           <div class="form-group">
             <label for="auth-method">Authentication method</label>
             <select id="auth-method" class="form-input">
               <option value="claude_code">Claude Code (automatic)</option>
-              <option value="subscription">Claude subscription token</option>
+              <option value="subscription">Claude subscription</option>
               <option value="api_key">Claude API key</option>
             </select>
           </div>
           <div class="form-group" id="auth-credential-group">
             <label for="auth-credential" id="auth-credential-label">Subscription token</label>
-            <input id="auth-credential" class="form-input" type="password" autocomplete="off" spellcheck="false">
+            <input id="auth-credential" class="form-input" type="password" autocomplete="new-password" spellcheck="false">
           </div>
           <p class="modal-help" id="auth-help"></p>
           <p class="folder-picker-error hidden" id="auth-error" role="alert"></p>

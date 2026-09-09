@@ -17,7 +17,6 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -95,12 +94,13 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
-        # FastAPI's default validation response includes rejected input values.
-        if request.url.path == "/api/auth":
-            return JSONResponse(
-                status_code=422, content={"detail": "Invalid authentication request."}
-            )
-        return await request_validation_exception_handler(request, exc)
+        # FastAPI's default 422 body echoes the rejected input, which for
+        # /api/auth would be a credential. Keep only the location and message.
+        errors = [
+            {key: value for key, value in error.items() if key not in ("input", "ctx")}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     app.add_middleware(
         CORSMiddleware,
@@ -154,13 +154,17 @@ def create_app(
     async def get_workspace_info():
         return await workspace_snapshot()
 
-    @app.get("/api/auth")
-    async def get_auth():
+    def auth_payload():
         return {
             "auth": runtime.auth.public(),
+            "model": runtime.session.model if runtime.session else runtime.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,
         }
+
+    @app.get("/api/auth")
+    async def get_auth():
+        return auth_payload()
 
     @app.post("/api/auth")
     async def set_auth(auth_request: AuthRequest, request: Request):
@@ -171,16 +175,12 @@ def create_app(
             else None
         )
         try:
-            auth = await runtime.authenticate(auth_request.method, credential)
+            await runtime.authenticate(auth_request.method, credential)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        data = {
-            "auth": auth,
-            "models": runtime.models,
-            "model_labels": runtime.model_labels,
-        }
+        data = auth_payload()
         await runtime.broadcast("auth_changed", data)
         return data
 

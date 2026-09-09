@@ -109,9 +109,9 @@ def test_export_notebook_names_the_file_after_workspace_and_session(session):
 
 
 @pytest.mark.asyncio
-async def test_auth_selection_reaches_sdk_and_resets_resumed_context(session):
+async def test_auth_selection_reaches_sdk_and_keeps_context(session):
     runtime = Runtime(session)
-    session._sdk_session_id = "previous-account-session"
+    session._sdk_session_id = "resumed-session"
     with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
@@ -129,51 +129,59 @@ async def test_auth_selection_reaches_sdk_and_resets_resumed_context(session):
     assert result["method"] == "subscription"
     assert "oauth-secret" not in repr(result)
     assert session.auth is runtime.auth
-    assert session._sdk_session_id is None
+    assert session._sdk_session_id == "resumed-session"
     assert runtime.models == ["sonnet"]
 
 
 @pytest.mark.asyncio
-async def test_cancelled_auth_selection_restores_credentials_catalog_and_context(
-    session,
-):
+async def test_auth_selection_survives_failed_model_discovery(session):
     runtime = Runtime(session)
-    previous = runtime.auth
-    session._sdk_session_id = "existing-session"
     runtime.models = ["existing-model"]
+    with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
+        sdk.return_value.__aenter__.side_effect = RuntimeError("CLI unavailable")
+        result = await runtime.authenticate("api_key", "unverified-key")
 
-    async def discover_models():
-        runtime.models = []
-        raise asyncio.CancelledError()
-
-    runtime.discover_models = discover_models
-    with pytest.raises(asyncio.CancelledError):
-        await runtime.authenticate("api_key", "bad-key")
-
-    assert runtime.auth is previous
-    assert session.auth is previous
-    assert session._sdk_session_id == "existing-session"
-    assert runtime.models == ["existing-model"]
-    assert runtime.changing is False
+    assert result["method"] == "api_key"
+    assert session.auth.sdk_env()["ANTHROPIC_API_KEY"] == "unverified-key"
+    assert runtime.models == []
+    assert not runtime.changing
 
 
 @pytest.mark.asyncio
-async def test_return_to_automatic_works_without_model_catalog(session):
-    from nocturnomath.auth import ClaudeAuth
-
-    session.set_auth(ClaudeAuth.interactive("api_key", "manual-key"))
+async def test_auth_change_waits_for_idle_and_returns_to_automatic(session):
     runtime = Runtime(session)
-    runtime.discover_models = AsyncMock(return_value=False)
+    runtime.discover_models = AsyncMock()
+    blocker = asyncio.Event()
+    session._current_task = asyncio.create_task(blocker.wait())
+    with pytest.raises(RuntimeError):
+        await runtime.authenticate("api_key", "manual-key")
+    assert session.auth.method == "claude_code"
+    blocker.set()
+    await session._current_task
+    session._current_task = None
+
+    await runtime.authenticate("api_key", "manual-key")
+    assert session.auth.method == "api_key"
     result = await runtime.authenticate("claude_code")
     assert result["method"] == "claude_code"
     assert session.auth.sdk_env() == {}
     assert session.auth is runtime.auth
 
 
-@pytest.mark.asyncio
-async def test_reselecting_same_auth_preserves_context(session):
-    runtime = Runtime(session)
-    runtime.discover_models = AsyncMock(return_value=True)
-    session._sdk_session_id = "existing-session"
-    await runtime.authenticate("claude_code")
-    assert session._sdk_session_id == "existing-session"
+def test_runtime_and_session_share_one_auth(session, tmp_path):
+    from nocturnomath.auth import ClaudeAuth
+
+    manual = ClaudeAuth.interactive("api_key", "manual-key")
+    runtime = Runtime(session, auth=manual)
+    assert session.auth is manual
+    assert runtime.auth is manual
+
+    received = {}
+
+    def factory(**kwargs):
+        received.update(kwargs)
+        return session
+
+    fresh = Runtime(session_factory=factory, auth=manual)
+    fresh.open_workspace(tmp_path)
+    assert received["auth"] is manual
