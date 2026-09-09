@@ -1,6 +1,6 @@
 # Nocturnomath
 
-Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, citable evidence and thoughts in Markdown, and a split-screen local web app dashboard.
+Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a persistent Jupyter kernel, citable evidence and thoughts in Markdown, and two interfaces on one shared runtime: a split-screen local web app dashboard and a terminal client.
 
 ## Features
 
@@ -9,6 +9,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a 
   - **Right Half**: Live-rendered Markdown reader (auto-syncing `evidence.md`, `thoughts.md`, reports, and other markdown docs) and figures gallery.
   - **Draggable Gutter**: Easily resize the split panes to focus on chat or document reading.
   - **Workspace Picker**: The web app opens on a landing page with a visual folder navigator. It does not start a kernel or create workspace files until you open a folder.
+- **Terminal Client**: The same runtime without a browser: multi-line input with history, Markdown replies, syntax-highlighted probe code, and slash commands covering history, resume, notebook export, model switching, context, environment, workspace, documents, and plots.
 
 ## Quick Start
 
@@ -34,25 +35,69 @@ Use `--path` / `-p` to set the starting location for the web folder navigator:
 uv run nocturnomath --path /path/to/project
 ```
 
-#### CLI Options:
-- `--path`, `-p`: Starting folder for the web navigator (default: current directory `.`). The terminal CLI uses it as its workspace.
-- `--port`: Port for web app (default: `8000`)
-- `--host`: Host to bind server to (default: `127.0.0.1`)
+#### Options shared by both commands:
+- `--path`, `-p`: Starting folder for the web navigator (default: current directory `.`). The terminal opens it as its workspace.
+- `--python`: Research environment Python executable, or `managed` (remembered per workspace)
 - `--model`: Claude model (default: `claude-opus-5`)
 - `--timeout`: Seconds allowed per kernel run (default: `600`)
 - `--images`: Plots returned to Claude per run (default: `2`)
+
+#### Web-only options:
+- `--port`: Port for web app (default: `8000`)
+- `--host`: Host to bind server to (default: `127.0.0.1`)
 - `--no-browser`: Do not automatically open the browser on startup
 
-### 3. Terminal CLI Mode (Alternative)
+If `ANTHROPIC_API_KEY` is set it silently takes precedence over your Claude
+subscription. Both commands warn about this at startup and continue.
 
-If you prefer running in the terminal without a web browser:
+### 3. Terminal Mode (Alternative)
+
+If you prefer running without a web browser:
 
 ```bash
-uv run nocturnomath-cli
+uv run nocturnomath-cli --path /path/to/project
 ```
 
-The terminal and web interfaces share the same prompt, tools, persistent kernel,
-notes, transcripts, verdict gating, and context behavior.
+The terminal has no landing page: it opens `--path` as the workspace immediately,
+preparing the research environment on startup. It then prints the research
+Python executable and version, the workspace path, the model, and the transcript path
+the next session will use.
+
+Enter sends the message; Esc then Enter (or Alt+Enter) inserts a newline for multi-line
+input. Input history persists in `<workspace>/.nocturnomath/terminal_history`.
+Ctrl-C interrupts a running kernel run or cancels the running query, and reports that
+nothing is running otherwise; it does not quit. Ctrl-D or `/exit` drains the running
+query and probe, releases the kernel, and leaves.
+
+Assistant replies, notes, system messages, and Markdown documents are rendered as
+Markdown; probe code is shown as syntax-highlighted Python. Every event the engine
+emits is printed, including probe predictions and code, probe output and the paths of
+saved plots, recorded evidence and thoughts, verdicts, kernel restarts and
+interruptions, `install_packages` results, and thinking/running/idle status changes.
+
+| Command | Description |
+| --- | --- |
+| `/help` | list these commands |
+| `/new` | start a new chat on a fresh kernel |
+| `/restart` | restart the kernel; in-memory state is gone |
+| `/notes` | show `evidence.md` and `thoughts.md` |
+| `/history` | list the chats recorded in this workspace |
+| `/resume <S001> [--kernel]` | reopen a chat, optionally replaying its probes |
+| `/export [path]` | save the current chat as a Jupyter notebook |
+| `/model [name]` | show the catalogue, or use a model from the next message |
+| `/context [on\|off]` | show or set whether the agent carries chat context |
+| `/env <python>\|managed` | switch the research environment; starts a new chat |
+| `/workspace <path>` | open a different workspace folder |
+| `/docs [name]` | list the Markdown documents, or render one |
+| `/plots` | list the plots saved by probes |
+| `/exit` | stop the agent and leave |
+
+`/export` writes to the current directory by default; a directory argument keeps the
+generated `nocturnomath-<workspace>-<session>.ipynb` name, a file path overrides it.
+`/restart` and `/export` are refused while the agent is running a query.
+
+The terminal and web interfaces share the same runtime, prompt, tools, persistent
+kernel, notes, transcripts, verdict gating, and context behavior.
 
 Nocturnomath keeps its managed artifacts together inside the selected workspace:
 
@@ -98,19 +143,29 @@ ways. The new thought explains the correction and carries forward any valid reas
 Struck entries remain citable history, not valid support for conclusions.
 
 Evidence and thoughts belong to the workspace and can cite probes from any session.
-Starting a new session restarts the kernel and prepares an empty chat. Its numbered `S`
-folder is created only when the first message is accepted. Empty legacy folders are omitted
-from History. Resuming a past session appends to its existing folder.
+Starting a new session restarts the kernel and prepares an empty chat (New chat in the
+web app, `/new` in the terminal). Its numbered `S` folder is created only when the first
+message is accepted. Empty legacy folders are omitted from History and from `/history`.
+Resuming a past session appends to its existing folder: History in the web app,
+`/resume S001` in the terminal, with `--kernel` (the web app's resume-with-kernel option)
+replaying the stored probes in order instead of starting with empty Python memory.
+The current session can be exported as a Jupyter notebook with Download .ipynb in the
+web app or `/export` in the terminal; both refuse while a query is running and produce
+the same `nocturnomath-<workspace>-<session>.ipynb` file.
 
 In the web interface, Evidence and Thoughts open the scientific record directly;
-Documents lists workspace files. Documents refresh automatically. The model selector
-above the composer applies to the next message and keeps the current conversation.
-Its options come from the Claude SDK at service startup, using resolved model IDs
-as labels and excluding Default. If discovery is unavailable, the selector shows
-No model available. Discovery does not send a model prompt.
-Keep context is on by default and can be changed under Settings → Experimental.
-Exit stops the service and attempts to close the tab; browsers that block tab closing
-show a message instead.
+Documents lists workspace files, and Documents refresh automatically. In the terminal,
+`/notes` prints the scientific record, `/docs` lists the Markdown documents or renders
+one, and `/plots` lists the saved figures with their paths. The model selector above the
+composer, and `/model <name>` in the terminal, apply to the next message and keep the
+current conversation. Their options come from the Claude SDK at startup, using resolved
+model IDs as labels and excluding Default. If discovery is unavailable, the selector
+shows No model available and `/model` reports that the catalogue is unavailable.
+Discovery does not send a model prompt.
+Keep context is on by default and can be changed under Settings → Experimental or with
+`/context on|off`. Exit stops the service and attempts to close the tab; browsers that
+block tab closing show a message instead. `/exit` and Ctrl-D do the same in the terminal,
+draining the running query first.
 
 Probe numbering is local to each session. Code and prediction are saved before execution;
 raw text output and all captured plots are saved after execution, including partial
@@ -135,8 +190,14 @@ The Python package is organized by responsibility:
 - `nocturnomath/workspace.py` owns session folders, probe artifacts, files, and transcripts.
 - `nocturnomath/notes.py` manages numbered evidence, thoughts, citations, and corrections.
 - `nocturnomath/kernel.py` manages the persistent Jupyter kernel.
-- `nocturnomath/web/` contains the FastAPI dashboard and browser assets.
-- `nocturnomath/cli/` contains the web and terminal entry points.
+- `nocturnomath/runtime.py` is the transport-agnostic runtime shared by both interfaces:
+  it owns the session, the model catalogue, workspace opening, serialised kernel and
+  workspace transitions, query start-up, notebook export, and event fan-out to subscribers.
+- `nocturnomath/web/` contains the FastAPI routes, the WebSocket runtime subclass that
+  forwards runtime events to browsers, and the browser assets.
+- `nocturnomath/cli/` contains the entry points and their shared arguments:
+  `web.py` (`nocturnomath`) serves the dashboard, `terminal.py` (`nocturnomath-cli`)
+  renders runtime events and slash commands in the terminal.
 
 ## Research environments
 
@@ -145,12 +206,15 @@ already has a `.venv`. The environment starts with ipykernel, matplotlib, numpy,
 pandas. Packages persist across sessions; kernel variables do not. The first opening
 requires uv and may download packages. Later openings reuse the environment.
 
-In Settings → Research environment, enter another environment's Python executable
-if you want to use it instead. It must already contain ipykernel and matplotlib;
+In Settings → Research environment, or with `/env /path/to/venv/bin/python` in the
+terminal, enter another environment's Python executable if you want to use it instead.
+It must already contain ipykernel and matplotlib;
 Nocturnomath does not automatically modify a manually selected environment during
 selection. Subsequent agent package installations target that environment. The choice
-is remembered in `.nocturnomath/config.json`. Use “Use managed environment” to return
-to the workspace default. Changing environments starts a new session.
+is remembered in `.nocturnomath/config.json`. Use “Use managed environment”, or
+`/env managed`, to return to the workspace default. Changing environments starts a new
+session. The terminal also opens a different workspace folder with `/workspace <path>`,
+mirroring the web app's workspace picker.
 
 Both commands accept `--python /path/to/venv/bin/python` (or `--python managed`).
 For the web command this applies to the first workspace opened. This also allows
