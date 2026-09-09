@@ -306,7 +306,7 @@
 .chat-form { display: flex; gap: 10px; align-items: flex-end; }
 .prompt-input {
   flex: 1;
-  min-height: 46px;
+  min-height: 44px;
   max-height: 170px;
   padding: 11px 12px;
   resize: none;
@@ -321,4 +321,4 @@
 }
 .prompt-input::placeholder { color: var(--ink-faint); }
 .prompt-input:focus { border-color: var(--blue); }
-.input-actions button { height: 46px; padding: 0 20px; }
+.input-actions button { height: 44px; padding: 0 20px; }

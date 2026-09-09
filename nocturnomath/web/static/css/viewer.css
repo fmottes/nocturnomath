@@ -26,7 +26,8 @@
 .viewer-tabs { flex-shrink: 0; }
 .tab-btn { padding-inline: 7px; letter-spacing: 0.06em; }
 
-.file-select {
+.file-select,
+.model-select-native {
   max-width: 190px;
   padding: 4px 8px;
   outline: none;
@@ -37,13 +38,8 @@
   border: 1px solid var(--rule);
   border-radius: 0;
 }
-.file-select:focus { border-color: var(--blue); }
-
-.model-select-native {
-  max-width: 190px;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
+.file-select:focus,
+.model-select-native:focus { border-color: var(--blue); }
 
 .toggle-label {
   display: flex;
