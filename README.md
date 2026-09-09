@@ -98,14 +98,24 @@ ways. The new thought explains the correction and carries forward any valid reas
 Struck entries remain citable history, not valid support for conclusions.
 
 Evidence and thoughts belong to the workspace and can cite probes from any session.
-Starting a new session allocates a new `S` folder; resuming appends to its existing folder.
+Starting a new session allocates a new `S` folder and restarts the kernel; resuming appends to its existing folder.
+
+In the web interface, Evidence and Thoughts open the scientific record directly;
+Documents lists workspace files. Documents refresh automatically. The model selector
+above the composer applies to the next message and keeps the current conversation.
+Its options come from the Claude SDK at service startup, with the configured model
+retained if discovery is unavailable. Discovery does not send a model prompt.
+Keep context is on by default and can be changed under Settings → Experimental.
+Exit stops the service and attempts to close the tab; browsers that block tab closing
+show a message instead.
+
 Probe numbering is local to each session. Code and prediction are saved before execution;
 raw text output and all captured plots are saved after execution, including partial
 output returned after an interruption. `probe.json` records the model, prediction,
 timestamps, and outcome (`completed`, `error`, `incomplete`, `interrupted`, or `failed`).
 A record still marked `started` has no recorded outcome, for example after a process crash.
 These files preserve execution artifacts, not input snapshots or a reproducible kernel state.
-The existing kernel lifetime and verdict-before-next-run behavior are unchanged.
+The kernel persists within a session, and the verdict-before-next-run behavior is unchanged.
 
 There is no migration or compatibility layer for the previous generic notes/transcript layout.
 Old test artifacts are not imported into the new record.

@@ -57,16 +57,10 @@
         <div class="brand">
           <span class="brand-title">Xprober</span>
         </div>
-        <span class="badge model-badge" id="model-badge">claude-opus-5</span>
-      </div>
-
-      <!-- Workspace Folder Selector -->
-      <div class="header-center">
-        <div class="workspace-pill" id="workspace-pill" title="Click to change workspace folder">
-          <span class="pill-label">wd</span>
+        <button type="button" class="workspace-pill" id="workspace-pill" title="Change workspace folder">
           <span class="workspace-path" id="workspace-path">Loading workspace...</span>
-          <button class="btn btn-xs btn-outline" id="btn-change-folder" type="button">Change</button>
-        </div>
+          <span aria-hidden="true">▾</span>
+        </button>
       </div>
 
       <!-- Controls & Status -->
@@ -75,19 +69,12 @@
           <span class="status-dot green" id="kernel-dot"></span>
           <span class="status-text" id="kernel-text">Kernel ready</span>
         </div>
-        <button class="btn btn-sm btn-ghost" id="btn-new-session" title="Start new session (same kernel)" type="button">
-          <span>New session</span>
-        </button>
-        <button class="btn btn-sm btn-ghost" id="btn-history" title="Resume a past chat from this workspace" type="button">
-          <span>History</span>
-        </button>
         <button class="btn btn-sm btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
-        <button class="btn btn-sm btn-ghost" id="btn-restart-kernel" title="Restart Jupyter kernel (clears in-memory state)" type="button">
-          <span>Restart kernel</span>
-        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-settings" type="button">Settings</button>
         <button class="btn btn-sm btn-danger-outline hidden" id="btn-interrupt" title="Interrupt running probe" type="button">
           <span>Interrupt</span>
         </button>
+        <button class="btn btn-sm btn-danger-outline" id="btn-exit" type="button">Exit</button>
       </div>
     </header>
 
@@ -100,11 +87,8 @@
             <span>Exploration log</span>
           </div>
           <div class="chat-header-actions">
-            <label class="toggle-label switch-label" id="context-control" title="Keep the conversation across messages, as the CLI does. Off: every message starts fresh from the system prompt plus evidence.md and thoughts.md.">
-              <span class="toggle-text">Keep context</span>
-              <input type="checkbox" id="context-toggle" class="switch-input" checked>
-              <span class="switch" aria-hidden="true"></span>
-            </label>
+            <button class="btn btn-xs btn-ghost" id="btn-new-session" title="Start a new session with a fresh kernel" type="button">New session</button>
+            <button class="btn btn-xs btn-ghost" id="btn-history" type="button">History</button>
             <span class="badge" id="chat-status-badge">Idle</span>
           </div>
         </div>
@@ -130,10 +114,8 @@
         <div class="chat-input-container">
           <!-- Slash command helper chips -->
           <div class="command-chips">
-            <button type="button" class="chip" data-cmd="/new">/new</button>
-            <button type="button" class="chip" data-cmd="/restart">/restart</button>
-            <button type="button" class="chip" data-cmd="/notes">/notes</button>
-            <span class="chips-hint">Enter to send, Shift+Enter for a new line</span>
+            <select id="model-select" class="file-select" aria-label="Model for next message"></select>
+            <span class="chips-hint">Shift+Enter for a new line</span>
           </div>
 
           <form class="chat-form" id="chat-form">
@@ -141,7 +123,7 @@
               id="prompt-input"
               class="prompt-input"
               rows="2"
-              placeholder="Ask the agent to probe the system, e.g. inspect the files in this folder, check data columns, test a model"
+              placeholder="Ask the agent to figure something out"
               required
             ></textarea>
             <div class="input-actions">
@@ -161,37 +143,23 @@
         <div class="viewer-header">
           <!-- Left: Tab navigation -->
           <div class="viewer-tabs">
-            <button class="tab-btn active" id="tab-doc" data-tab="doc" type="button">
-              Document
-            </button>
+            <button class="tab-btn active" id="tab-evidence" data-tab="evidence" type="button">Evidence</button>
+            <button class="tab-btn" id="tab-thoughts" data-tab="thoughts" type="button">Thoughts</button>
             <button class="tab-btn" id="tab-plots" data-tab="plots" type="button">
               Figures <span class="badge badge-sm" id="plots-count">0</span>
             </button>
+            <button class="tab-btn" id="tab-doc" data-tab="doc" type="button">Documents</button>
           </div>
 
           <!-- Right: Document Actions -->
           <div class="viewer-actions">
             <!-- File Selector Dropdown -->
-            <div class="file-selector-wrapper" id="file-selector-wrapper">
+            <div class="file-selector-wrapper hidden" id="file-selector-wrapper">
               <select id="file-select" class="file-select" title="Select markdown document">
                 <option value="xprober/notes/evidence.md">xprober/notes/evidence.md</option>
               </select>
             </div>
 
-            <!-- Raw / Rendered Toggle -->
-            <button class="btn btn-xs btn-ghost" id="btn-toggle-raw" type="button" title="Toggle raw markdown / rendered view">
-              Raw
-            </button>
-
-            <!-- Copy Content Button -->
-            <button class="btn btn-xs btn-ghost" id="btn-copy-doc" type="button" title="Copy markdown to clipboard">
-              Copy
-            </button>
-
-            <!-- Refresh Button -->
-            <button class="btn btn-xs btn-ghost" id="btn-refresh-doc" type="button" title="Reload active document">
-              Reload
-            </button>
           </div>
         </div>
 
@@ -206,14 +174,12 @@
             <article class="markdown-body" id="markdown-container">
               <!-- Rendered markdown inserted here -->
             </article>
-            <pre class="raw-markdown hidden" id="raw-markdown-container"><code></code></pre>
           </div>
 
           <!-- Plots Gallery Tab View -->
           <div class="tab-view hidden" id="view-plots">
             <div class="plots-gallery-header">
               <span class="gallery-title">Generated figures</span>
-              <button class="btn btn-xs btn-outline" id="btn-refresh-plots" type="button">Refresh</button>
             </div>
             <div class="plots-grid" id="plots-grid">
               <div class="empty-state">No figures yet. Run a probe that produces a plot.</div>
@@ -222,6 +188,24 @@
         </div>
       </section>
     </main>
+
+    <div class="modal-backdrop hidden" id="settings-modal">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>Settings</h3>
+          <button class="modal-close" id="settings-close" aria-label="Close settings" type="button">&times;</button>
+        </div>
+        <div class="modal-body">
+          <h4>Experimental</h4>
+          <label class="toggle-label switch-label">
+            <span>Keep context</span>
+            <input type="checkbox" id="context-toggle" class="switch-input" checked>
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+          <p class="modal-help">On by default. When off, each message starts from the scientific record without the earlier conversation.</p>
+        </div>
+      </div>
+    </div>
 
     <!-- Chat History Modal -->
     <div class="modal-backdrop hidden" id="history-modal">

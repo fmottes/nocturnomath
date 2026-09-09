@@ -21,7 +21,10 @@
 .tab-btn:hover { color: var(--ink-soft); }
 .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
 
-.viewer-actions { display: flex; align-items: center; gap: 8px; }
+.viewer-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; }
+.viewer-header { height: auto; min-height: 42px; flex-wrap: wrap; padding-block: 6px; }
+.viewer-tabs { flex-shrink: 0; }
+.tab-btn { padding-inline: 7px; letter-spacing: 0.06em; }
 
 .file-select {
   max-width: 190px;

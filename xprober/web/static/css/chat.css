@@ -25,7 +25,7 @@
 .chat-header-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 5px;
 }
 
 #context-control {

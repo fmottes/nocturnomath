@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from fastapi import WebSocket
 
 from ..session import ExplorationSession
@@ -28,6 +29,8 @@ class WebRuntime:
     ):
         self.session = session
         self.model = session.model if session else model
+        self.models = [self.model]
+        self.model_labels = {self.model: self.model}
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
         self.navigator_root = Path(navigator_root).expanduser().resolve()
@@ -43,6 +46,26 @@ class WebRuntime:
     def start(self):
         self._started = True
         self._subscribe_to_session()
+
+    async def discover_models(self):
+        """Read the CLI's model catalog without sending an inference request."""
+        try:
+            async with asyncio.timeout(15):
+                async with ClaudeSDKClient(
+                    ClaudeAgentOptions(tools=[], mcp_servers={})
+                ) as client:
+                    info = await client.get_server_info()
+            for model in (info or {}).get("models", []):
+                value = model.get("value")
+                if not isinstance(value, str) or not value:
+                    continue
+                if value not in self.models:
+                    self.models.append(value)
+                self.model_labels[value] = model.get("displayName") or value
+        except Exception as exc:
+            logger.warning(
+                "Could not discover Claude models; retaining configured model: %s", exc
+            )
 
     def shutdown(self):
         self._started = False
@@ -98,11 +121,17 @@ class WebRuntime:
     async def forward_session_event(self, event_type: str, payload: dict[str, Any]):
         await self.broadcast(event_type, payload)
 
-    def start_query(self, text: str):
+    def start_query(self, text: str, model: str | None = None):
         if self.session is None:
             raise RuntimeError("Open a workspace folder before starting a query.")
         if self.session.has_active_query():
             raise RuntimeError("The agent is already running a query.")
+        if model is not None:
+            if model not in self.models:
+                raise ValueError("Choose a model from the model selector.")
+            self.session.model = model
+            self.model = model
+            self.session.log_transcript("meta", model=model)
         task = asyncio.create_task(self._run_query(text))
         self.session._current_task = task
 

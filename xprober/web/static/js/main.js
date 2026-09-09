@@ -1,8 +1,8 @@
 import { elements, state } from "./state.js?v=20260906-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20260906-1";
-import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext } from "./workspace.js?v=20260906-1";
+import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260906-1";
 import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260906-1";
-import { loadSessions, replaySession } from "./history.js?v=20260906-1";
+import { clearChat, loadSessions, replaySession } from "./history.js?v=20260906-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";
 
@@ -30,6 +30,11 @@ function applyTheme(theme) {
 // ============================================================================
 function handleServerEvent(event) {
   switch (event.type) {
+    case "service_stopping":
+      state.exiting = true;
+      elements.btnSend.disabled = true;
+      appendSystemMessage("Xprober is stopping. You can close this tab.");
+      break;
     case "init":
     case "workspace_updated":
       applyWorkspace(event.workspace);
@@ -50,8 +55,8 @@ function handleServerEvent(event) {
 
     case "record_changed":
       appendNoteNotification(event.kind, `${event.entry_id}: ${event.text}`);
-      if (state.autoSync && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)) {
-        loadDocument(state.activeDoc);
+      if (state.activeTab !== "plots" && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)) {
+        loadDocument(state.activeDoc, "", true);
       }
       break;
 
@@ -65,6 +70,7 @@ function handleServerEvent(event) {
 
     case "turn_complete":
       finalizeAssistantTurn();
+      refreshDocuments();
       break;
 
     case "status_change":
@@ -91,7 +97,8 @@ function handleServerEvent(event) {
       break;
 
     case "session_reset":
-      appendSystemMessage("Started new exploration session with fresh context.");
+      clearChat();
+      updateKernelStatus(true, false);
       break;
 
     case "session_resumed":
@@ -120,6 +127,33 @@ function handleServerEvent(event) {
 // Event Listeners & Setup
 // ============================================================================
 function setupEventListeners() {
+  elements.chatMessages.addEventListener("scroll", () => {
+    const log = elements.chatMessages;
+    state.followChat = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
+  }, { passive: true });
+  elements.btnSettings.addEventListener("click", () => elements.settingsModal.classList.remove("hidden"));
+  elements.settingsClose.addEventListener("click", () => elements.settingsModal.classList.add("hidden"));
+  elements.settingsModal.addEventListener("click", (event) => {
+    if (event.target === elements.settingsModal) elements.settingsModal.classList.add("hidden");
+  });
+  elements.btnExit.addEventListener("click", async () => {
+    elements.btnExit.disabled = true;
+    try {
+      const response = await fetch("/api/exit", { method: "POST" });
+      if (!response.ok) throw new Error((await response.json()).detail || "Unable to stop service");
+      state.exiting = true;
+      state.ws?.close();
+      window.close();
+      document.body.replaceChildren();
+      const message = document.createElement("p");
+      message.className = "empty-state";
+      message.textContent = "Xprober is stopping. You can close this tab.";
+      document.body.appendChild(message);
+    } catch (error) {
+      appendErrorMessage(error.message);
+      elements.btnExit.disabled = false;
+    }
+  });
   document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
     button.addEventListener("click", () => {
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -133,7 +167,7 @@ function setupEventListeners() {
     const text = elements.promptInput.value.trim();
     if (!text) return;
 
-    sendWs("query", { text });
+    sendWs("query", { text, model: elements.modelSelect.value });
     elements.promptInput.value = "";
     elements.promptInput.style.height = "44px";
   });
@@ -150,14 +184,6 @@ function setupEventListeners() {
   elements.promptInput.addEventListener("input", () => {
     elements.promptInput.style.height = "44px";
     elements.promptInput.style.height = Math.min(elements.promptInput.scrollHeight, 160) + "px";
-  });
-
-  // Slash command chips
-  document.querySelectorAll(".chip").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const cmd = chip.dataset.cmd;
-      sendWs("query", { text: cmd });
-    });
   });
 
   // Control Buttons
@@ -180,16 +206,11 @@ function setupEventListeners() {
     sendWs("set_carry_context", { enabled: e.target.checked });
   });
 
-  elements.btnRestartKernel.addEventListener("click", () => sendWs("restart_kernel"));
   elements.btnInterrupt.addEventListener("click", () => sendWs("interrupt"));
 
   // Workspace Switcher Modal
   elements.btnOpenWorkspace.addEventListener("click", () => openFolderPicker("open"));
   elements.workspacePill.addEventListener("click", () => openFolderPicker("change"));
-  elements.btnChangeFolder.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openFolderPicker("change");
-  });
   elements.modalClose.addEventListener("click", closeFolderPicker);
   elements.modalCancel.addEventListener("click", closeFolderPicker);
   elements.folderModal.addEventListener("click", (e) => {
@@ -234,65 +255,12 @@ function setupEventListeners() {
 
   // Document controls
   elements.fileSelect.addEventListener("change", (e) => {
-    loadDocument(e.target.value);
+    loadDocument(e.target.value, "", false, "doc");
   });
 
-  elements.btnRefreshDoc.addEventListener("click", () => {
-    loadDocument(elements.fileSelect.value);
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.addEventListener("click", () => selectViewerTab(button.dataset.tab));
   });
-
-  // No control for this in the UI at the moment; auto-sync is simply on. The
-  // listener stays wired for whenever the toggle comes back.
-  if (elements.autoRefreshToggle) {
-    elements.autoRefreshToggle.addEventListener("change", (e) => {
-      state.autoSync = e.target.checked;
-    });
-  }
-
-  elements.btnToggleRaw.addEventListener("click", () => {
-    state.rawView = !state.rawView;
-    if (state.rawView) {
-      elements.markdownContainer.classList.add("hidden");
-      elements.rawMarkdownContainer.classList.remove("hidden");
-      elements.btnToggleRaw.textContent = "Rendered";
-    } else {
-      elements.markdownContainer.classList.remove("hidden");
-      elements.rawMarkdownContainer.classList.add("hidden");
-      elements.btnToggleRaw.textContent = "Raw";
-    }
-  });
-
-  elements.btnCopyDoc.addEventListener("click", async () => {
-    const raw = elements.rawMarkdownContainer.querySelector("code").textContent;
-    try {
-      await navigator.clipboard.writeText(raw);
-      const original = elements.btnCopyDoc.textContent;
-      elements.btnCopyDoc.textContent = "Copied";
-      setTimeout(() => (elements.btnCopyDoc.textContent = original), 1500);
-    } catch (e) {
-      console.error("Clipboard copy failed:", e);
-    }
-  });
-
-  // Viewer Tabs
-  elements.tabDoc.addEventListener("click", () => {
-    elements.tabDoc.classList.add("active");
-    elements.tabPlots.classList.remove("active");
-    elements.viewDoc.classList.remove("hidden");
-    elements.viewPlots.classList.add("hidden");
-    elements.fileSelect.parentElement.classList.remove("hidden");
-  });
-
-  elements.tabPlots.addEventListener("click", () => {
-    elements.tabPlots.classList.add("active");
-    elements.tabDoc.classList.remove("active");
-    elements.viewPlots.classList.remove("hidden");
-    elements.viewDoc.classList.add("hidden");
-    elements.fileSelect.parentElement.classList.add("hidden");
-    loadPlots();
-  });
-
-  elements.btnRefreshPlots.addEventListener("click", () => loadPlots());
 
   // Lightbox
   elements.lightboxClose.addEventListener("click", closeLightbox);
@@ -350,6 +318,9 @@ function setupGutterResize() {
 // Initial Boot
 document.addEventListener("DOMContentLoaded", () => {
   setupEventListeners();
+  setInterval(() => {
+    if (!state.exiting && !document.hidden && window.getSelection()?.isCollapsed !== false) refreshDocuments();
+  }, 3000);
   initWebSocket(
     handleServerEvent,
     () => {

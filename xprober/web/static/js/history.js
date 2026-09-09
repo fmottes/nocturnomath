@@ -112,6 +112,7 @@ export async function resumeSession(sessionId) {
 }
 
 export function clearChat() {
+  state.followChat = true;
   elements.chatMessages.innerHTML = "";
   state.currentAssistantBubble = null;
   state.currentProbeCard = null;

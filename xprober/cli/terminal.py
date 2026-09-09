@@ -83,7 +83,7 @@ async def run_terminal(args: argparse.Namespace):
                 continue
             if line == "/new":
                 session.reset_client_session()
-                print("new session, same kernel")
+                print("new session, fresh kernel")
                 continue
 
             task = asyncio.create_task(session.query(line))

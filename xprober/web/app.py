@@ -7,7 +7,14 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,6 +58,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         runtime.start()
+        await runtime.discover_models()
         browser_task = None
         if browser_url:
 
@@ -68,6 +76,8 @@ def create_app(
 
     app = FastAPI(title="Xprober Web App", lifespan=lifespan)
     app.state.runtime = runtime
+    app.state.request_shutdown = None
+    app.state.exiting = False
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -90,6 +100,8 @@ def create_app(
                 "is_open": False,
                 "path": None,
                 "model": runtime.model,
+                "models": runtime.models,
+                "model_labels": runtime.model_labels,
                 "kernel_alive": False,
                 "kernel_busy": False,
                 "is_busy": False,
@@ -104,6 +116,8 @@ def create_app(
             "is_open": True,
             "path": str(session.workspace_path),
             "model": session.model,
+            "models": runtime.models,
+            "model_labels": runtime.model_labels,
             "kernel_alive": session.kernel.is_alive(),
             "kernel_busy": session.kernel.busy,
             "is_busy": session._is_busy,
@@ -141,6 +155,37 @@ def create_app(
     async def get_workspace_info():
         return await workspace_snapshot()
 
+    @app.post("/api/exit")
+    async def exit_service(request: Request, background_tasks: BackgroundTasks):
+        origin = request.headers.get("origin")
+        if origin and origin != str(request.base_url).rstrip("/"):
+            raise HTTPException(
+                status_code=403, detail="Exit must be requested from this app."
+            )
+        if app.state.request_shutdown is None:
+            raise HTTPException(
+                status_code=503, detail="Stop this service using its launcher."
+            )
+        if not app.state.exiting:
+            app.state.exiting = True
+
+            async def stop():
+                await runtime.broadcast("service_stopping", {})
+                session = runtime.session
+                if session:
+                    task = session._current_task
+                    await session.interrupt()
+                    if task:
+                        await asyncio.gather(task, return_exceptions=True)
+                    if session._probe_task:
+                        await asyncio.gather(
+                            session._probe_task, return_exceptions=True
+                        )
+                app.state.request_shutdown()
+
+            background_tasks.add_task(stop)
+        return {"status": "stopping"}
+
     @app.post("/api/workspace")
     async def change_workspace(request: WorkspaceChangeRequest):
         try:
@@ -166,7 +211,9 @@ def create_app(
                 (
                     {"name": child.name, "path": str(child)}
                     for child in directory.iterdir()
-                    if child.is_dir() and not child.is_symlink()
+                    if not child.name.startswith(".")
+                    and child.is_dir()
+                    and not child.is_symlink()
                 ),
                 key=lambda item: item["name"].lower(),
             )
@@ -282,6 +329,8 @@ def create_app(
             while True:
                 data = await websocket.receive_json()
                 action = data.get("action")
+                if app.state.exiting:
+                    continue
                 session = runtime.session
                 if action != "set_workspace" and session is None:
                     await runtime.broadcast(
@@ -303,12 +352,7 @@ def create_app(
                             )
                             continue
                         session.reset_client_session()
-                        await runtime.broadcast(
-                            "system_message",
-                            {
-                                "text": "Started new exploration session with same kernel."
-                            },
-                        )
+                        await runtime.broadcast("session_reset", {})
                         continue
                     if text == "/restart":
                         if session.has_active_query():
@@ -337,8 +381,15 @@ def create_app(
                             {"message": "The agent is already running a query."},
                         )
                         continue
+                    model = data.get("model")
+                    if model is not None and model not in runtime.models:
+                        await runtime.broadcast(
+                            "error",
+                            {"message": "Choose a model from the model selector."},
+                        )
+                        continue
                     await runtime.broadcast("user_message", {"text": text})
-                    runtime.start_query(text)
+                    runtime.start_query(text, model)
 
                 elif action == "interrupt":
                     await session.interrupt()

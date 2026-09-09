@@ -45,7 +45,11 @@ def main():
         navigator_root=navigator_root,
     )
     logger.info(f"Xprober Web App ready at: {url}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+    )
+    app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+    server.run()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,34 @@
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from xprober.web import create_app
+
+
+@pytest.fixture(autouse=True)
+def sdk_model_catalog():
+    with patch("xprober.web.runtime.ClaudeSDKClient") as sdk:
+        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
+            return_value={"models": [{"value": "sonnet", "displayName": "Sonnet"}]}
+        )
+        yield sdk
+
+
+def test_startup_discovers_models_without_querying(sdk_model_catalog):
+    with TestClient(create_app()) as client:
+        snapshot = client.get("/api/workspace").json()
+        assert snapshot["models"] == ["claude-opus-5", "sonnet"]
+        assert snapshot["model_labels"]["sonnet"] == "Sonnet"
+        sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
+
+
+def test_model_discovery_failure_keeps_configured_model(sdk_model_catalog):
+    sdk_model_catalog.return_value.__aenter__.side_effect = RuntimeError(
+        "SDK unavailable"
+    )
+    with TestClient(create_app(model="custom-model")) as client:
+        assert client.get("/api/workspace").json()["models"] == ["custom-model"]
 
 
 class NoopKernel:
@@ -30,6 +56,7 @@ class NoopKernel:
 def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
     workspace = tmp_path / "chosen-workspace"
     workspace.mkdir()
+    (tmp_path / ".hidden-folder").mkdir()
     (tmp_path / "not-a-folder.txt").write_text("keep")
 
     with patch("xprober.session.Kernel", NoopKernel):
@@ -131,6 +158,68 @@ def test_websocket_event_contract(session):
             "type": "user_message",
             "text": "question",
         }
+
+
+def test_new_session_restarts_kernel_and_broadcasts_reset(session):
+    with (
+        TestClient(create_app(session)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        websocket.send_json({"action": "new_session"})
+        assert websocket.receive_json()["type"] == "session_reset"
+        assert session.kernel.restarts == 1
+        websocket.send_json({"action": "query", "text": "/new"})
+        assert websocket.receive_json()["type"] == "session_reset"
+        assert session.kernel.restarts == 2
+        assert client.post("/api/session/new").status_code == 200
+        assert websocket.receive_json()["type"] == "session_reset"
+        assert session.kernel.restarts == 3
+
+
+def test_model_selection_applies_to_next_query_without_resetting_context(session):
+    seen_models = []
+
+    async def query(text):
+        seen_models.append(session.model)
+        await session.emit("turn_complete")
+
+    session.query = query
+    session._sdk_session_id = "keep-context"
+    with (
+        TestClient(create_app(session)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        websocket.send_json({"action": "query", "text": "question", "model": "sonnet"})
+        assert websocket.receive_json()["type"] == "user_message"
+        assert websocket.receive_json()["type"] == "turn_complete"
+        assert seen_models == ["sonnet"]
+        assert session._sdk_session_id == "keep-context"
+        assert session.kernel.restarts == 0
+        websocket.send_json({"action": "query", "text": "question", "model": "unknown"})
+        assert websocket.receive_json()["type"] == "error"
+        assert seen_models == ["sonnet"]
+
+
+def test_exit_requests_launcher_shutdown_and_rejects_foreign_origin(session):
+    from unittest.mock import Mock
+
+    app = create_app(session)
+    stop = Mock()
+    app.state.request_shutdown = stop
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/api/exit", headers={"Origin": "https://elsewhere.example"}
+            ).status_code
+            == 403
+        )
+        stop.assert_not_called()
+        assert client.post("/api/exit").status_code == 200
+        stop.assert_called_once()
+        assert client.post("/api/exit").status_code == 200
+        stop.assert_called_once()
 
 
 def test_busy_http_mutations_return_conflict(session):

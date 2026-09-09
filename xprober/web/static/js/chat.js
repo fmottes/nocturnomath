@@ -6,7 +6,7 @@ import { openLightbox } from "./ui.js?v=20260906-1";
 // Chat UI Rendering
 // ============================================================================
 export function scrollChatToBottom() {
-  elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+  if (state.followChat) elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
 }
 
 export function nowLabel() {

@@ -15,6 +15,7 @@ export function initWebSocket(onMessage, onOpen, onClose) {
     }
   };
   state.ws.onclose = () => {
+    if (state.exiting) return;
     console.log("WebSocket closed, attempting reconnect in 2s...");
     onClose();
     setTimeout(() => initWebSocket(onMessage, onOpen, onClose), 2000);

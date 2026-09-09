@@ -11,13 +11,21 @@ export function applyWorkspace(ws) {
     showLanding(ws);
     return;
   }
+  if (state.workspace?.path !== ws.path) {
+    state.documentContent = null;
+    state.documentPath = null;
+    fileListSignature = null;
+  }
   state.workspace = ws;
   recordRecentWorkspace(ws.path);
   elements.landingScreen.classList.add("hidden");
   elements.workspaceApp.classList.remove("hidden");
 
   elements.workspacePath.textContent = workspaceName(ws.path);
-  elements.modelBadge.textContent = ws.model || "claude-opus-5";
+  elements.workspacePill.title = ws.path;
+  const models = [...new Set([ws.model, ...(ws.models || [])].filter(Boolean))];
+  elements.modelSelect.replaceChildren(...models.map((model) => new Option(ws.model_labels?.[model] || model, model)));
+  elements.modelSelect.value = ws.model;
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
@@ -123,7 +131,11 @@ export function setCarryContext(enabled) {
   elements.contextToggle.checked = state.carryChatContext;
 }
 
+let fileListSignature = null;
 export function updateFileSelector(files) {
+  const signature = JSON.stringify(files.map((file) => [file.path, file.is_notes]));
+  if (signature === fileListSignature) return;
+  fileListSignature = signature;
   const currentVal = elements.fileSelect.value;
   elements.fileSelect.innerHTML = "";
 
@@ -148,25 +160,62 @@ export function updateFileSelector(files) {
     elements.fileSelect.value = currentVal;
   } else {
     elements.fileSelect.value = files[0].path;
-    state.activeDoc = files[0].path;
   }
 }
 
-export async function loadDocument(filePath, anchor = "") {
+export function selectViewerTab(tab) {
+  setViewerTab(tab);
+  if (tab === "plots") return loadPlots();
+  const path = tab === "evidence" ? state.workspace?.evidence_path
+    : tab === "thoughts" ? state.workspace?.thoughts_path : elements.fileSelect.value;
+  if (path) loadDocument(path, "", false, tab);
+}
+
+function setViewerTab(tab) {
+  state.activeTab = tab;
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === tab);
+  });
+  elements.viewDoc.classList.toggle("hidden", tab === "plots");
+  elements.viewPlots.classList.toggle("hidden", tab !== "plots");
+  elements.fileSelect.parentElement.classList.toggle("hidden", tab !== "doc");
+}
+
+let refreshing = false;
+export async function refreshDocuments() {
+  if (!state.workspace?.is_open || refreshing || state.exiting) return;
+  refreshing = true;
+  try {
+    const response = await fetch("/api/files");
+    if (response.ok) updateFileSelector((await response.json()).files || []);
+    if (state.activeTab !== "plots") await loadDocument(state.activeDoc, "", true);
+    else await loadPlots();
+  } finally { refreshing = false; }
+}
+
+export async function loadDocument(filePath, anchor = "", quiet = false, tab = null) {
   if (!state.workspace?.is_open) return;
   if (!filePath) filePath = state.workspace.evidence_path;
   state.activeDoc = filePath;
+  if (!quiet) setViewerTab(tab || (filePath === state.workspace.evidence_path ? "evidence"
+    : filePath === state.workspace.thoughts_path ? "thoughts" : "doc"));
   elements.docPathLabel.textContent = filePath;
 
   try {
     const res = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
+    if (state.activeDoc !== filePath) return;
     if (!res.ok) {
       elements.markdownContainer.innerHTML = `<p class="empty-state">File not found or empty: ${filePath}</p>`;
-      elements.rawMarkdownContainer.querySelector("code").textContent = "";
+      state.documentContent = null;
       return;
     }
     const data = await res.json();
     const content = data.content || "";
+    if (state.activeDoc !== filePath) return;
+    if (quiet && window.getSelection()?.isCollapsed === false) return;
+    if (state.documentPath === filePath && state.documentContent === content && !anchor) return;
+    state.documentPath = filePath;
+    state.documentContent = content;
 
     // Render markdown
     if (filePath.endsWith(".md")) {
@@ -190,9 +239,6 @@ export async function loadDocument(filePath, anchor = "") {
         .find((element) => element.id === anchor);
       target?.scrollIntoView({ block: "start" });
     }
-
-    // Raw content
-    elements.rawMarkdownContainer.querySelector("code").textContent = content;
 
     // Metadata
     const modifiedDate = new Date(data.modified * 1000).toLocaleTimeString();
@@ -247,10 +293,11 @@ export async function loadPlots() {
     if (!res.ok) return;
     const data = await res.json();
     const plots = data.plots || [];
+    const changed = JSON.stringify(state.plots) !== JSON.stringify(plots);
     state.plots = plots;
     elements.plotsCount.textContent = plots.length;
 
-    renderPlotsGallery(plots);
+    if (changed) renderPlotsGallery(plots);
   } catch (e) {
     console.error("Error loading plots:", e);
   }

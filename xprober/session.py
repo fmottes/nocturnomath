@@ -252,6 +252,7 @@ class ExplorationSession:
 
     def reset_client_session(self):
         self.require_idle("start a new session")
+        self.kernel.restart()
         self._session_initialized = False
         self._sdk_session_id = None
         self._resume_prefix = None
