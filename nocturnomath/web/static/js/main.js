@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20260909-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu } from "./workspace.js?v=20260909-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260909-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
 import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
@@ -111,11 +111,13 @@ function handleServerEvent(event) {
       break;
 
     case "session_reset":
+      setSessionId(event.session_id);
       clearChat();
       updateKernelStatus(true, false);
       break;
 
     case "session_resumed":
+      setSessionId(event.id);
       state.carryChatContext = Boolean(event.carry_chat_context);
       replaySession(
         event.records || [],

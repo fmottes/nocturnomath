@@ -190,6 +190,7 @@ class Runtime:
         return {
             "is_open": True,
             "path": str(session.workspace_path),
+            "session_id": session.workspace.session_id,
             "environment": {
                 "python": str(session.environment.python),
                 "version": session.environment.version,

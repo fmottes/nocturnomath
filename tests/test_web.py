@@ -172,6 +172,7 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         workspace = client.get("/api/workspace")
         assert workspace.status_code == 200
         assert workspace.json()["path"] == str(tmp_path)
+        assert workspace.json()["session_id"] == "S001"
         assert (
             client.get("/api/file", params={"path": "report.md"}).json()["content"]
             == "# Report"
@@ -266,9 +267,13 @@ def test_new_session_restarts_kernel_and_broadcasts_reset(session):
         TestClient(create_app(session)) as client,
         client.websocket_connect("/ws") as websocket,
     ):
-        websocket.receive_json()
+        assert websocket.receive_json()["workspace"]["session_id"] == "S001"
+        session.log_transcript("user", text="question")
         websocket.send_json({"action": "new_session"})
-        assert websocket.receive_json()["type"] == "session_reset"
+        assert websocket.receive_json() == {
+            "type": "session_reset",
+            "session_id": "S002",
+        }
         assert session.kernel.restarts == 1
         websocket.send_json({"action": "query", "text": "/new"})
         assert websocket.receive_json()["type"] == "session_reset"

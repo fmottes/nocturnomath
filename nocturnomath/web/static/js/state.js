@@ -34,6 +34,7 @@ export const elements = {
   kernelDot: document.getElementById("kernel-dot"),
   kernelText: document.getElementById("kernel-text"),
   chatStatusBadge: document.getElementById("chat-status-badge"),
+  sessionIdBadge: document.getElementById("session-id-badge"),
   contextToggle: document.getElementById("context-toggle"),
   btnNewSession: document.getElementById("btn-new-session"),
   btnHistory: document.getElementById("btn-history"),

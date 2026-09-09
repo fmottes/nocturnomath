@@ -316,7 +316,9 @@ def create_app(
             await runtime.transition(session.reset_client_session)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        await runtime.broadcast("session_reset", {})
+        await runtime.broadcast(
+            "session_reset", {"session_id": session.workspace.session_id}
+        )
         return {"status": "ok"}
 
     @app.get("/api/sessions")
@@ -399,7 +401,10 @@ def create_app(
                             )
                             continue
                         await runtime.transition(session.reset_client_session)
-                        await runtime.broadcast("session_reset", {})
+                        await runtime.broadcast(
+                            "session_reset",
+                            {"session_id": session.workspace.session_id},
+                        )
                         continue
                     if text == "/restart":
                         if runtime.changing or session.has_active_query():
@@ -463,7 +468,9 @@ def create_app(
                         )
                         continue
                     await runtime.transition(session.reset_client_session)
-                    await runtime.broadcast("session_reset", {})
+                    await runtime.broadcast(
+                        "session_reset", {"session_id": session.workspace.session_id}
+                    )
                 elif action == "resume_session":
                     session_id = data.get("id")
                     if session_id:

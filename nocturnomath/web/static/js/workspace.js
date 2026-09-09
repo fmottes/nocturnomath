@@ -28,6 +28,7 @@ export function applyWorkspace(ws) {
 
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
+  setSessionId(ws.session_id);
   setModelCatalogue(ws.models || [], ws.model_labels || {}, ws.model);
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
@@ -47,6 +48,11 @@ export function applyWorkspace(ws) {
 
   // Refresh plots list
   loadPlots();
+}
+
+export function setSessionId(id) {
+  state.currentSession = id || null;
+  elements.sessionIdBadge.textContent = id || "";
 }
 
 function workspaceName(path) {
