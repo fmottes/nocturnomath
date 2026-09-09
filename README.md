@@ -94,7 +94,9 @@ interruptions, `install_packages` results, and thinking/running/idle status chan
 
 `/export` writes to the current directory by default; a directory argument keeps the
 generated `nocturnomath-<workspace>-<session>.ipynb` name, a file path overrides it.
-`/restart` and `/export` are refused while the agent is running a query.
+Commands that change the chat, kernel, context, environment, or workspace (`/new`,
+`/restart`, `/resume`, `/export`, `/context`, `/env`, `/workspace`) are refused while the
+agent is running a query, with the same messages the web app shows.
 
 The terminal and web interfaces share the same runtime, prompt, tools, persistent
 kernel, notes, transcripts, verdict gating, and context behavior.

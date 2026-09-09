@@ -197,7 +197,13 @@ class Workspace:
             for path in self.path.glob("**/*.md"):
                 if any(
                     ignored in path.parts
-                    for ignored in (".git", "node_modules", ".venv", ".pytest_cache")
+                    for ignored in (
+                        ".git",
+                        "node_modules",
+                        ".venv",
+                        "venv",
+                        ".pytest_cache",
+                    )
                 ):
                     continue
                 try:

@@ -27,6 +27,9 @@ def test_workspace_defers_session_folder_until_first_activity(tmp_path):
 def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
     workspace = Workspace(tmp_path)
     (tmp_path / "report.md").write_text("# Report")
+    vendored = tmp_path / ".nocturnomath/venv/lib/site-packages/numpy"
+    vendored.mkdir(parents=True)
+    (vendored / "LICENSE.md").write_text("vendored")
     probe = workspace.start_probe("print(3)", "positive", "test")
     workspace.finish_probe(probe, "3\n", [b"png"], "completed", None)
     workspace.log_transcript("user", text="inspect the data")

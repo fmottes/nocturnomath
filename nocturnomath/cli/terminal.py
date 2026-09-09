@@ -71,6 +71,7 @@ class TerminalApp:
         self.pending_model: str | None = None
         self.status = "idle"
         self.stopped = False
+        self._interrupt_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ output
 
@@ -258,13 +259,9 @@ class TerminalApp:
 
     def check_model(self, model: str):
         if not self.runtime.models:
-            self.warn(
-                f"Could not read the Claude model catalogue; continuing with {model}."
-            )
-        elif model not in self.runtime.models:
-            self.warn(
-                f"{model} is not in the Claude model catalogue "
-                f"({', '.join(self.runtime.models)}); continuing with it anyway."
+            self.write(
+                f"Model catalogue unavailable; /model cannot switch from {model}.",
+                style="dim",
             )
 
     def interrupt(self) -> bool:
@@ -275,7 +272,7 @@ class TerminalApp:
         task = self.runtime.current_task
         if not session.kernel.busy and (task is None or task.done()):
             return False
-        asyncio.create_task(session.interrupt())
+        self._interrupt_task = asyncio.create_task(session.interrupt())
         return True
 
     def on_interrupt(self):
@@ -326,7 +323,8 @@ class TerminalApp:
         return True
 
     async def _command_new(self, argument: str) -> bool:
-        session = self.runtime.require_session()
+        self.require_idle("start a new session")
+        session = self.runtime.session
         await self.runtime.transition(session.reset_client_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -381,7 +379,8 @@ class TerminalApp:
         if not ids:
             self.error("Name a chat to resume, such as /resume S001.")
             return True
-        session = self.runtime.require_session()
+        self.require_idle("resume")
+        session = self.runtime.session
         data = await self.runtime.transition(
             session.resume_session, ids[0], restore_kernel
         )

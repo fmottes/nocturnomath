@@ -379,9 +379,16 @@ async def test_mutations_are_refused_while_a_query_runs(terminal):
     terminal.output()
     terminal.session._is_busy = True
 
-    for command in ("/new", "/restart", "/resume S001", "/export"):
+    expected = {
+        "/new": "Cannot start a new session while the agent is running a query.",
+        "/restart": "Cannot restart the kernel while the agent is running a query.",
+        "/resume S001": "Cannot resume while the agent is running a query.",
+        "/export": "Cannot download the current session while the agent is running a query.",
+        "/context off": "Cannot change context settings while the agent is running a query.",
+    }
+    for command, message in expected.items():
         await terminal.run(command)
-        assert "while the agent is running a query." in terminal.output(), command
+        assert message in terminal.output(), command
 
     await terminal.run("/restart")
     assert (

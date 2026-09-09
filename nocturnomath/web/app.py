@@ -145,16 +145,7 @@ def create_app(
 
             async def stop():
                 await runtime.broadcast("service_stopping", {})
-                session = runtime.session
-                if session:
-                    task = session._current_task
-                    await session.interrupt()
-                    if task:
-                        await asyncio.gather(task, return_exceptions=True)
-                    if session._probe_task:
-                        await asyncio.gather(
-                            session._probe_task, return_exceptions=True
-                        )
+                await runtime.drain()
                 app.state.request_shutdown()
 
             background_tasks.add_task(stop)
