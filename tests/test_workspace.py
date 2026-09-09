@@ -50,7 +50,9 @@ def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
         ".nocturnomath/notes/thoughts.md",
         "report.md",
     ]
-    assert workspace.list_plots()[0]["filename"] == "S001/P001/plot-1.png"
+    [plot] = workspace.list_plots()
+    assert plot["filename"] == "S001/P001/plot-1.png"
+    assert plot["session"] == "S001"
     [history] = workspace.list_sessions()
     assert history["id"] == "S001"
     assert history["context_restorable"] is True

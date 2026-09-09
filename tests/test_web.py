@@ -184,7 +184,10 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
             static_script.text
         )
         assert client.get("/static/css/base.css").status_code == 200
-        plots = client.get("/api/plots").json()["plots"]
+        listing = client.get("/api/plots").json()
+        assert listing["current_session"] == "S001"
+        plots = listing["plots"]
+        assert plots[0]["session"] == "S001"
         assert (
             plots[0]["url"]
             == "/api/asset?path=.nocturnomath/sessions/S001/probes/P001/plot-1.png"

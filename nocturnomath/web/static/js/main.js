@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20260909-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu } from "./workspace.js?v=20260909-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
 import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
@@ -212,6 +212,24 @@ function setupEventListeners() {
   elements.promptInput.addEventListener("input", () => {
     elements.promptInput.style.height = "44px";
     elements.promptInput.style.height = Math.min(elements.promptInput.scrollHeight, 160) + "px";
+  });
+
+  // Figures session filter
+  elements.plotsFilterBtn.addEventListener("click", () => togglePlotsFilterMenu());
+  elements.plotsFilterMenu.addEventListener("change", (e) => {
+    const input = e.target;
+    if (input.name === "plots-filter-mode") {
+      setPlotsFilter(input.value);
+    } else if (input.type === "checkbox") {
+      const chosen = [...elements.plotsFilterSessions.querySelectorAll("input:checked")].map((box) => box.value);
+      setPlotsFilter("selected", chosen);
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if (!elements.plotsFilter.contains(e.target)) togglePlotsFilterMenu(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") togglePlotsFilterMenu(false);
   });
 
   // Control Buttons

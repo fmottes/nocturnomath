@@ -250,6 +250,56 @@
   color: var(--blue);
 }
 
+/* Session filter for the gallery: a selector-styled button that opens a
+   compact panel of radio modes plus a checkbox list of sessions. */
+.plots-filter { position: relative; }
+.plots-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.plots-filter-btn:hover { border-color: var(--blue-soft); }
+.plots-filter-btn[aria-expanded="true"] { border-color: var(--blue); }
+.plots-filter-caret { color: var(--ink-faint); font-size: 0.7em; }
+.plots-filter-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 210px;
+  padding: 6px 0;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink);
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+.plots-filter-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.plots-filter-option:hover { background: var(--blue-wash); }
+.plots-filter-option input { margin: 0; accent-color: var(--blue); }
+.plots-filter-note { color: var(--ink-faint); }
+.plots-filter-session { padding-left: 30px; }
+.plots-filter-session .plots-filter-note { margin-left: auto; }
+.plots-filter-sessions {
+  max-height: 200px;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--rule);
+}
+.plots-filter-empty { padding: 5px 12px 5px 30px; color: var(--ink-faint); }
+
 .plots-grid {
   padding: 22px;
   display: grid;

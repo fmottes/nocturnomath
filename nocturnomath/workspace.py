@@ -259,6 +259,7 @@ class Workspace:
             plots.append(
                 {
                     "filename": f"{path.parents[2].name}/{path.parent.name}/{path.name}",
+                    "session": path.parents[2].name,
                     "url": f"/api/asset?path={relative}",
                     "modified": stat.st_mtime,
                     "size": stat.st_size,

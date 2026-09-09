@@ -196,6 +196,28 @@
           <div class="tab-view hidden" id="view-plots">
             <div class="plots-gallery-header">
               <span class="gallery-title">Generated figures</span>
+              <div class="plots-filter" id="plots-filter">
+                <button type="button" class="file-select plots-filter-btn" id="plots-filter-btn"
+                        aria-haspopup="true" aria-expanded="false" aria-controls="plots-filter-menu"
+                        title="Filter figures by session">
+                  <span id="plots-filter-label">All sessions</span><span class="plots-filter-caret" aria-hidden="true">▾</span>
+                </button>
+                <div class="plots-filter-menu hidden" id="plots-filter-menu" role="group" aria-label="Filter figures by session">
+                  <label class="plots-filter-option">
+                    <input type="radio" name="plots-filter-mode" value="all" checked>
+                    <span>All sessions</span>
+                  </label>
+                  <label class="plots-filter-option">
+                    <input type="radio" name="plots-filter-mode" value="current">
+                    <span>Current session <span class="plots-filter-note" id="plots-filter-current"></span></span>
+                  </label>
+                  <label class="plots-filter-option">
+                    <input type="radio" name="plots-filter-mode" value="selected">
+                    <span>Selected sessions</span>
+                  </label>
+                  <div class="plots-filter-sessions" id="plots-filter-sessions"></div>
+                </div>
+              </div>
             </div>
             <div class="plots-grid" id="plots-grid">
               <div class="empty-state">No figures yet. Run a probe that produces a plot.</div>

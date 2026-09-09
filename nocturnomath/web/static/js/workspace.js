@@ -335,20 +335,95 @@ export async function loadPlots() {
     if (!res.ok) return;
     const data = await res.json();
     const plots = data.plots || [];
-    const changed = JSON.stringify(state.plots) !== JSON.stringify(plots);
+    const current = data.current_session || null;
+    const changed = current !== state.currentSession
+      || JSON.stringify(state.plots) !== JSON.stringify(plots);
     state.plots = plots;
-    elements.plotsCount.textContent = plots.length;
+    state.currentSession = current;
 
-    if (changed) renderPlotsGallery(plots);
+    if (changed) applyPlotsFilter();
   } catch (e) {
     console.error("Error loading plots:", e);
   }
 }
 
-export function renderPlotsGallery(plots) {
+// Session filter for the figures gallery. "all" shows everything, "current"
+// follows whichever session is active, "selected" shows the checked sessions.
+function plotSessions() {
+  const counts = new Map();
+  state.plots.forEach((p) => counts.set(p.session, (counts.get(p.session) || 0) + 1));
+  return [...counts.entries()]
+    .sort(([a], [b]) => b.localeCompare(a, undefined, { numeric: true }))
+    .map(([id, count]) => ({ id, count }));
+}
+
+function visiblePlots() {
+  const { mode, sessions } = state.plotsFilter;
+  if (mode === "current") return state.plots.filter((p) => p.session === state.currentSession);
+  if (mode === "selected") return state.plots.filter((p) => sessions.includes(p.session));
+  return state.plots;
+}
+
+export function setPlotsFilter(mode, sessions = state.plotsFilter.sessions) {
+  const known = new Set(plotSessions().map((s) => s.id));
+  state.plotsFilter = { mode, sessions: sessions.filter((id) => known.has(id)) };
+  applyPlotsFilter();
+}
+
+export function applyPlotsFilter() {
+  const sessions = plotSessions();
+  const known = new Set(sessions.map((s) => s.id));
+  const filter = state.plotsFilter;
+  filter.sessions = filter.sessions.filter((id) => known.has(id));
+
+  elements.plotsFilterCurrent.textContent = state.currentSession ? `· ${state.currentSession}` : "";
+  elements.plotsFilterMenu.querySelectorAll("input[name=plots-filter-mode]").forEach((input) => {
+    input.checked = input.value === filter.mode;
+  });
+
+  elements.plotsFilterSessions.replaceChildren(...sessions.map((s) => {
+    const label = document.createElement("label");
+    label.className = "plots-filter-option plots-filter-session";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = s.id;
+    box.checked = filter.sessions.includes(s.id);
+    const name = document.createElement("span");
+    name.textContent = s.id + (s.id === state.currentSession ? " (current)" : "");
+    const count = document.createElement("span");
+    count.className = "plots-filter-note";
+    count.textContent = s.count;
+    label.append(box, name, count);
+    return label;
+  }));
+  if (!sessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "plots-filter-empty";
+    empty.textContent = "No sessions with figures";
+    elements.plotsFilterSessions.replaceChildren(empty);
+  }
+
+  const shown = visiblePlots();
+  elements.plotsFilterLabel.textContent = filter.mode === "current"
+    ? `Current session${state.currentSession ? ` · ${state.currentSession}` : ""}`
+    : filter.mode === "selected"
+      ? (filter.sessions.length === 1 ? filter.sessions[0] : `${filter.sessions.length} sessions`)
+      : "All sessions";
+  elements.plotsCount.textContent = shown.length;
+  renderPlotsGallery(shown, filter.mode !== "all" && state.plots.length > 0);
+}
+
+export function togglePlotsFilterMenu(open = elements.plotsFilterMenu.classList.contains("hidden")) {
+  elements.plotsFilterMenu.classList.toggle("hidden", !open);
+  elements.plotsFilterBtn.setAttribute("aria-expanded", String(open));
+}
+
+export function renderPlotsGallery(plots, filtered = false) {
   elements.plotsGrid.innerHTML = "";
   if (!plots || !plots.length) {
-    elements.plotsGrid.innerHTML = `<div class="empty-state">No figures yet. Ask the agent to probe the system and produce a plot.</div>`;
+    elements.plotsGrid.innerHTML = filtered
+      ? `<div class="empty-state">No figures match the selected sessions.</div>`
+      : `<div class="empty-state">No figures yet. Ask the agent to probe the system and produce a plot.</div>`;
     return;
   }
 

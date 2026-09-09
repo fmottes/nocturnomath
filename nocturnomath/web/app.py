@@ -275,7 +275,10 @@ def create_app(
     @app.get("/api/plots")
     async def list_plots():
         session = active_session()
-        return {"plots": session.list_plots()}
+        return {
+            "plots": session.list_plots(),
+            "current_session": session.workspace.session_id,
+        }
 
     @app.get("/api/session/notebook")
     async def download_notebook():
