@@ -121,6 +121,8 @@ def build_tools(session: "ExplorationSession"):
             environment=session.environment_record,
         )
         source_id = f"{workspace.session_id}/{probe_path.name}"
+        probe_dir = probe_path.relative_to(workspace.path).as_posix()
+        code_path = f"{probe_dir}/code.py"
         session.log_transcript(
             "probe_started", probe_id=source_id, expected=expected, code=code
         )
@@ -148,10 +150,7 @@ def build_tools(session: "ExplorationSession"):
             elif kernel_note:
                 status = "incomplete"
             workspace.finish_probe(probe_path, text, images, status, kernel_note)
-            paths = [
-                f"{probe_path.relative_to(workspace.path).as_posix()}/plot-{i}.png"
-                for i in range(1, len(images) + 1)
-            ]
+            paths = [f"{probe_dir}/plot-{i}.png" for i in range(1, len(images) + 1)]
             workspace.log_transcript(
                 "run",
                 transcript_path=transcript_path,
@@ -163,19 +162,22 @@ def build_tools(session: "ExplorationSession"):
                 execution_note=kernel_note,
                 status=status,
             )
-            return text, images, kernel_note, paths
+            return text, images, kernel_note, paths, status
 
         await session.emit(
             "probe_start",
             probe_id=source_id,
             expected=expected,
             code=code,
+            code_path=code_path,
             kernel_alive=session.kernel.is_alive(),
         )
         execution = asyncio.create_task(asyncio.to_thread(execute_and_save))
         session._probe_task = execution
         try:
-            text, images, kernel_note, plot_paths = await asyncio.shield(execution)
+            text, images, kernel_note, plot_paths, status = await asyncio.shield(
+                execution
+            )
         except asyncio.CancelledError:
             cancelled.set()
             # Preserve the worker until its output is saved, even when its caller is cancelled.
@@ -229,7 +231,11 @@ def build_tools(session: "ExplorationSession"):
             probe_id=source_id,
             expected=expected,
             code=code,
+            code_path=code_path,
             output=output,
+            text=text,
+            status=status,
+            plot_paths=plot_paths,
             plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
             plot_images=encoded_images,
         )

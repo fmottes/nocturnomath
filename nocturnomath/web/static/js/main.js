@@ -1,10 +1,10 @@
-import { elements, state } from "./state.js?v=20260909-2";
-import { initWebSocket, sendWs } from "./transport.js?v=20260909-2";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-2";
-import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-2";
-import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-2";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-2";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260909-2";
+import { elements, state } from "./state.js?v=20260909-3";
+import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-3";
+import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
+import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260909-3";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -52,7 +52,7 @@ function handleServerEvent(event) {
       break;
 
     case "probe_finish":
-      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images);
+      appendProbeFinish(event.expected, event.code, event.text ?? event.output, event.plot_urls, event.plot_images);
       loadPlots();
       break;
 
@@ -65,6 +65,10 @@ function handleServerEvent(event) {
 
     case "probe_verdict":
       appendProbeVerdict(event.text);
+      break;
+
+    case "assistant_delta":
+      appendAssistantDelta(event.text);
       break;
 
     case "assistant_text":

@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    StreamEvent,
     TextBlock,
     create_sdk_mcp_server,
 )
@@ -27,6 +28,19 @@ from .workspace import Workspace
 logger = logging.getLogger("nocturnomath")
 
 CARRY_CHAT_CONTEXT = True
+
+
+def _stream_delta_text(event: StreamEvent) -> str | None:
+    """Return the incremental assistant text a stream event carries, if any."""
+    if event.parent_tool_use_id:
+        return None
+    raw = event.event or {}
+    if raw.get("type") != "content_block_delta":
+        return None
+    delta = raw.get("delta") or {}
+    if delta.get("type") != "text_delta":
+        return None
+    return delta.get("text") or None
 
 
 class ExplorationSession:
@@ -282,6 +296,7 @@ class ExplorationSession:
             permission_mode="bypassPermissions",
             model=self.model,
             max_buffer_size=20 * 1024 * 1024,
+            include_partial_messages=True,
             # Deliberately preserve the existing SDK working-directory behavior.
             resume=self._sdk_session_id if self.carry_chat_context else None,
         )
@@ -306,7 +321,11 @@ class ExplorationSession:
                 accumulated_text = []
                 async for message in client.receive_response():
                     self._track_session_id(getattr(message, "session_id", None))
-                    if isinstance(message, AssistantMessage):
+                    if isinstance(message, StreamEvent):
+                        delta = _stream_delta_text(message)
+                        if delta:
+                            await self.emit("assistant_delta", text=delta)
+                    elif isinstance(message, AssistantMessage):
                         for block in message.content:
                             if isinstance(block, TextBlock):
                                 accumulated_text.append(block.text)

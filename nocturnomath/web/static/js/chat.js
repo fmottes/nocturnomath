@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js?v=20260909-2";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260909-2";
-import { openLightbox } from "./ui.js?v=20260909-2";
+import { elements, state } from "./state.js?v=20260909-3";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260909-3";
+import { openLightbox } from "./ui.js?v=20260909-3";
 
 // ============================================================================
 // Chat UI Rendering
@@ -33,33 +33,54 @@ export function appendUserMessage(text, timeLabel) {
   scrollChatToBottom();
 }
 
-export function appendAssistantChunk(text, timeLabel) {
-  if (!state.currentAssistantBubble) {
-    const bubble = document.createElement("div");
-    bubble.className = "chat-bubble agent";
+function openAssistantBubble(timeLabel) {
+  if (state.currentAssistantBubble) return state.currentAssistantBubble;
 
-    const meta = document.createElement("div");
-    meta.className = "bubble-meta";
-    meta.textContent = `Agent • ${timeLabel || nowLabel()}`;
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble agent";
 
-    const body = document.createElement("div");
-    body.className = "bubble-body markdown-body";
+  const meta = document.createElement("div");
+  meta.className = "bubble-meta";
+  meta.textContent = `Agent • ${timeLabel || nowLabel()}`;
 
-    bubble.appendChild(meta);
-    bubble.appendChild(body);
-    elements.chatMessages.appendChild(bubble);
+  const body = document.createElement("div");
+  body.className = "bubble-body markdown-body";
 
-    state.currentAssistantBubble = {
-      container: bubble,
-      body: body,
-      rawText: "",
-    };
-  }
+  bubble.appendChild(meta);
+  bubble.appendChild(body);
+  elements.chatMessages.appendChild(bubble);
 
-  state.currentAssistantBubble.rawText += (state.currentAssistantBubble.rawText ? "\n\n" : "") + text;
-  state.currentAssistantBubble.body.innerHTML = renderMarkdown(state.currentAssistantBubble.rawText);
-  highlightBlocks(state.currentAssistantBubble.body);
+  state.currentAssistantBubble = {
+    container: bubble,
+    body: body,
+    rawText: "",
+    streamText: "",
+  };
+  return state.currentAssistantBubble;
+}
+
+function renderAssistantBubble(bubble) {
+  const separator = bubble.rawText && bubble.streamText ? "\n\n" : "";
+  bubble.body.innerHTML = renderMarkdown(bubble.rawText + separator + bubble.streamText);
+  highlightBlocks(bubble.body);
   scrollChatToBottom();
+}
+
+// Live streaming: the chunk extends the block currently being written, which
+// assistant_text later replaces with its final form.
+export function appendAssistantDelta(text) {
+  const bubble = openAssistantBubble();
+  bubble.streamText += text;
+  renderAssistantBubble(bubble);
+}
+
+export function appendAssistantChunk(text, timeLabel) {
+  const bubble = openAssistantBubble(timeLabel);
+  // The completed block is authoritative: drop whatever was streamed for it
+  // rather than appending, so streamed text is never duplicated.
+  bubble.streamText = "";
+  bubble.rawText += (bubble.rawText ? "\n\n" : "") + text;
+  renderAssistantBubble(bubble);
 }
 
 export function finalizeAssistantTurn() {
