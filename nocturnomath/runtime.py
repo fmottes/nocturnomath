@@ -9,6 +9,7 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from .auth import AuthMethod, ClaudeAuth
 from .session import ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
@@ -29,8 +30,10 @@ class Runtime:
         image_cap: int = 2,
         navigator_root: Path | str = ".",
         session_factory: Callable[..., ExplorationSession] = ExplorationSession,
+        auth: ClaudeAuth | None = None,
     ):
         self.session = session
+        self.auth = session.auth if session else (auth or ClaudeAuth.from_environment())
         self.model = session.model if session else model
         self.models = []
         self.model_labels = {}
@@ -51,14 +54,16 @@ class Runtime:
         self._started = True
         self._subscribe_to_session()
 
-    async def discover_models(self):
+    async def discover_models(self) -> bool:
         """Read the CLI's model catalog without sending an inference request."""
         self.models = []
         self.model_labels = {}
         try:
             async with asyncio.timeout(15):
                 async with ClaudeSDKClient(
-                    ClaudeAgentOptions(tools=[], mcp_servers={})
+                    ClaudeAgentOptions(
+                        tools=[], mcp_servers={}, env=self.auth.sdk_env()
+                    )
                 ) as client:
                     info = await client.get_server_info()
             for model in (info or {}).get("models", []):
@@ -68,8 +73,43 @@ class Runtime:
                 if value not in self.models:
                     self.models.append(value)
                 self.model_labels[value] = model.get("resolvedModel") or value
+            return bool(self.models)
         except Exception as exc:
-            logger.warning("Could not discover Claude models: %s", exc)
+            logger.warning("Could not discover Claude models (%s)", type(exc).__name__)
+            return False
+
+    async def authenticate(
+        self, method: AuthMethod, credential: str | None = None
+    ) -> dict[str, str | bool]:
+        """Select credentials; SDK initialization is not an authentication check.
+
+        Credential validity is determined by the next inference request. Catalog
+        discovery is best-effort and must not prevent returning to automatic auth.
+        """
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        if self.session:
+            self.session.require_idle("change Claude authentication")
+        previous = self.auth
+        previous_models = self.models
+        previous_labels = self.model_labels
+        selected = ClaudeAuth.interactive(method, credential)
+        self.changing = True
+        self.auth = selected
+        try:
+            await self.discover_models()
+            if self.session and selected != previous:
+                self.session.set_auth(selected)
+            return self.auth.public()
+        except BaseException:
+            self.auth = previous
+            self.models = previous_models
+            self.model_labels = previous_labels
+            raise
+        finally:
+            self.changing = False
 
     def shutdown(self):
         self._started = False
@@ -96,6 +136,7 @@ class Runtime:
                 timeout_s=self.timeout_s,
                 image_cap=self.image_cap,
             )
+            self.session.set_auth(self.auth)
             self._subscribe_to_session()
         else:
             self.session.set_workspace(target, python)
@@ -150,6 +191,7 @@ class Runtime:
                 "markdown_files": [],
                 "plots": [],
                 "navigator_root": str(self.navigator_root),
+                "auth": self.auth.public(),
             }
         return {
             "is_open": True,
@@ -169,6 +211,7 @@ class Runtime:
             "thoughts_path": THOUGHTS_PATH,
             "markdown_files": session.list_markdown_files(),
             "plots": session.list_plots(),
+            "auth": self.auth.public(),
         }
 
     def export_notebook(self) -> tuple[str, dict[str, Any]]:

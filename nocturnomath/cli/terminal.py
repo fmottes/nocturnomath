@@ -2,11 +2,13 @@
 
 import argparse
 import asyncio
+import getpass
 import json
 import logging
-import os
 import signal
 import time
+import warnings
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -40,6 +42,11 @@ COMMANDS = [
     ("/resume", "<S001> [--kernel]", "reopen a chat, optionally replaying its probes"),
     ("/export", "[path]", "save the current chat as a Jupyter notebook"),
     ("/model", "[name]", "show the catalogue, or use a model from the next message"),
+    (
+        "/auth",
+        "[status|subscription|api-key|claude-code]",
+        "show or change Claude login",
+    ),
     ("/context", "[on|off]", "show or set whether the agent carries chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
     ("/workspace", "<path>", "open a different workspace folder"),
@@ -57,6 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def format_time(epoch_seconds: float) -> str:
     return time.strftime("%b %d %H:%M", time.localtime(epoch_seconds))
+
+
+def read_credential(prompt: str) -> str:
+    """Refuse getpass's echoed-input fallback when no secure terminal exists."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            raise ValueError(
+                "Secure input is unavailable. Use an interactive terminal or the web auth form."
+            ) from None
 
 
 class Tail:
@@ -86,11 +105,13 @@ class TerminalApp:
         console: Console | None = None,
         error_console: Console | None = None,
         python: str | None = None,
+        credential_reader: Callable[[str], str] = read_credential,
     ):
         self.runtime = runtime
         self.console = console or Console()
         self.error_console = error_console or Console(stderr=True)
         self.initial_python = python
+        self.credential_reader = credential_reader
         self.pending_model: str | None = None
         self.status = "idle"
         self.stopped = False
@@ -191,6 +212,9 @@ class TerminalApp:
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model}", style="dim")
             self.write(
+                f"Claude auth: {self.runtime.auth.public()['label']}", style="dim"
+            )
+            self.write(
                 f"next transcript: {session.transcript_path} "
                 "(created with first message)",
                 style="dim",
@@ -216,7 +240,7 @@ class TerminalApp:
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
         return (
-            f"kernel {kernel} · model {model} · context {context} · "
+            f"kernel {kernel} · model {model} · auth {self.runtime.auth.method} · context {context} · "
             f"chat {chat} · {self.status}"
         )
 
@@ -597,6 +621,40 @@ class TerminalApp:
         self.write(f"Using {argument} from the next message.")
         return True
 
+    async def _command_auth(self, argument: str) -> bool:
+        choice = argument or "status"
+        if choice == "status":
+            self.write(f"Claude authentication: {self.runtime.auth.public()['label']}")
+            self.write(
+                "Use /auth subscription, /auth api-key, or /auth claude-code to change it.",
+                style="dim",
+            )
+            return True
+        methods = {
+            "subscription": "subscription",
+            "api-key": "api_key",
+            "claude-code": "claude_code",
+        }
+        if choice not in methods:
+            self.error("Use /auth subscription, /auth api-key, or /auth claude-code.")
+            return True
+        self.require_idle("change Claude authentication")
+        method = methods[choice]
+        credential = None
+        if method != "claude_code":
+            prompt = (
+                "Claude subscription token (from `claude setup-token`): "
+                if method == "subscription"
+                else "Claude API key: "
+            )
+            credential = await asyncio.to_thread(self.credential_reader, prompt)
+        auth = await self.runtime.authenticate(method, credential)
+        self.pending_model = None
+        self.write(f"Selected {auth['label']}.")
+        self.write("Credentials will be checked on your next message.", style="dim")
+        self.check_model(self.runtime.model)
+        return True
+
     async def _command_context(self, argument: str) -> bool:
         session = self.runtime.require_session()
         if not argument:
@@ -725,11 +783,6 @@ async def run_terminal(args: argparse.Namespace):
         console=console,
         python=args.python,
     )
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        app.warn(
-            "ANTHROPIC_API_KEY is set and silently takes precedence over your Claude subscription."
-        )
-
     app.runtime.start()
     app.runtime.subscribe(app.render_event)
     try:

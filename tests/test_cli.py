@@ -1,4 +1,6 @@
+import getpass
 import json
+import warnings
 from io import StringIO
 from unittest.mock import patch
 
@@ -9,10 +11,22 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 
 from nocturnomath.cli.completion import CommandCompleter
-from nocturnomath.cli.terminal import COMMANDS, TerminalApp
+from nocturnomath.cli.terminal import COMMANDS, TerminalApp, read_credential
 from nocturnomath.cli.terminal import build_parser as terminal_parser
 from nocturnomath.cli.web import build_parser as web_parser
 from nocturnomath.runtime import Runtime
+
+
+def test_credential_prompt_refuses_echo_fallback():
+    def insecure_prompt(prompt):
+        warnings.warn("Password may be echoed", getpass.GetPassWarning)
+        pytest.fail("Must abort before reading echoed input")
+
+    with (
+        patch("nocturnomath.cli.terminal.getpass.getpass", insecure_prompt),
+        pytest.raises(ValueError, match="Secure input is unavailable"),
+    ):
+        read_credential("API key: ")
 
 
 def test_web_command_options():
@@ -315,6 +329,40 @@ async def test_model_needs_a_catalogue_and_applies_to_the_next_message(terminal)
 
 
 @pytest.mark.asyncio
+async def test_auth_command_reads_secrets_outside_command_history(terminal):
+    prompts = []
+    terminal.app.credential_reader = lambda prompt: prompts.append(prompt) or "secret"
+
+    async def discover_models():
+        terminal.runtime.models = ["sonnet"]
+        terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
+        return True
+
+    terminal.runtime.discover_models = discover_models
+    terminal.session._sdk_session_id = "old-account-session"
+
+    await terminal.run("/auth subscription")
+    output = terminal.output()
+    assert terminal.runtime.auth.method == "subscription"
+    assert terminal.runtime.auth.credential == "secret"
+    assert terminal.session._sdk_session_id is None
+    assert prompts and "setup-token" in prompts[0]
+    assert "secret" not in output
+    assert "Selected Claude subscription" in output
+    assert "checked on your next message" in output
+
+    await terminal.run("/auth status")
+    assert "Claude subscription" in terminal.output()
+
+    terminal.app.credential_reader = lambda prompt: pytest.fail(
+        "Claude Code login must not prompt for a secret"
+    )
+    await terminal.run("/auth claude-code")
+    assert terminal.runtime.auth.method == "claude_code"
+    assert "Claude Code (automatic)" in terminal.output()
+
+
+@pytest.mark.asyncio
 async def test_context_toggles_and_refuses_while_busy(terminal):
     await terminal.run("/context")
     assert "carry chat context: on" in terminal.output()
@@ -528,6 +576,12 @@ def test_completer_suggests_commands_with_their_description(completer):
 def test_completer_suggests_command_arguments(completer, terminal):
     assert [text for text, _ in complete(completer, "/context ")] == ["on", "off"]
     assert [text for text, _ in complete(completer, "/context o")] == ["on", "off"]
+    assert [text for text, _ in complete(completer, "/auth ")] == [
+        "status",
+        "subscription",
+        "api-key",
+        "claude-code",
+    ]
 
     terminal.runtime.models = ["sonnet", "opus"]
     terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}

@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20260909-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20260909-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260909-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-3";
 import { clearChat, loadSessions, replaySession } from "./history.js?v=20260909-3";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
@@ -41,6 +41,12 @@ function handleServerEvent(event) {
     case "workspace_updated":
       clearChat();
       applyWorkspace(event.workspace);
+      break;
+
+    case "auth_changed":
+      setAuthStatus(event.auth);
+      setModelCatalogue(event.models || [], event.model_labels || {});
+      appendSystemMessage(`Claude authentication changed to ${event.auth?.label || "the selected method"}.`);
       break;
 
     case "user_message":
@@ -144,6 +150,16 @@ function setupEventListeners() {
     state.followChat = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
   }, { passive: true });
   elements.btnSettings.addEventListener("click", () => elements.settingsModal.classList.remove("hidden"));
+  [elements.btnAuth, elements.btnAuthLanding, elements.btnAuthSettings].forEach((button) => {
+    button.addEventListener("click", openAuthModal);
+  });
+  elements.authMethod.addEventListener("change", updateAuthForm);
+  elements.authModalClose.addEventListener("click", closeAuthModal);
+  elements.authModalCancel.addEventListener("click", closeAuthModal);
+  elements.authModal.addEventListener("click", (event) => {
+    if (event.target === elements.authModal) closeAuthModal();
+  });
+  elements.authForm.addEventListener("submit", submitAuth);
   elements.settingsClose.addEventListener("click", () => elements.settingsModal.classList.add("hidden"));
   elements.settingsModal.addEventListener("click", (event) => {
     if (event.target === elements.settingsModal) elements.settingsModal.classList.add("hidden");
@@ -312,6 +328,68 @@ function setupEventListeners() {
 
   // Draggable Gutter / Pane Resizing
   setupGutterResize();
+}
+
+function openAuthModal() {
+  elements.authMethod.value = state.auth?.method || "claude_code";
+  elements.authCredential.value = "";
+  elements.authError.textContent = "";
+  elements.authError.classList.add("hidden");
+  updateAuthForm();
+  elements.authModal.classList.remove("hidden");
+}
+
+function closeAuthModal() {
+  if (elements.authSubmit.disabled) return;
+  elements.authCredential.value = "";
+  elements.authModal.classList.add("hidden");
+}
+
+function updateAuthForm() {
+  const method = elements.authMethod.value;
+  elements.authCredentialGroup.classList.toggle("hidden", method === "claude_code");
+  elements.authCredential.required = method !== "claude_code";
+  if (method === "subscription") {
+    elements.authCredentialLabel.textContent = "Subscription token";
+    elements.authCredential.placeholder = "Token from claude setup-token";
+    elements.authHelp.textContent = "Run `claude setup-token` in a terminal, then paste the generated token here.";
+  } else if (method === "api_key") {
+    elements.authCredentialLabel.textContent = "API key";
+    elements.authCredential.placeholder = "sk-ant-api…";
+    elements.authHelp.textContent = "Create a key in the Claude Console. API usage is billed separately from a subscription.";
+  } else {
+    elements.authHelp.textContent = "Use the existing Claude Code login or other credentials inherited by this process.";
+  }
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  elements.authSubmit.disabled = true;
+  elements.authSubmit.textContent = "Applying…";
+  elements.authError.classList.add("hidden");
+  const method = elements.authMethod.value;
+  const body = { method };
+  if (method !== "claude_code") body.credential = elements.authCredential.value;
+  try {
+    const response = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to authenticate with Claude");
+    setAuthStatus(data.auth);
+    setModelCatalogue(data.models || [], data.model_labels || {});
+    elements.authCredential.value = "";
+    elements.authModal.classList.add("hidden");
+  } catch (error) {
+    elements.authCredential.value = "";
+    elements.authError.textContent = error.message;
+    elements.authError.classList.remove("hidden");
+  } finally {
+    elements.authSubmit.disabled = false;
+    elements.authSubmit.textContent = "Use selected method";
+  }
 }
 
 function setupGutterResize() {

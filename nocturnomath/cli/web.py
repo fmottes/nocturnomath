@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 import uvicorn
@@ -31,11 +30,6 @@ def main():
     navigator_root = Path(args.path).expanduser().resolve()
     logger = logging.getLogger("nocturnomath.web")
     logger.info("Starting Nocturnomath; choose a workspace in the browser.")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        logger.warning(
-            "ANTHROPIC_API_KEY is set and silently takes precedence over your Claude subscription."
-        )
-
     url = f"http://{args.host}:{args.port}"
     app = create_app(
         browser_url=None if args.no_browser else url,

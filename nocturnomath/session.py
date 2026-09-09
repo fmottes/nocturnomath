@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
+from .auth import ClaudeAuth
 from .environment import ResearchEnvironment
 from .kernel import Kernel
 from .prompt import SYSTEM_PROMPT
@@ -54,11 +55,13 @@ class ExplorationSession:
         image_cap: int = 2,
         carry_chat_context: bool = CARRY_CHAT_CONTEXT,
         python: str | None = None,
+        auth: ClaudeAuth | None = None,
     ):
         self.model = model
         self.timeout_s = timeout_s
         self.image_cap = image_cap
         self.carry_chat_context = carry_chat_context
+        self.auth = auth or ClaudeAuth.from_environment()
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
         self._current_client: ClaudeSDKClient | None = None
@@ -262,6 +265,14 @@ class ExplorationSession:
         logger.info(f"carry_chat_context set to {enabled}")
         return enabled
 
+    def set_auth(self, auth: ClaudeAuth):
+        """Switch credentials without allowing an SDK session to cross accounts."""
+        self.require_idle("change Claude authentication")
+        self.auth = auth
+        self._sdk_session_id = None
+        self._resume_prefix = None
+        self._session_initialized = False
+
     async def interrupt(self):
         if self.kernel.busy:
             self.kernel.interrupt()
@@ -297,6 +308,7 @@ class ExplorationSession:
             model=self.model,
             max_buffer_size=20 * 1024 * 1024,
             include_partial_messages=True,
+            env=self.auth.sdk_env(),
             # Deliberately preserve the existing SDK working-directory behavior.
             resume=self._sdk_session_id if self.carry_chat_context else None,
         )

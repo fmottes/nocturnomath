@@ -8,6 +8,7 @@ import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3"
 // ============================================================================
 export function applyWorkspace(ws) {
   document.getElementById("app-loading").classList.add("hidden");
+  setAuthStatus(ws?.auth);
   if (!ws || !ws.is_open) {
     showLanding(ws);
     return;
@@ -27,11 +28,7 @@ export function applyWorkspace(ws) {
 
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
-  const models = ws.models || [];
-  elements.modelSelect.replaceChildren(...models.map((model) => new Option(ws.model_labels?.[model] || model, model)));
-  if (!models.length) elements.modelSelect.add(new Option("No model available", ""));
-  elements.modelSelect.disabled = !models.length;
-  elements.modelSelect.value = models.includes(ws.model) ? ws.model : (models[0] || "");
+  setModelCatalogue(ws.models || [], ws.model_labels || {});
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
@@ -61,9 +58,28 @@ export function showLanding(ws) {
   document.getElementById("app-loading").classList.add("hidden");
   state.workspace = null;
   state.navigatorRoot = ws?.navigator_root || state.navigatorRoot || ".";
+  setAuthStatus(ws?.auth);
   elements.workspaceApp.classList.add("hidden");
   elements.landingScreen.classList.remove("hidden");
   renderRecentWorkspaces();
+}
+
+export function setAuthStatus(auth) {
+  if (!auth) return;
+  state.auth = auth;
+  const label = auth.label || "Claude authentication";
+  elements.btnAuth.textContent = label;
+  elements.btnAuthLanding.textContent = label;
+  elements.authSummary.textContent = `Current: ${label}.`;
+  elements.authCurrent.textContent = `Current: ${label}`;
+}
+
+export function setModelCatalogue(models = [], labels = {}) {
+  elements.modelSelect.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
+  if (!models.length) elements.modelSelect.add(new Option("No model available", ""));
+  elements.modelSelect.disabled = !models.length;
+  const preferred = state.workspace?.model;
+  elements.modelSelect.value = models.includes(preferred) ? preferred : (models[0] || "");
 }
 
 const RECENT_WORKSPACES_KEY = "nocturnomath.recent-workspaces";

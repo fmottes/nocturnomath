@@ -5,6 +5,8 @@ from unittest.mock import patch
 import pytest
 from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock
 
+from nocturnomath.auth import ClaudeAuth
+
 
 def stream_event(delta, parent_tool_use_id=None):
     return StreamEvent(
@@ -78,6 +80,20 @@ async def test_query_streams_text_tracks_context_and_logs(session):
     assert [record["text"] for record in records if record["kind"] == "agent"] == [
         "answer"
     ]
+
+
+@pytest.mark.asyncio
+async def test_query_passes_selected_authentication_only_to_the_sdk(session):
+    session.set_auth(ClaudeAuth.interactive("api_key", "top-secret-key"))
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("question")
+
+    options = FakeClient.options_used[-1]
+    assert options.env["ANTHROPIC_API_KEY"] == "top-secret-key"
+    assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert options.env["ANTHROPIC_AUTH_TOKEN"] == ""
+    transcript = session.transcript_path.read_text()
+    assert "top-secret-key" not in transcript
 
 
 @pytest.mark.asyncio

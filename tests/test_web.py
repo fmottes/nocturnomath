@@ -36,6 +36,63 @@ def test_startup_discovers_models_without_querying(sdk_model_catalog):
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
 
 
+def test_authentication_can_be_changed_before_opening_a_workspace(
+    sdk_model_catalog,
+):
+    with (
+        TestClient(create_app()) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        response = client.post(
+            "/api/auth",
+            json={"method": "subscription", "credential": "oauth-secret"},
+        )
+        event = websocket.receive_json()
+
+        assert response.status_code == 200
+        assert response.json()["auth"]["method"] == "subscription"
+        assert response.json()["models"] == ["sonnet"]
+        assert "oauth-secret" not in response.text
+        assert event["type"] == "auth_changed"
+        assert event["auth"]["method"] == "subscription"
+        assert "oauth-secret" not in repr(event)
+
+        options = sdk_model_catalog.call_args.args[0]
+        assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
+        assert options.env["ANTHROPIC_API_KEY"] == ""
+
+
+def test_authentication_rejects_missing_secrets_and_foreign_origins():
+    with TestClient(create_app()) as client:
+        missing = client.post("/api/auth", json={"method": "api_key"})
+        assert missing.status_code == 400
+        assert "API key" in missing.json()["detail"]
+
+        foreign = client.post(
+            "/api/auth",
+            json={"method": "api_key", "credential": "secret"},
+            headers={"Origin": "https://elsewhere.example"},
+        )
+        assert foreign.status_code == 403
+
+        for body in (
+            {"method": "secret-invalid-method", "credential": "secret"},
+            {"method": "api_key", "credential": {"key": "secret"}},
+        ):
+            invalid = client.post("/api/auth", json=body)
+            assert invalid.status_code == 422
+            assert "secret" not in invalid.text
+
+
+def test_authentication_ui_is_served_without_embedding_credentials():
+    with TestClient(create_app()) as client:
+        page = client.get("/").text
+        assert 'id="btn-auth-landing"' in page
+        assert 'id="auth-modal"' in page
+        assert 'type="password"' in page
+
+
 def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
     sdk_model_catalog.return_value.__aenter__.side_effect = RuntimeError(
         "SDK unavailable"
@@ -287,6 +344,13 @@ def test_busy_http_mutations_return_conflict(session):
     with TestClient(app) as client:
         assert client.post("/api/kernel/restart").status_code == 409
         assert client.post("/api/session/new").status_code == 409
+        assert (
+            client.post(
+                "/api/auth",
+                json={"method": "api_key", "credential": "secret"},
+            ).status_code
+            == 409
+        )
         assert (
             client.post(
                 "/api/workspace", json={"path": str(session.workspace_path / "other")}

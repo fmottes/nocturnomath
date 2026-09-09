@@ -9,6 +9,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool with a 
   - **Right Half**: Live-rendered Markdown reader (auto-syncing `evidence.md`, `thoughts.md`, reports, and other markdown docs) and figures gallery.
   - **Draggable Gutter**: Easily resize the split panes to focus on chat or document reading.
   - **Workspace Picker**: The web app opens on a landing page with a visual folder navigator. It does not start a kernel or create workspace files until you open a folder.
+- **Explicit Claude Login**: Choose a Claude subscription token, a Claude API key, or an existing Claude Code login from either interface. Credentials are passed directly to each Agent SDK client and kept only in memory.
 - **Terminal Client**: The same runtime without a browser: multi-line input with history and completion, a state toolbar and a progress spinner, replies streamed as Markdown, compact probe cards that link to the saved code and cap the output, and slash commands covering history, resume, notebook export, model switching, context, environment, workspace, documents, and plots.
 
 ## Quick Start
@@ -47,8 +48,36 @@ uv run nocturnomath --path /path/to/project
 - `--host`: Host to bind server to (default: `127.0.0.1`)
 - `--no-browser`: Do not automatically open the browser on startup
 
-If `ANTHROPIC_API_KEY` is set it silently takes precedence over your Claude
-subscription. Both commands warn about this at startup and continue.
+### Claude authentication
+
+By default, Nocturnomath uses whatever authentication Claude Code already has,
+including its saved login and inherited environment, without changing credential
+precedence. No additional login is required if that setup works.
+
+The web app's **Claude** button is available on both the landing screen and the
+workspace header. In the terminal, use `/auth`. Both interfaces support:
+
+- **Claude subscription**: First run `claude setup-token`, then paste the resulting
+  long-lived token. Nocturnomath passes it to the Agent SDK as
+  `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Claude API key**: Paste a key created in the
+  [Claude Console](https://platform.claude.com/settings/keys). Nocturnomath passes it
+  to the Agent SDK as `ANTHROPIC_API_KEY`; API usage is billed separately from a
+  Claude subscription.
+- **Claude Code (automatic)**: Return to the default behavior, including inherited
+  environment credentials, without changing Claude Code's saved login.
+
+Manual credentials override inherited credentials and use Anthropic's API endpoint.
+Selecting a method does not verify the credential or make a billable test request;
+authentication errors are reported on the next message. Model discovery alone
+does not establish that a credential is valid. Subscription login uses a token
+from `claude setup-token`; the installed Agent SDK does not expose browser login.
+
+A credential entered in either interface is never written to browser storage, shell
+history, transcripts, or workspace files. It remains only in the running process,
+so enter it again after restarting unless you provide it through the environment.
+Changing authentication clears the SDK conversation-resume identifier but does not
+restart the research kernel or erase the visible transcript.
 
 ### 3. Terminal Mode (Alternative)
 
@@ -99,6 +128,7 @@ Recorded evidence and thoughts, verdicts, kernel restarts and interruptions, and
 | `/resume <S001> [--kernel]` | reopen a chat, optionally replaying its probes |
 | `/export [path]` | save the current chat as a Jupyter notebook |
 | `/model [name]` | show the catalogue, or use a model from the next message |
+| `/auth [status\|subscription\|api-key\|claude-code]` | show or securely change Claude authentication |
 | `/context [on\|off]` | show or set whether the agent carries chat context |
 | `/env <python>\|managed` | switch the research environment; starts a new chat |
 | `/workspace <path>` | open a different workspace folder |

@@ -7,6 +7,7 @@ import webbrowser
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import (
     BackgroundTasks,
@@ -16,10 +17,12 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from ..session import ExplorationSession
 from .runtime import WebRuntime
@@ -36,6 +39,11 @@ class WorkspaceChangeRequest(BaseModel):
 class SessionResumeRequest(BaseModel):
     id: str
     restore_kernel: bool = False
+
+
+class AuthRequest(BaseModel):
+    method: Literal["claude_code", "subscription", "api_key"]
+    credential: SecretStr | None = None
 
 
 def create_app(
@@ -84,6 +92,16 @@ def create_app(
     app.state.runtime = runtime
     app.state.request_shutdown = None
     app.state.exiting = False
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        # FastAPI's default validation response includes rejected input values.
+        if request.url.path == "/api/auth":
+            return JSONResponse(
+                status_code=422, content={"detail": "Invalid authentication request."}
+            )
+        return await request_validation_exception_handler(request, exc)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -118,6 +136,13 @@ def create_app(
                 detail=f"Cannot {action} while the agent is running a query.",
             )
 
+    def require_same_origin(request: Request, action: str):
+        origin = request.headers.get("origin")
+        if origin and origin != str(request.base_url).rstrip("/"):
+            raise HTTPException(
+                status_code=403, detail=f"{action} must be requested from this app."
+            )
+
     @app.get("/", response_class=HTMLResponse)
     async def get_index():
         index_path = STATIC_DIR / "index.html"
@@ -129,13 +154,39 @@ def create_app(
     async def get_workspace_info():
         return await workspace_snapshot()
 
+    @app.get("/api/auth")
+    async def get_auth():
+        return {
+            "auth": runtime.auth.public(),
+            "models": runtime.models,
+            "model_labels": runtime.model_labels,
+        }
+
+    @app.post("/api/auth")
+    async def set_auth(auth_request: AuthRequest, request: Request):
+        require_same_origin(request, "Authentication")
+        credential = (
+            auth_request.credential.get_secret_value()
+            if auth_request.credential is not None
+            else None
+        )
+        try:
+            auth = await runtime.authenticate(auth_request.method, credential)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        data = {
+            "auth": auth,
+            "models": runtime.models,
+            "model_labels": runtime.model_labels,
+        }
+        await runtime.broadcast("auth_changed", data)
+        return data
+
     @app.post("/api/exit")
     async def exit_service(request: Request, background_tasks: BackgroundTasks):
-        origin = request.headers.get("origin")
-        if origin and origin != str(request.base_url).rstrip("/"):
-            raise HTTPException(
-                status_code=403, detail="Exit must be requested from this app."
-            )
+        require_same_origin(request, "Exit")
         if app.state.request_shutdown is None:
             raise HTTPException(
                 status_code=503, detail="Stop this service using its launcher."

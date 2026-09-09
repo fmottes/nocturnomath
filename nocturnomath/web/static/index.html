@@ -45,7 +45,10 @@
           <h1>Nocturnomath</h1>
           <span class="brand-icon landing-brand-icon" aria-hidden="true"></span>
         </div>
-        <button class="btn btn-xs btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
+        <div class="landing-actions">
+          <button class="btn btn-xs btn-ghost" id="btn-auth-landing" type="button">Claude</button>
+          <button class="btn btn-xs btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
+        </div>
       </div>
       <button class="btn btn-primary landing-open-button" id="btn-open-workspace" type="button">
         Open a folder workspace
@@ -79,6 +82,7 @@
           <span class="status-text" id="kernel-text">Kernel ready</span>
         </div>
         <button class="btn btn-sm btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
+        <button class="btn btn-sm btn-ghost" id="btn-auth" type="button">Claude</button>
         <button class="btn btn-sm btn-ghost" id="btn-settings" type="button">Settings</button>
         <button class="btn btn-sm btn-danger-outline hidden" id="btn-interrupt" title="Interrupt running probe" type="button">
           <span>Interrupt</span>
@@ -208,6 +212,9 @@
           <button class="modal-close" id="settings-close" aria-label="Close settings" type="button">&times;</button>
         </div>
         <div class="modal-body">
+          <h4>Claude authentication</h4>
+          <p id="auth-summary" class="modal-help"></p>
+          <button class="btn btn-outline" id="btn-auth-settings" type="button">Change Claude login</button>
           <h4>Research environment</h4>
           <p id="environment-info" class="modal-help"></p>
           <form id="environment-form">
@@ -259,6 +266,43 @@
         <button class="lightbox-close" id="lightbox-close" type="button">&times;</button>
         <img id="lightbox-img" src="" alt="Enlarged plot">
         <div class="lightbox-caption" id="lightbox-caption"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="auth-modal">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3>Claude authentication</h3>
+        <button class="modal-close" id="auth-modal-close" aria-label="Close Claude authentication" type="button">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-help">
+          Claude Code's existing authentication is used automatically. Manual credentials stay in memory until the app stops and are checked on your next message.
+        </p>
+        <form id="auth-form">
+          <div class="form-group">
+            <label for="auth-method">Authentication method</label>
+            <select id="auth-method" class="form-input">
+              <option value="claude_code">Claude Code (automatic)</option>
+              <option value="subscription">Claude subscription token</option>
+              <option value="api_key">Claude API key</option>
+            </select>
+          </div>
+          <div class="form-group" id="auth-credential-group">
+            <label for="auth-credential" id="auth-credential-label">Subscription token</label>
+            <input id="auth-credential" class="form-input" type="password" autocomplete="off" spellcheck="false">
+          </div>
+          <p class="modal-help" id="auth-help"></p>
+          <p class="folder-picker-error hidden" id="auth-error" role="alert"></p>
+          <div class="modal-actions">
+            <span class="modal-help" id="auth-current"></span>
+            <div class="modal-action-buttons">
+              <button class="btn btn-ghost" id="auth-modal-cancel" type="button">Cancel</button>
+              <button class="btn btn-primary" id="auth-submit" type="submit">Use selected method</button>
+            </div>
+          </div>
+        </form>
       </div>
     </div>
   </div>

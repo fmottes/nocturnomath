@@ -73,6 +73,13 @@ class CommandCompleter(Completer):
                 ("on", "carry chat context"),
                 ("off", "start every message fresh"),
             ]
+        if name == "/auth":
+            return [
+                ("status", "show the current authentication method"),
+                ("subscription", "enter a Claude subscription token securely"),
+                ("api-key", "enter a Claude API key securely"),
+                ("claude-code", "use the existing Claude Code login"),
+            ]
         if name == "/env":
             return [("managed", "the environment prepared in the workspace")]
         session = self.runtime.session
