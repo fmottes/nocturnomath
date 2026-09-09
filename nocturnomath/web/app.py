@@ -1,6 +1,7 @@
 """FastAPI application factory for the Nocturnomath dashboard."""
 
 import asyncio
+import json
 import logging
 import webbrowser
 from collections.abc import Callable
@@ -16,7 +17,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -269,6 +270,28 @@ def create_app(
     async def list_plots():
         session = active_session()
         return {"plots": session.list_plots()}
+
+    @app.get("/api/session/notebook")
+    async def download_notebook():
+        require_idle("download the current session")
+        session = active_session()
+        if session.workspace.session_pending:
+            raise HTTPException(
+                status_code=409,
+                detail="The current session has no messages to download.",
+            )
+        try:
+            notebook = session.workspace.export_notebook(
+                session.workspace.session_id, session.environment.version
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        filename = f"nocturnomath-{session.workspace.session_id}.ipynb"
+        return Response(
+            content=json.dumps(notebook, ensure_ascii=False, indent=1) + "\n",
+            media_type="application/x-ipynb+json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.post("/api/kernel/restart")
     async def restart_kernel():

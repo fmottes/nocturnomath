@@ -33,6 +33,7 @@ export const elements = {
   contextToggle: document.getElementById("context-toggle"),
   btnNewSession: document.getElementById("btn-new-session"),
   btnHistory: document.getElementById("btn-history"),
+  btnDownloadNotebook: document.getElementById("btn-download-notebook"),
   btnSettings: document.getElementById("btn-settings"),
   settingsModal: document.getElementById("settings-modal"),
   settingsClose: document.getElementById("settings-close"),

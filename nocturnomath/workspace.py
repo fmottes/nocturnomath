@@ -1,5 +1,6 @@
 """Workspace files, notes, plots, and persisted chat history."""
 
+import base64
 import json
 import logging
 import re
@@ -335,6 +336,170 @@ class Workspace:
 
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         return self.read_transcript(self.transcript_file(session_id))
+
+    def export_notebook(
+        self, session_id: str, python_version: str | None = None
+    ) -> dict[str, Any]:
+        """Build a notebook from one saved session without rerunning its probes."""
+        records = self.load_session(session_id)
+        if not any(record.get("kind") == "user" for record in records):
+            raise ValueError("The current session has no messages to download.")
+
+        outcomes = {
+            record.get("probe_id"): record
+            for record in records
+            if record.get("kind") in ("run", "probe_failed")
+        }
+        cells: list[dict[str, Any]] = []
+        turn = 0
+        idea = 0
+        probe = 0
+        execution_count = 0
+        pending_agent: list[str] = []
+
+        def markdown(source: str, kind: str, **metadata):
+            cells.append(
+                {
+                    "cell_type": "markdown",
+                    "id": f"cell-{len(cells) + 1}",
+                    "metadata": {"nocturnomath": {"kind": kind, **metadata}},
+                    "source": source,
+                }
+            )
+
+        def flush_agent():
+            nonlocal idea
+            if not pending_agent:
+                return
+            idea += 1
+            body = "\n\n".join(pending_agent)
+            pending_agent.clear()
+            markdown(f"## Idea {turn}.{idea}\n\n{body}", "agent", turn=turn)
+
+        for record in records:
+            kind = record.get("kind")
+            if kind == "agent":
+                text = record.get("text")
+                if isinstance(text, str) and text.strip():
+                    pending_agent.append(text)
+                continue
+            if kind in ("meta", "kernel_started", "resumed"):
+                continue
+            flush_agent()
+
+            if kind == "user":
+                turn += 1
+                idea = 0
+                probe = 0
+                markdown(
+                    f"# User message {turn}\n\n{record.get('text', '')}",
+                    "user",
+                    turn=turn,
+                    time=record.get("t"),
+                )
+            elif kind == "probe_started":
+                probe += 1
+                probe_id = record.get("probe_id", f"probe-{probe}")
+                expected = record.get("expected", "")
+                markdown(
+                    f"### Probe {turn}.{probe}\n\n**Prediction:** {expected}",
+                    "probe",
+                    probe_id=probe_id,
+                )
+                outcome = outcomes.get(probe_id, {})
+                outputs = self._notebook_outputs(outcome)
+                execution_count += 1
+                cells.append(
+                    {
+                        "cell_type": "code",
+                        "execution_count": execution_count,
+                        "id": f"cell-{len(cells) + 1}",
+                        "metadata": {
+                            "nocturnomath": {
+                                "kind": "probe_code",
+                                "probe_id": probe_id,
+                                "status": outcome.get("status")
+                                or (
+                                    "completed"
+                                    if outcome.get("kind") == "run"
+                                    else "no recorded outcome"
+                                ),
+                            }
+                        },
+                        "outputs": outputs,
+                        "source": record.get("code", ""),
+                    }
+                )
+            elif kind == "verdict":
+                markdown(
+                    f"**Verdict:** {record.get('text', '')}",
+                    "verdict",
+                    probe_id=record.get("probe_id"),
+                )
+            elif kind in ("evidence", "thought", "evidence_struck"):
+                label = kind.replace("_", " ").title()
+                entry_id = record.get("entry_id", "")
+                markdown(
+                    f"> **{label} {entry_id}:** {record.get('text', '')}",
+                    kind,
+                    entry_id=entry_id,
+                )
+
+        flush_agent()
+        language_info = {"name": "python"}
+        if python_version:
+            language_info["version"] = python_version
+        return {
+            "cells": cells,
+            "metadata": {
+                "kernelspec": {
+                    "display_name": "Python 3",
+                    "language": "python",
+                    "name": "python3",
+                },
+                "language_info": language_info,
+                "nocturnomath": {"session_id": session_id},
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+
+    def _notebook_outputs(self, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+        outputs = []
+        text = outcome.get("output") or outcome.get("text")
+        if text:
+            outputs.append(
+                {
+                    "name": "stderr"
+                    if outcome.get("kind") == "probe_failed"
+                    else "stdout",
+                    "output_type": "stream",
+                    "text": text,
+                }
+            )
+        for relative in outcome.get("images", []):
+            try:
+                image = self.asset_file(relative).read_bytes()
+            except (FileNotFoundError, ValueError):
+                outputs.append(
+                    {
+                        "name": "stderr",
+                        "output_type": "stream",
+                        "text": f"[Recorded figure missing: {relative}]",
+                    }
+                )
+                continue
+            outputs.append(
+                {
+                    "data": {"image/png": base64.b64encode(image).decode("ascii")},
+                    "metadata": {},
+                    "output_type": "display_data",
+                }
+            )
+        note = outcome.get("execution_note")
+        if note:
+            outputs.append({"name": "stderr", "output_type": "stream", "text": note})
+        return outputs
 
     @staticmethod
     def recap(records: list[dict[str, Any]], max_chars: int = 8000) -> str:

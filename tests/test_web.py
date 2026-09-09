@@ -140,6 +140,27 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
         )
 
 
+def test_current_session_downloads_as_notebook(session):
+    app = create_app(session)
+    with TestClient(app) as client:
+        assert client.get("/api/session/notebook").status_code == 409
+        session.log_transcript("user", text="question")
+        session.log_transcript(
+            "probe_started", probe_id="S001/P001", expected="3", code="print(3)"
+        )
+        session.log_transcript(
+            "run", probe_id="S001/P001", output="3\n", images=[]
+        )
+        response = client.get("/api/session/notebook")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ipynb+json")
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="nocturnomath-S001.ipynb"'
+    )
+    assert response.json()["cells"][1]["source"] == "### Probe 1.1\n\n**Prediction:** 3"
+
+
 def test_websocket_event_contract(session):
     session.query = AsyncMock()
     app = create_app(session)

@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 from nocturnomath.workspace import Workspace
@@ -81,3 +83,44 @@ def test_recap_preserves_interpretation_and_corrections():
     assert "expecting: positive" in recap
     assert "Does not distinguish" in recap
     assert "evidence_struck E001" in recap
+
+
+def test_notebook_export_structures_turns_and_embeds_probe_results(tmp_path):
+    workspace = Workspace(tmp_path)
+    workspace.log_transcript("user", text="What does the system do?")
+    workspace.log_transcript(
+        "agent", text="A direct measurement should distinguish it."
+    )
+    probe = workspace.start_probe("print(3)", "The value is 3.", "test")
+    workspace.finish_probe(probe, "3\n", [b"png-data"], "completed", None)
+    workspace.log_transcript(
+        "probe_started",
+        probe_id="S001/P001",
+        expected="The value is 3.",
+        code="print(3)",
+    )
+    workspace.log_transcript(
+        "run",
+        probe_id="S001/P001",
+        output="3\n",
+        images=[".nocturnomath/sessions/S001/probes/P001/plot-1.png"],
+        status="completed",
+    )
+    workspace.log_transcript("verdict", text="The prediction held.")
+
+    notebook = workspace.export_notebook("S001", "3.12")
+
+    assert notebook["nbformat"] == 4
+    assert notebook["metadata"]["language_info"]["version"] == "3.12"
+    assert len({cell["id"] for cell in notebook["cells"]}) == len(notebook["cells"])
+    assert notebook["cells"][0]["source"].startswith("# User message 1")
+    assert notebook["cells"][1]["source"].startswith("## Idea 1.1")
+    assert notebook["cells"][2]["source"].startswith("### Probe 1.1")
+    code = notebook["cells"][3]
+    assert code["source"] == "print(3)"
+    assert code["outputs"][0]["text"] == "3\n"
+    assert (
+        code["outputs"][1]["data"]["image/png"]
+        == base64.b64encode(b"png-data").decode()
+    )
+    assert notebook["cells"][4]["source"] == "**Verdict:** The prediction held."
