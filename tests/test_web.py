@@ -10,7 +10,16 @@ from xprober.web import create_app
 def sdk_model_catalog():
     with patch("xprober.web.runtime.ClaudeSDKClient") as sdk:
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-            return_value={"models": [{"value": "sonnet", "displayName": "Sonnet"}]}
+            return_value={
+                "models": [
+                    {"value": "default", "displayName": "Default (recommended)"},
+                    {
+                        "value": "sonnet",
+                        "displayName": "Sonnet",
+                        "resolvedModel": "claude-sonnet-5",
+                    },
+                ]
+            }
         )
         yield sdk
 
@@ -18,17 +27,17 @@ def sdk_model_catalog():
 def test_startup_discovers_models_without_querying(sdk_model_catalog):
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
-        assert snapshot["models"] == ["claude-opus-5", "sonnet"]
-        assert snapshot["model_labels"]["sonnet"] == "Sonnet"
+        assert snapshot["models"] == ["sonnet"]
+        assert snapshot["model_labels"]["sonnet"] == "claude-sonnet-5"
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
 
 
-def test_model_discovery_failure_keeps_configured_model(sdk_model_catalog):
+def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
     sdk_model_catalog.return_value.__aenter__.side_effect = RuntimeError(
         "SDK unavailable"
     )
     with TestClient(create_app(model="custom-model")) as client:
-        assert client.get("/api/workspace").json()["models"] == ["custom-model"]
+        assert client.get("/api/workspace").json()["models"] == []
 
 
 class NoopKernel:

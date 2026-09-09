@@ -29,8 +29,8 @@ class WebRuntime:
     ):
         self.session = session
         self.model = session.model if session else model
-        self.models = [self.model]
-        self.model_labels = {self.model: self.model}
+        self.models = []
+        self.model_labels = {}
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
         self.navigator_root = Path(navigator_root).expanduser().resolve()
@@ -49,6 +49,8 @@ class WebRuntime:
 
     async def discover_models(self):
         """Read the CLI's model catalog without sending an inference request."""
+        self.models = []
+        self.model_labels = {}
         try:
             async with asyncio.timeout(15):
                 async with ClaudeSDKClient(
@@ -57,15 +59,13 @@ class WebRuntime:
                     info = await client.get_server_info()
             for model in (info or {}).get("models", []):
                 value = model.get("value")
-                if not isinstance(value, str) or not value:
+                if not isinstance(value, str) or not value or value == "default":
                     continue
                 if value not in self.models:
                     self.models.append(value)
-                self.model_labels[value] = model.get("displayName") or value
+                self.model_labels[value] = model.get("resolvedModel") or value
         except Exception as exc:
-            logger.warning(
-                "Could not discover Claude models; retaining configured model: %s", exc
-            )
+            logger.warning("Could not discover Claude models: %s", exc)
 
     def shutdown(self):
         self._started = False

@@ -23,9 +23,11 @@ export function applyWorkspace(ws) {
 
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
-  const models = [...new Set([ws.model, ...(ws.models || [])].filter(Boolean))];
+  const models = ws.models || [];
   elements.modelSelect.replaceChildren(...models.map((model) => new Option(ws.model_labels?.[model] || model, model)));
-  elements.modelSelect.value = ws.model;
+  if (!models.length) elements.modelSelect.add(new Option("No model available", ""));
+  elements.modelSelect.disabled = !models.length;
+  elements.modelSelect.value = models.includes(ws.model) ? ws.model : (models[0] || "");
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");

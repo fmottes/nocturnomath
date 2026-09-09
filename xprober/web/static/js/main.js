@@ -166,6 +166,7 @@ function setupEventListeners() {
     e.preventDefault();
     const text = elements.promptInput.value.trim();
     if (!text) return;
+    if (!elements.modelSelect.value) return;
 
     sendWs("query", { text, model: elements.modelSelect.value });
     elements.promptInput.value = "";

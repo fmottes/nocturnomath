@@ -103,8 +103,9 @@ Starting a new session allocates a new `S` folder and restarts the kernel; resum
 In the web interface, Evidence and Thoughts open the scientific record directly;
 Documents lists workspace files. Documents refresh automatically. The model selector
 above the composer applies to the next message and keeps the current conversation.
-Its options come from the Claude SDK at service startup, with the configured model
-retained if discovery is unavailable. Discovery does not send a model prompt.
+Its options come from the Claude SDK at service startup, using resolved model IDs
+as labels and excluding Default. If discovery is unavailable, the selector shows
+No model available. Discovery does not send a model prompt.
 Keep context is on by default and can be changed under Settings → Experimental.
 Exit stops the service and attempts to close the tab; browsers that block tab closing
 show a message instead.

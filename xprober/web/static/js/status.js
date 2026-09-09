@@ -27,7 +27,7 @@ export function updateAgentStatus(status) {
     elements.btnInterrupt.classList.remove("hidden");
   } else {
     elements.chatStatusBadge.style.color = "var(--ink-soft)";
-    elements.btnSend.disabled = false;
+    elements.btnSend.disabled = !elements.modelSelect.value;
     elements.btnInterrupt.classList.add("hidden");
   }
 }
