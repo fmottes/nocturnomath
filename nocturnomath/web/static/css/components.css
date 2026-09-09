@@ -4,16 +4,18 @@
 .app-header {
   height: var(--header-height);
   flex-shrink: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
   padding: 0 18px;
   border-bottom: 1px solid var(--rule-strong);
   z-index: 10;
 }
 
-.header-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+.header-brand { grid-column: 2; }
 
 .brand-title {
   font-family: var(--font-hand);
@@ -29,7 +31,12 @@
   letter-spacing: 0.01em;
 }
 
-.header-center { flex: 1; display: flex; justify-content: center; max-width: 560px; }
+.workspace-label {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
 
 .workspace-pill {
   display: flex;
@@ -67,7 +74,7 @@
   white-space: nowrap;
 }
 
-.header-right { display: flex; align-items: center; gap: 6px; }
+.header-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
 
 .status-indicator {
   display: flex;

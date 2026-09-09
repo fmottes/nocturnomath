@@ -1,7 +1,7 @@
 import { elements, state } from "./state.js?v=20260906-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20260906-1";
 import { applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setCarryContext, selectViewerTab, refreshDocuments } from "./workspace.js?v=20260906-1";
-import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260906-1";
+import { appendAssistantChunk, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260909-1";
 import { clearChat, loadSessions, replaySession } from "./history.js?v=20260906-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260906-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260906-1";

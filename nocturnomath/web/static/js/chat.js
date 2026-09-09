@@ -141,11 +141,23 @@ export function appendProbeFinish(expected, code, output, plotUrls, plotImages) 
     state.currentProbeCard.statusBadge.style.color = "var(--ok)";
   }
 
-  // Add output box
+  // Keep text output available without letting long probe logs dominate the chat.
+  const outputDetails = document.createElement("details");
+  outputDetails.className = "probe-output-details";
+  outputDetails.open = false;
+
+  const outputText = output || "(No text output)";
+  const outputSummary = document.createElement("summary");
+  outputSummary.className = "probe-output-summary";
+  outputSummary.textContent = "Text Output";
+
   const outBox = document.createElement("pre");
   outBox.className = "probe-output-box";
-  outBox.textContent = output || "(No text output)";
-  card.appendChild(outBox);
+  outBox.textContent = outputText;
+
+  outputDetails.appendChild(outputSummary);
+  outputDetails.appendChild(outBox);
+  card.appendChild(outputDetails);
 
   // Add inline plots if any
   if (plotUrls && plotUrls.length > 0) {

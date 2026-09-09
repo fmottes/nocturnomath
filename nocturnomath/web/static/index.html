@@ -54,13 +54,15 @@
     <!-- Top Navigation Header -->
     <header class="app-header" id="app-header">
       <div class="header-left">
-        <div class="brand">
-          <span class="brand-title">Nocturnomath</span>
-        </div>
+        <span class="workspace-label">Workspace:</span>
         <button type="button" class="workspace-pill" id="workspace-pill" title="Change workspace folder">
           <span class="workspace-path" id="workspace-path">Loading workspace...</span>
           <span aria-hidden="true">▾</span>
         </button>
+      </div>
+
+      <div class="brand header-brand">
+        <span class="brand-title">Nocturnomath</span>
       </div>
 
       <!-- Controls & Status -->
@@ -89,6 +91,7 @@
           <div class="chat-header-actions">
             <button class="btn btn-xs btn-ghost" id="btn-new-session" title="Start a new session with a fresh kernel" type="button">New session</button>
             <button class="btn btn-xs btn-ghost" id="btn-history" type="button">History</button>
+            <span class="chat-status-separator" aria-hidden="true"></span>
             <span class="badge" id="chat-status-badge">Idle</span>
           </div>
         </div>
@@ -284,7 +287,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260908-1"></script>
+  <script type="module" src="/static/js/main.js?v=20260909-1"></script>
   <script src="/static/js/sketch.js?v=20260908-1"></script>
 </body>
 </html>

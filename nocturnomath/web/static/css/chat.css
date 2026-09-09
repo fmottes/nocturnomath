@@ -28,6 +28,13 @@
   gap: 5px;
 }
 
+.chat-status-separator {
+  width: 1px;
+  height: 16px;
+  margin: 0 3px;
+  background: var(--rule);
+}
+
 #context-control {
   padding-right: 12px;
   border-right: 1px solid var(--rule);
@@ -206,8 +213,10 @@
   margin-right: 6px;
 }
 
-.probe-code-details { border: 1px solid var(--rule); background: var(--sheet-solid); }
-.probe-code-summary {
+.probe-code-details,
+.probe-output-details { border: 1px solid var(--rule); background: var(--sheet-solid); }
+.probe-code-summary,
+.probe-output-summary {
   padding: 6px 10px;
   font-family: var(--font-mono);
   font-size: 0.71875rem;
@@ -215,7 +224,8 @@
   cursor: pointer;
   user-select: none;
 }
-.probe-code-summary:hover { color: var(--blue); }
+.probe-code-summary:hover,
+.probe-output-summary:hover { color: var(--blue); }
 .probe-code-block {
   padding: 10px 12px;
   border-top: 1px solid var(--rule);
@@ -237,7 +247,7 @@
   word-break: break-word;
   color: var(--ink-soft);
   background: var(--sheet-solid);
-  border: 1px solid var(--rule);
+  border-top: 1px solid var(--rule);
 }
 
 /* Figures are never hand-drawn: precise frame, no tilt, no scaling */
