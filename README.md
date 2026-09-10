@@ -4,7 +4,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It com
 
 ## Features
 
-- **Web dashboard:** Chat with Claude beside a live Markdown reader and figures gallery. Probe cards show predictions, code, output, plots, and kernel status.
+- **Web dashboard:** Chat with Claude beside a live Markdown reader and a figures gallery that can be filtered by session. Probe cards show predictions, code, output, plots, and kernel status.
 - **Terminal client:** Stream Markdown replies, run the same probes and commands, and view compact kernel, model, context, and session status.
 - **Persistent research record:** Save session transcripts, probe artifacts, numbered evidence, interpretations, and notebook exports inside each workspace.
 - **Flexible environments:** Use an automatically managed Python environment or select an existing interpreter.
@@ -108,7 +108,7 @@ Evidence links to its probe output or plots, code, and run metadata. The web rea
 
 Entries keep stable wording and IDs. Invalid evidence is struck in full, and its correction becomes a new observation. Corrected thoughts are also appended and linked to the superseded entries. Struck entries remain part of the citable history but are not valid support for conclusions.
 
-Evidence and thoughts span sessions. A new session starts an empty chat and fresh kernel; its `S` folder appears when the first message is accepted. Resuming a session appends to its existing record but normally starts with empty Python memory. Choose resume-with-kernel in the web app, or `/resume S001 --kernel`, to replay stored probes. Reloading the current session preserves its live kernel.
+Evidence and thoughts span sessions. A new session starts an empty chat and fresh kernel. Resuming a session appends to its existing record but normally starts with empty Python memory. Choose resume-with-kernel in the web app, or `/resume S001 --kernel`, to replay stored probes. Refreshing the browser reconnects to the same session and restores its chat.
 
 Probe IDs are session-local. Code and predictions are saved before execution; text output and plots are saved afterward, including partial output from interruptions. `probe.json` records the model, timestamps, prediction, kernel, and outcome. These are execution artifacts, not input snapshots or a fully reproducible kernel state.
 
