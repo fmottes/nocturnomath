@@ -42,7 +42,12 @@
     <div class="landing-card">
       <div class="landing-heading">
         <div class="landing-brand">
-          <h1>Nocturnomath</h1>
+          <div class="landing-title">
+            <h1>Nocturnomath</h1>
+            <button class="landing-about-link" id="btn-about-toggle" type="button" aria-expanded="false" aria-controls="about-panel">
+              About Nocturnomaths
+            </button>
+          </div>
           <span class="brand-icon landing-brand-icon" aria-hidden="true"></span>
         </div>
         <div class="landing-actions">
@@ -57,6 +62,49 @@
       <p id="recent-workspace-error" class="modal-help" role="alert"></p>
     </div>
     <p id="recent-workspace-loading" class="landing-loading hidden" role="status">Loading…</p>
+    <aside class="about-panel" id="about-panel" aria-labelledby="about-title" hidden>
+      <div class="about-panel-head">
+        <span class="about-panel-kicker">About</span>
+        <button class="btn btn-xs btn-ghost" id="btn-about-close" type="button">Close</button>
+      </div>
+      <h2 id="about-title">Nocturnomaths</h2>
+      <p class="about-lead">
+        Nocturnomaths are an exceedingly rare Zamonian life form and, by common consent as well as their
+        own, the most intelligent on the continent. The defining feature of the species is the possession
+        of several brains. Only the first is housed inside the skull: the others are located on the outside
+        of the head as prominent bulges, so that the brain count of a given Nocturnomath can usually be
+        established at a glance. The brains operate simultaneously and independently of one another, and
+        the resulting activity is audible as a faint but persistent hum. Several lines of thought can thus
+        be pursued at once, and a Nocturnomath is able to solve a problem, doubt the solution, and draft a
+        lecture on the doubt in the same instant. Nocturnomaths are nocturnal by habit and preference,
+        subsist chiefly on knowledge, and are prone to lecturing whether or not an audience is present.
+      </p>
+      <p>
+        The most celebrated Nocturnomath is Professor Abdullah Nightingale. Nightingale has seven brains and
+        holds this to be the correct number. He is the director of the Nocturnal Academy, the discoverer of
+        the Gloomberg darkness, and the inventor of a great many devices whose purpose has yet to be
+        established. His pupils included Captain Bluebear, who graduated with his head full and applied the contents over the better part of thirteen and a half lives.
+      </p>
+      <p>
+        A second Nocturnomath of importance is Dr Oztafan Kolibril, three brains, whose field is the very
+        small. He constructed the apparatus by which Volzotan Smyke was reduced in size and sent on a
+        voyage through his own body, leading to the first observation of the Non-Existent Teenies. Kolibril
+        is also credited with the education of Rumo, a young Wolperting of exceptional fighting ability and no
+        prior schooling, on whom he conferred the ability to read and write, together with a substantial body
+        of general knowledge, by having him insert a finger into one of the doctor's ears.
+      </p>
+      <h3>References</h3>
+      <ol class="about-references">
+        <li>
+          <a href="https://en.wikipedia.org/wiki/The_13%C2%BD_Lives_of_Captain_Bluebear" target="_blank" rel="noopener noreferrer">
+            <em>The 13½ Lives of Captain Bluebear</em></a>, Wikipedia.
+        </li>
+        <li>
+          <a href="https://en.wikipedia.org/wiki/Rumo_%26_His_Miraculous_Adventures" target="_blank" rel="noopener noreferrer">
+            <em>Rumo &amp; His Miraculous Adventures</em></a>, Wikipedia.
+        </li>
+      </ol>
+    </aside>
   </section>
 
   <div class="app-container hidden" id="workspace-app">

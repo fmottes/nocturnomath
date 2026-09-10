@@ -157,7 +157,86 @@
 .landing-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .landing-brand { display: flex; align-items: center; gap: 12px; }
 .landing-brand-icon { width: 56px; height: 56px; flex-basis: 56px; }
+.landing-title { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.landing-about-link {
+  padding: 0;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.landing-about-link:hover,
+.landing-about-link:focus-visible,
+.landing-about-link[aria-expanded="true"] { color: var(--blue); outline: 0; }
 .landing-open-button { margin-top: 24px; }
+
+/* About panel: the landing screen splits into card (left) and entry (right). */
+.landing-screen.about-open {
+  flex-direction: row;
+  align-items: stretch;
+  justify-content: center;
+  gap: 24px;
+}
+.landing-screen.about-open .landing-card {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 820px;
+  align-self: center;
+}
+.landing-screen.about-open .landing-loading { display: none; }
+.about-panel {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 560px;
+  max-height: 100%;
+  padding: clamp(20px, 4vw, 36px);
+  overflow-y: auto;
+  color: var(--ink);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  background: var(--sheet-solid);
+  border: 1px solid var(--rule-strong);
+}
+.about-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.about-panel-kicker {
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.about-panel h2 {
+  margin: 0 0 12px;
+  padding-bottom: 8px;
+  color: var(--blue);
+  font-family: var(--font-hand);
+  font-size: 1.75rem;
+  font-weight: 400;
+  border-bottom: 1px solid var(--rule);
+}
+.about-panel h3 {
+  margin: 18px 0 6px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.about-panel p { margin: 0 0 10px; }
+.about-lead { color: var(--ink); }
+.about-references { margin: 0; padding-left: 1.4em; color: var(--ink-soft); }
+.about-references li { margin-bottom: 4px; }
+.about-references a { color: var(--blue); }
+@media (max-width: 900px) {
+  .landing-screen.about-open { flex-direction: column; align-items: center; height: auto; min-height: 100vh; }
+  .landing-screen.about-open .landing-card,
+  .about-panel { width: min(100%, 820px); max-width: none; flex: 0 0 auto; }
+  .about-panel { max-height: none; overflow: visible; }
+}
 .recent-workspaces { margin-top: 30px; }
 .recent-workspaces:empty { display: none; }
 .recent-workspaces-label {

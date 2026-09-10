@@ -284,6 +284,13 @@ function setupEventListeners() {
 
   // Workspace Switcher Modal
   elements.btnOpenWorkspace.addEventListener("click", () => openFolderPicker("open"));
+  const setAboutOpen = (open) => {
+    elements.aboutPanel.hidden = !open;
+    elements.landingScreen.classList.toggle("about-open", open);
+    elements.btnAboutToggle.setAttribute("aria-expanded", String(open));
+  };
+  elements.btnAboutToggle.addEventListener("click", () => setAboutOpen(elements.aboutPanel.hidden));
+  elements.btnAboutClose.addEventListener("click", () => setAboutOpen(false));
   elements.workspacePill.addEventListener("click", () => openFolderPicker("change"));
   elements.modalClose.addEventListener("click", closeFolderPicker);
   elements.modalCancel.addEventListener("click", closeFolderPicker);
