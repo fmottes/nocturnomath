@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -121,7 +122,7 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert not (workspace / "notes.md").exists()
             assert not (workspace / "scratch").exists()
             assert not (workspace / ".nocturnomath").exists()
-            assert client.get("/api/files").status_code == 409
+            assert client.get("/api/documents").status_code == 409
 
             folders = client.get("/api/folders", params={"path": str(tmp_path)})
             assert folders.status_code == 200
@@ -141,11 +142,11 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert opened.json()["workspace"]["is_open"] is True
             assert (
                 opened.json()["workspace"]["evidence_path"]
-                == ".nocturnomath/notes/evidence.md"
+                == ".nocturnomath/kb/evidence.md"
             )
-            assert (workspace / ".nocturnomath" / "notes" / "evidence.md").is_file()
+            assert (workspace / ".nocturnomath" / "kb" / "evidence.md").is_file()
             assert not (workspace / ".nocturnomath" / "sessions" / "S001").exists()
-            assert (workspace / ".nocturnomath" / "notes").is_dir()
+            assert (workspace / ".nocturnomath" / "documents").is_dir()
             assert (workspace / ".nocturnomath" / "scratch").is_dir()
 
 
@@ -403,9 +404,54 @@ def test_record_citations_resolve_to_saved_artifacts_and_entries(session):
                     assert f'id="{anchor}"' in response.text
         with client.websocket_connect("/ws") as websocket:
             init = websocket.receive_json()
-            assert (
-                init["workspace"]["thoughts_path"] == ".nocturnomath/notes/thoughts.md"
-            )
+            assert init["workspace"]["thoughts_path"] == ".nocturnomath/kb/thoughts.md"
             websocket.send_json({"action": "query", "text": "/notes"})
             text = websocket.receive_json()["text"]
             assert "# Evidence" in text and "# Thoughts" in text and "<del>" in text
+
+
+def test_documents_api_creates_edits_and_selects_documents(session):
+    with TestClient(create_app(session)) as client:
+        assert client.get("/api/documents").json() == {
+            "documents": [],
+            "documents_default": True,
+        }
+
+        created = client.post(
+            "/api/documents", json={"title": "Inputs", "text": "# Inputs\n\nN = 10"}
+        )
+        assert created.status_code == 201
+        assert created.json()["name"] == "Inputs.md"
+        [document] = created.json()["documents"]
+        assert document["name"] == "Inputs.md" and document["included"] is True
+        assert (
+            client.post("/api/documents", json={"title": "Inputs"}).status_code == 409
+        )
+        assert client.post("/api/documents", json={"title": " "}).status_code == 400
+
+        read = client.get("/api/documents/Inputs.md")
+        assert read.status_code == 200
+        assert read.json()["content"] == "# Inputs\n\nN = 10\n"
+        assert client.get("/api/documents/missing.md").status_code == 404
+        assert client.get("/api/documents/..%2Fconfig.json").status_code in (400, 404)
+
+        edited = client.put(
+            "/api/documents/Inputs.md", json={"text": "# Inputs\n\nN = 20"}
+        )
+        assert edited.status_code == 200
+        assert edited.json()["content"] == "# Inputs\n\nN = 20\n"
+
+        toggled = client.post(
+            "/api/documents/Inputs.md/include", json={"included": False}
+        )
+        assert toggled.json() == {"name": "Inputs.md", "included": False}
+        assert client.get("/api/documents").json()["documents"][0]["included"] is False
+        assert client.get("/api/workspace").json()["documents"][0]["included"] is False
+
+        changed = client.post("/api/documents/default", json={"enabled": False})
+        assert changed.json()["documents_default"] is False
+        assert changed.json()["documents"][0]["included"] is False
+        config = json.loads(
+            (session.workspace_path / ".nocturnomath" / "config.json").read_text()
+        )
+        assert config["documents_default"] is False

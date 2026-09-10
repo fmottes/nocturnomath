@@ -40,6 +40,23 @@ class SessionResumeRequest(BaseModel):
     restore_kernel: bool = False
 
 
+class DocumentCreateRequest(BaseModel):
+    title: str
+    text: str = ""
+
+
+class DocumentWriteRequest(BaseModel):
+    text: str
+
+
+class DocumentIncludeRequest(BaseModel):
+    included: bool
+
+
+class DocumentsDefaultRequest(BaseModel):
+    enabled: bool
+
+
 class AuthRequest(BaseModel):
     method: Literal["claude_code", "subscription", "api_key"]
     credential: SecretStr | None = None
@@ -245,10 +262,64 @@ def create_app(
             "folders": folders,
         }
 
-    @app.get("/api/files")
-    async def list_files():
+    def documents_payload(session: ExplorationSession):
+        return {
+            "documents": session.list_documents(),
+            "documents_default": session.documents_default,
+        }
+
+    @app.get("/api/documents")
+    async def list_documents():
+        return documents_payload(active_session())
+
+    @app.post("/api/documents", status_code=201)
+    async def create_document(request: DocumentCreateRequest):
         session = active_session()
-        return {"files": session.list_markdown_files()}
+        try:
+            name = session.workspace.create_document(request.title, request.text)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"name": name, **documents_payload(session)}
+
+    @app.post("/api/documents/default")
+    async def set_documents_default(request: DocumentsDefaultRequest):
+        session = active_session()
+        session.set_documents_default(request.enabled)
+        return documents_payload(session)
+
+    @app.get("/api/documents/{name}")
+    async def read_document(name: str):
+        session = active_session()
+        try:
+            return session.workspace.read_document(name)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Document not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.put("/api/documents/{name}")
+    async def write_document(name: str, request: DocumentWriteRequest):
+        session = active_session()
+        try:
+            session.workspace.write_document(name, request.text)
+            return session.workspace.read_document(name)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Document not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/documents/{name}/include")
+    async def include_document(name: str, request: DocumentIncludeRequest):
+        session = active_session()
+        try:
+            included = session.set_document_included(name, request.included)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Document not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"name": name, "included": included}
 
     @app.get("/api/file")
     async def read_file(path: str):

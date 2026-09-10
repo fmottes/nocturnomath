@@ -79,7 +79,7 @@ The verdict is the report. Do not add a summary, a recap of what you did, or "do
 
 ## Memory
 
-The scientific record lives in .nocturnomath/notes/evidence.md and thoughts.md. Read both
+The scientific record lives in .nocturnomath/kb/evidence.md and thoughts.md. Read both
 at the start of a session. Use the record tools to change these files; never edit their
 contents through Python or file-editing tools. IDs and links are managed for you.
 
@@ -101,6 +101,11 @@ contents through Python or file-editing tools. IDs and links are managed for you
 - Struck evidence and thoughts remain citable history, but are not valid support for new
   conclusions. When citing them to explain a correction, explicitly acknowledge this.
   Check whether conclusions you use depend on invalid entries; do not silently propagate them.
+
+Messages may open with a "Documents" section: Markdown files from .nocturnomath/documents/
+that I chose as extra context (inputs, reports, calculations). Treat them as background from
+me, not as the scientific record. They are sent only when new or changed, so refer back to
+what you already saw.
 
 Probe code, raw text output, plots, and execution status are saved under
 .nocturnomath/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not

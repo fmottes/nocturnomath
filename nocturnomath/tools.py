@@ -264,7 +264,7 @@ def build_tools(session: "ExplorationSession"):
 
     @tool(
         "evidence",
-        "Append a factual observation to .nocturnomath/notes/evidence.md. Maximum 250 characters "
+        "Append a factual observation to .nocturnomath/kb/evidence.md. Maximum 250 characters "
         "of plain text, with conditions; no interpretation or citations to entries. "
         "sources is a list of saved artifacts such as S001/P001/output.txt or "
         "S001/P001/plot-1.png returned by run. Returns a stable E ID.",
@@ -291,7 +291,7 @@ def build_tools(session: "ExplorationSession"):
     @tool(
         "thought",
         "Append an interpretation, conjecture, explanation, or question to "
-        ".nocturnomath/notes/thoughts.md. Aim for one direct paragraph (80–150 words); equations "
+        ".nocturnomath/kb/thoughts.md. Aim for one direct paragraph (80–150 words); equations "
         "are welcome. Cite supporting entries as [E001] or [T001]; links are generated. "
         "replaces lists old T IDs to strike in full, or [] for a new thought. A replacement "
         "must explain the correction and retain any still-valid reasoning. Returns a stable T ID.",

@@ -165,18 +165,7 @@
             <button class="tab-btn" id="tab-plots" data-tab="plots" type="button">
               Figures <span class="badge badge-sm" id="plots-count">0</span>
             </button>
-            <button class="tab-btn" id="tab-doc" data-tab="doc" type="button">Documents</button>
-          </div>
-
-          <!-- Right: Document Actions -->
-          <div class="viewer-actions">
-            <!-- File Selector Dropdown -->
-            <div class="file-selector-wrapper hidden" id="file-selector-wrapper">
-              <select id="file-select" class="file-select" title="Select markdown document">
-                <option value=".nocturnomath/notes/evidence.md">.nocturnomath/notes/evidence.md</option>
-              </select>
-            </div>
-
+            <button class="tab-btn" id="tab-documents" data-tab="documents" type="button">Documents</button>
           </div>
         </div>
 
@@ -185,7 +174,7 @@
           <!-- Document Reader Tab View -->
           <div class="tab-view active" id="view-doc">
             <div class="doc-header-info" id="doc-header-info">
-              <span class="doc-path-label" id="doc-path-label">.nocturnomath/notes/evidence.md</span>
+              <span class="doc-path-label" id="doc-path-label">.nocturnomath/kb/evidence.md</span>
               <span class="doc-meta-label" id="doc-meta-label"></span>
             </div>
             <article class="markdown-body" id="markdown-container">
@@ -224,6 +213,31 @@
               <div class="empty-state">No figures yet. Run a probe that produces a plot.</div>
             </div>
           </div>
+
+          <!-- Documents Tab View: list, reader, and a minimal editor -->
+          <div class="tab-view hidden" id="view-documents">
+            <div class="documents-toolbar">
+              <button class="btn btn-xs btn-ghost hidden" id="documents-back" type="button" title="Back to the document list" aria-label="Back to the document list">&larr;</button>
+              <span class="documents-title" id="documents-title">Documents</span>
+              <span class="doc-meta-label" id="documents-meta"></span>
+              <div class="documents-toolbar-actions">
+                <button class="btn btn-xs btn-outline hidden" id="documents-modify" type="button">Modify</button>
+                <button class="btn btn-xs btn-outline" id="documents-new" type="button">New document</button>
+              </div>
+            </div>
+            <p class="documents-hint" id="documents-hint">Checked documents are sent with the next message.</p>
+            <div class="documents-list" id="documents-list"></div>
+            <article class="markdown-body hidden" id="documents-markdown"></article>
+            <form class="documents-editor hidden" id="documents-editor">
+              <input id="documents-editor-title" class="form-input" type="text" placeholder="Title" spellcheck="false" autocomplete="off">
+              <textarea id="documents-editor-text" class="form-input documents-editor-text" placeholder="Markdown text" spellcheck="false"></textarea>
+              <p class="folder-picker-error hidden" id="documents-error" role="alert"></p>
+              <div class="documents-editor-actions">
+                <button type="button" class="btn btn-xs btn-ghost" id="documents-cancel">Cancel</button>
+                <button type="submit" class="btn btn-xs btn-primary" id="documents-save">Save</button>
+              </div>
+            </form>
+          </div>
         </div>
       </section>
     </main>
@@ -255,6 +269,12 @@
             <span class="switch" aria-hidden="true"></span>
           </label>
           <p class="modal-help">On by default. When off, each message starts from the scientific record without the earlier conversation.</p>
+          <label class="toggle-label switch-label">
+            <span>Include documents by default</span>
+            <input type="checkbox" id="documents-default-toggle" class="switch-input" checked>
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+          <p class="modal-help">On by default. New documents are checked in the Documents tab and sent with the next message. Changing this resets the current selection.</p>
         </div>
       </div>
     </div>
@@ -376,7 +396,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260909-3"></script>
-  <script src="/static/js/sketch.js?v=20260909-3"></script>
+  <script type="module" src="/static/js/main.js?v=20260910-1"></script>
+  <script src="/static/js/sketch.js?v=20260910-1"></script>
 </body>
 </html>

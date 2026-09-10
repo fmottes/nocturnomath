@@ -76,7 +76,7 @@ Enter sends; Esc then Enter (or Alt+Enter) inserts a newline. Ctrl-C interrupts 
 | `/context [on\|off]` | Show or change context carry-over |
 | `/env <python>\|managed` | Switch research environment |
 | `/workspace <path>` | Open another workspace |
-| `/docs [name]` | List or render Markdown documents |
+| `/docs [name]` | List the documents folder or render one |
 | `/plots` | List saved plots |
 | `/exit` | Stop and exit |
 
@@ -88,9 +88,11 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 
 ```text
 .nocturnomath/
-├── notes/
+├── kb/
 │   ├── evidence.md
 │   └── thoughts.md
+├── documents/
+│   └── inputs.md
 ├── sessions/
 │   └── S001/
 │       ├── transcript.jsonl
@@ -105,6 +107,8 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 `evidence.md` contains numbered observations (`E001`, `E002`, …), each limited to 250 characters plus generated source links. Observations state what happened and under which conditions. `thoughts.md` contains numbered interpretations (`T001`, `T002`, …), usually one 80–150-word paragraph, with citations such as `[E001]` and `[T001]`.
 
 Evidence links to its probe output or plots, code, and run metadata. The web reader follows citations and opens those artifacts; `/notes`, `/docs`, and `/plots` expose them in the terminal.
+
+`documents/` holds free-form Markdown files that give the agent extra context: your inputs, generated reports, calculations. The Documents tab lists them with a checkbox that decides whether each one is sent with the next message, renders a document on click, and lets you create or modify one in place. Settings chooses whether new documents start checked. With context kept, a document is sent only when it is new or has changed.
 
 Entries keep stable wording and IDs. Invalid evidence is struck in full, and its correction becomes a new observation. Corrected thoughts are also appended and linked to the superseded entries. Struck entries remain part of the citable history but are not valid support for conclusions.
 

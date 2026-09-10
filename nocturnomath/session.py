@@ -73,12 +73,16 @@ class ExplorationSession:
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
+        # Documents chosen for the next message, and what this conversation already saw.
+        self.document_choices: dict[str, bool] = {}
+        self._sent_documents: dict[str, str] = {}
 
         self.environment = ResearchEnvironment(workspace_path, python)
         self.kernel = Kernel(cwd=workspace_path, environment=self.environment)
         try:
             self.workspace = Workspace(workspace_path)
             self.environment.save()
+            self.load_document_settings()
             self.kernel.on_start = self.record_kernel_start
             self.record_kernel_start("opened")
         except Exception:
@@ -164,10 +168,60 @@ class ExplorationSession:
         self._resume_prefix = None
         self._results_since_note = 0
         self._pending_verdict = None
+        self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
 
-    def list_markdown_files(self) -> list[dict[str, Any]]:
-        return self.workspace.list_markdown_files()
+    def load_document_settings(self):
+        self.documents_default = bool(
+            self.workspace.read_config().get("documents_default", True)
+        )
+        self.document_choices = {}
+        self._sent_documents = {}
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        """Documents with their inclusion flag; unseen files take the default."""
+        documents = self.workspace.list_documents()
+        names = {document["name"] for document in documents}
+        self.document_choices = {
+            name: self.document_choices.get(name, self.documents_default)
+            for name in names
+        }
+        for document in documents:
+            document["included"] = self.document_choices[document["name"]]
+        return documents
+
+    def set_document_included(self, name: str, included: bool) -> bool:
+        self.workspace.read_document(name)
+        self.document_choices[name] = bool(included)
+        return self.document_choices[name]
+
+    def set_documents_default(self, enabled: bool) -> bool:
+        """Persist the default and reset the current selection to match it."""
+        self.documents_default = bool(enabled)
+        self.workspace.update_config(documents_default=self.documents_default)
+        self.document_choices = {}
+        return self.documents_default
+
+    def document_context(self) -> str:
+        """Included documents the conversation has not seen in their current form."""
+        sections = []
+        for document in self.list_documents():
+            if not document["included"]:
+                continue
+            content = self.workspace.read_document(document["name"])["content"]
+            if (
+                self.carry_chat_context
+                and self._sent_documents.get(document["name"]) == content
+            ):
+                continue
+            self._sent_documents[document["name"]] = content
+            sections.append(f"### {document['name']}\n\n{content.rstrip()}\n")
+        if not sections:
+            return ""
+        return (
+            "Documents (extra context selected by the user, stored in "
+            ".nocturnomath/documents/):\n\n" + "\n".join(sections) + "\n---\n\n"
+        )
 
     def read_file(self, relative_path: str) -> dict[str, Any]:
         return self.workspace.read_file(relative_path)
@@ -208,6 +262,7 @@ class ExplorationSession:
         else:
             replayed = 0
         self._sdk_session_id = sdk_id
+        self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
         if self.carry_chat_context:
@@ -259,6 +314,7 @@ class ExplorationSession:
         self.carry_chat_context = enabled
         self._sdk_session_id = None
         self._resume_prefix = None
+        self._sent_documents = {}
         self._session_initialized = False
         if not self.workspace.session_pending:
             self.log_transcript("meta", carry_chat_context=enabled)
@@ -318,6 +374,7 @@ class ExplorationSession:
                     prefix = self.opening_notes()
                     self._session_initialized = True
 
+                prefix += self.document_context()
                 prefix += self._kernel_notice
                 self._kernel_notice = ""
                 prompt = prefix + user_text if prefix else user_text
@@ -367,6 +424,7 @@ class ExplorationSession:
         self._session_initialized = False
         self._sdk_session_id = None
         self._resume_prefix = None
+        self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
 

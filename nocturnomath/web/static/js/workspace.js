@@ -1,7 +1,8 @@
-import { elements, state } from "./state.js?v=20260909-3";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260909-3";
-import { openLightbox } from "./ui.js?v=20260909-3";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260909-3";
+import { elements, state } from "./state.js?v=20260910-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260910-1";
+import { openLightbox } from "./ui.js?v=20260910-1";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260910-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260910-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -16,7 +17,8 @@ export function applyWorkspace(ws) {
   if (state.workspace?.path !== ws.path) {
     state.documentContent = null;
     state.documentPath = null;
-    fileListSignature = null;
+    state.openDocumentContent = null;
+    showDocumentsView("list");
   }
   state.workspace = ws;
   document.getElementById("environment-info").textContent = ws.environment
@@ -35,16 +37,13 @@ export function applyWorkspace(ws) {
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
   setCarryContext(ws.carry_chat_context);
 
-  const notesPath = ws.evidence_path || ".nocturnomath/notes/evidence.md";
-  if (!state.activeDoc || !ws.markdown_files?.some((f) => f.path === state.activeDoc)) {
-    state.activeDoc = notesPath;
+  if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
+    state.activeDoc = ws.evidence_path;
   }
+  setDocuments(ws.documents || [], ws.documents_default);
 
-  // Populate file selector
-  updateFileSelector(ws.markdown_files || []);
-
-  // Refresh active doc
-  loadDocument(state.activeDoc);
+  // Refresh the record view without pulling the user off the figures or documents tab.
+  loadDocument(state.activeDoc, "", ["plots", "documents"].includes(state.activeTab));
 
   // Refresh plots list
   loadPlots();
@@ -179,43 +178,11 @@ export function setCarryContext(enabled) {
   elements.contextToggle.checked = state.carryChatContext;
 }
 
-let fileListSignature = null;
-export function updateFileSelector(files) {
-  const signature = JSON.stringify(files.map((file) => [file.path, file.is_notes]));
-  if (signature === fileListSignature) return;
-  fileListSignature = signature;
-  const currentVal = elements.fileSelect.value;
-  elements.fileSelect.innerHTML = "";
-
-  if (!files.length) {
-    const opt = document.createElement("option");
-    opt.value = state.workspace?.evidence_path || ".nocturnomath/notes/evidence.md";
-    opt.textContent = opt.value;
-    elements.fileSelect.appendChild(opt);
-    return;
-  }
-
-  files.forEach((f) => {
-    const opt = document.createElement("option");
-    opt.value = f.path;
-    opt.textContent = f.path + (f.is_notes ? " (notes)" : "");
-    elements.fileSelect.appendChild(opt);
-  });
-
-  // Preserve selection if possible
-  const exists = files.some((f) => f.path === currentVal);
-  if (exists) {
-    elements.fileSelect.value = currentVal;
-  } else {
-    elements.fileSelect.value = files[0].path;
-  }
-}
-
 export function selectViewerTab(tab) {
   setViewerTab(tab);
   if (tab === "plots") return loadPlots();
-  const path = tab === "evidence" ? state.workspace?.evidence_path
-    : tab === "thoughts" ? state.workspace?.thoughts_path : elements.fileSelect.value;
+  if (tab === "documents") return fetchDocuments().then(refreshOpenDocument);
+  const path = tab === "evidence" ? state.workspace?.evidence_path : state.workspace?.thoughts_path;
   if (path) loadDocument(path, "", false, tab);
 }
 
@@ -224,9 +191,17 @@ function setViewerTab(tab) {
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === tab);
   });
-  elements.viewDoc.classList.toggle("hidden", tab === "plots");
+  elements.viewDoc.classList.toggle("hidden", tab === "plots" || tab === "documents");
   elements.viewPlots.classList.toggle("hidden", tab !== "plots");
-  elements.fileSelect.parentElement.classList.toggle("hidden", tab !== "doc");
+  elements.viewDocuments.classList.toggle("hidden", tab !== "documents");
+}
+
+// Which record tab a rendered file belongs to. Linked artifacts (probe code,
+// output) stay under whichever record tab the reader was already on.
+function tabForPath(filePath) {
+  if (filePath === state.workspace?.evidence_path) return "evidence";
+  if (filePath === state.workspace?.thoughts_path) return "thoughts";
+  return ["evidence", "thoughts"].includes(state.activeTab) ? state.activeTab : "evidence";
 }
 
 let refreshing = false;
@@ -234,10 +209,10 @@ export async function refreshDocuments() {
   if (!state.workspace?.is_open || refreshing || state.exiting) return;
   refreshing = true;
   try {
-    const response = await fetch("/api/files");
-    if (response.ok) updateFileSelector((await response.json()).files || []);
-    if (state.activeTab !== "plots") await loadDocument(state.activeDoc, "", true);
-    else await loadPlots();
+    await fetchDocuments();
+    if (state.activeTab === "plots") await loadPlots();
+    else if (state.activeTab === "documents") await refreshOpenDocument();
+    else await loadDocument(state.activeDoc, "", true);
   } finally { refreshing = false; }
 }
 
@@ -245,8 +220,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
   if (!state.workspace?.is_open) return;
   if (!filePath) filePath = state.workspace.evidence_path;
   state.activeDoc = filePath;
-  if (!quiet) setViewerTab(tab || (filePath === state.workspace.evidence_path ? "evidence"
-    : filePath === state.workspace.thoughts_path ? "thoughts" : "doc"));
+  if (!quiet) setViewerTab(tab || tabForPath(filePath));
   elements.docPathLabel.textContent = filePath;
 
   try {
@@ -278,10 +252,6 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     rewriteEmbeddedImageUrls(elements.markdownContainer, filePath);
     rewriteDocumentLinks(elements.markdownContainer, filePath);
     highlightBlocks(elements.markdownContainer);
-    if (![...elements.fileSelect.options].some((option) => option.value === filePath)) {
-      elements.fileSelect.add(new Option(filePath, filePath));
-    }
-    elements.fileSelect.value = filePath;
     if (anchor) {
       const target = [...elements.markdownContainer.querySelectorAll("[id]")]
         .find((element) => element.id === anchor);
@@ -297,7 +267,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
   }
 }
 
-function rewriteDocumentLinks(container, documentPath) {
+export function rewriteDocumentLinks(container, documentPath) {
   container.querySelectorAll("a[href]").forEach((link) => {
     const source = link.getAttribute("href")?.trim();
     if (!source || source.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(source)) return;
@@ -317,7 +287,7 @@ function rewriteDocumentLinks(container, documentPath) {
   });
 }
 
-function rewriteEmbeddedImageUrls(container, documentPath) {
+export function rewriteEmbeddedImageUrls(container, documentPath) {
   const documentDir = documentPath.includes("/")
     ? documentPath.slice(0, documentPath.lastIndexOf("/"))
     : "";

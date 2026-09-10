@@ -349,3 +349,73 @@
   font-size: 1.0625rem;
   color: var(--ink-faint);
 }
+
+/* --------------------------------------------------------------------------
+   Documents: list with inclusion checkboxes, reader, minimal editor
+   -------------------------------------------------------------------------- */
+.documents-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 6px 22px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  border-bottom: 1px solid var(--rule);
+}
+.documents-title {
+  color: var(--blue);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.documents-toolbar-actions { display: flex; gap: 6px; margin-left: auto; flex-shrink: 0; }
+.documents-hint {
+  margin: 0;
+  padding: 10px 22px 0;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+}
+.documents-list { display: flex; flex-direction: column; padding: 8px 22px 40px; }
+.document-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--row-rule);
+}
+.document-row input[type="checkbox"] { margin: 0; flex-shrink: 0; accent-color: var(--blue); cursor: pointer; }
+.document-row-title {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  color: var(--ink);
+  background: none;
+  border: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.document-row-title:hover { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }
+.document-row-meta {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.documents-editor { display: flex; flex: 1; flex-direction: column; gap: 10px; padding: 16px 22px 40px; }
+.documents-editor-text {
+  flex: 1;
+  min-height: 320px;
+  resize: vertical;
+  line-height: 1.6;
+}
+.documents-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }

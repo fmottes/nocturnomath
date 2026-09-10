@@ -14,8 +14,8 @@ from .session import ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
 
-EVIDENCE_PATH = ".nocturnomath/notes/evidence.md"
-THOUGHTS_PATH = ".nocturnomath/notes/thoughts.md"
+EVIDENCE_PATH = ".nocturnomath/kb/evidence.md"
+THOUGHTS_PATH = ".nocturnomath/kb/thoughts.md"
 
 
 class Runtime:
@@ -182,7 +182,8 @@ class Runtime:
                 "carry_chat_context": True,
                 "evidence_path": EVIDENCE_PATH,
                 "thoughts_path": THOUGHTS_PATH,
-                "markdown_files": [],
+                "documents": [],
+                "documents_default": True,
                 "plots": [],
                 "records": [],
                 "navigator_root": str(self.navigator_root),
@@ -206,7 +207,8 @@ class Runtime:
             "carry_chat_context": session.carry_chat_context,
             "evidence_path": EVIDENCE_PATH,
             "thoughts_path": THOUGHTS_PATH,
-            "markdown_files": session.list_markdown_files(),
+            "documents": session.list_documents(),
+            "documents_default": session.documents_default,
             "plots": session.list_plots(),
             "auth": self.auth.public(),
         }

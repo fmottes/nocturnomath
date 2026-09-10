@@ -146,3 +146,43 @@ def test_resume_with_kernel_replays_recorded_probe_code_in_order(session):
     assert "replaying 2 stored probes" in session._kernel_notice
     records = session.workspace.read_transcript(session.transcript_path)
     assert sum(record["kind"] == "run" for record in records) == 1
+
+
+@pytest.mark.asyncio
+async def test_included_documents_are_sent_when_new_or_changed(session):
+    documents = session.workspace.documents_path
+    (documents / "inputs.md").write_text("# Inputs\n\nN = 10\n")
+    (documents / "draft.md").write_text("# Draft\n")
+    session.set_document_included("draft.md", False)
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("first")
+        first = FakeClient.prompts[-1]
+        assert "### inputs.md\n\n# Inputs\n\nN = 10\n" in first
+        assert "draft.md" not in first
+        assert (
+            first.index("# Evidence")
+            < first.index("### inputs.md")
+            < first.index("first")
+        )
+
+        await session.query("second")
+        assert "inputs.md" not in FakeClient.prompts[-1]
+
+        (documents / "inputs.md").write_text("# Inputs\n\nN = 20\n")
+        await session.query("third")
+        third = FakeClient.prompts[-1]
+        assert "N = 20" in third and "N = 10" not in third
+
+        session.set_documents_default(False)
+        await session.query("fourth")
+        assert "inputs.md" not in FakeClient.prompts[-1]
+        assert session.list_documents() == [
+            {**item, "included": False} for item in session.workspace.list_documents()
+        ]
+
+        session.set_document_included("inputs.md", True)
+        session.set_carry_chat_context(False)
+        await session.query("fifth")
+        await session.query("sixth")
+        assert "N = 20" in FakeClient.prompts[-1]

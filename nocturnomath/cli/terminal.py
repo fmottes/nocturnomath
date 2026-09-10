@@ -50,7 +50,7 @@ COMMANDS = [
     ("/context", "[on|off]", "show or set whether the agent carries chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
     ("/workspace", "<path>", "open a different workspace folder"),
-    ("/docs", "[name]", "list the Markdown documents, or render one"),
+    ("/docs", "[name]", "list the documents folder, or render one"),
     ("/plots", "", "list the plots saved by probes"),
     ("/exit", "", "stop the agent and leave"),
 ]
@@ -715,17 +715,19 @@ class TerminalApp:
     async def _command_docs(self, argument: str) -> bool:
         session = self.runtime.require_session()
         if not argument:
-            files = session.list_markdown_files()
-            if not files:
-                self.write("No Markdown documents in this workspace yet.", style="dim")
+            documents = session.list_documents()
+            if not documents:
+                self.write("No documents in .nocturnomath/documents/ yet.", style="dim")
                 return True
-            for document in files:
+            for document in documents:
+                mark = "[x]" if document["included"] else "[ ]"
                 self.write(
-                    f"{document['path']} ({document['size']} bytes, "
+                    f"{mark} {document['name']} ({document['size']} bytes, "
                     f"{format_time(document['modified'])})"
                 )
+            self.write("[x] marks documents sent with the next message.", style="dim")
             return True
-        document = session.read_file(argument)
+        document = session.workspace.read_document(argument)
         self.write(document["path"], style="bold")
         self.markdown(document["content"])
         return True

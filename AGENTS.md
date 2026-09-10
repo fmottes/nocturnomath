@@ -10,7 +10,7 @@ Prefer plain code, explicit state, and small changes over abstractions, framewor
 
 Package code lives in `nocturnomath/`. `session.py` coordinates Claude conversations, `runtime.py` handles shared orchestration, `workspace.py` owns artifacts, `notes.py` manages the scientific record, and `kernel.py` controls Jupyter. Interface adapters live in `cli/` and `web/`; browser assets are in `web/static/`. Tests and fixtures live in `tests/`.
 
-Treat the generated `.nocturnomath/` workspace directory as runtime data. Do not commit sessions, probe output, notes, or scratch files.
+Treat the generated `.nocturnomath/` workspace directory as runtime data. Do not commit sessions, probe output, knowledge-base entries, documents, or scratch files.
 
 ## Build, Test, and Development Commands
 
@@ -37,11 +37,12 @@ Web and terminal clients must share one runtime contract; keep orchestration and
 
 ### Scientific record
 
-- `.nocturnomath/notes/evidence.md` is an append-only list with stable IDs (`E001`, `E002`, ...). Each entry is a strictly factual observation, at most 250 characters excluding generated source links, and states relevant conditions. It must link to saved output or a plot that directly supports it. It must not interpret, characterize a result as positive or negative, or cite another evidence or thought entry.
+- `.nocturnomath/kb/evidence.md` is an append-only list with stable IDs (`E001`, `E002`, ...). Each entry is a strictly factual observation, at most 250 characters excluding generated source links, and states relevant conditions. It must link to saved output or a plot that directly supports it. It must not interpret, characterize a result as positive or negative, or cite another evidence or thought entry.
 - Never revise or delete an evidence entry. If it proves invalid, strike the whole original entry and append the corrected observation under a new ID. Do not add a supersession explanation or replacement link inside the evidence record.
-- `.nocturnomath/notes/thoughts.md` is an append-only list with stable IDs (`T001`, `T002`, ...). Thoughts use plain, direct language and may interpret or reconcile evidence, form supported conjectures, develop a unified explanation or theory, and contain equations. They may cite evidence and earlier thoughts.
+- `.nocturnomath/kb/thoughts.md` is an append-only list with stable IDs (`T001`, `T002`, ...). Thoughts use plain, direct language and may interpret or reconcile evidence, form supported conjectures, develop a unified explanation or theory, and contain equations. They may cite evidence and earlier thoughts.
 - Correct a thought by appending a self-contained replacement that carries forward everything still valid, then strike the old thought without removing it from the record. Preserve citations and stable IDs so the history remains traceable.
 - Struck entries remain visible historical records but are not valid support for later conclusions.
+- `.nocturnomath/documents/` holds free-form Markdown documents that serve as extra context (user inputs, reports, calculations). They are not part of the scientific record. The user chooses per document whether it travels with the next message; a per-workspace default (all or none) lives in `.nocturnomath/config.json`. With context kept, a document is sent only when new or changed.
 
 ### Probes, sessions, and kernels
 

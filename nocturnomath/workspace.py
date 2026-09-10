@@ -1,4 +1,4 @@
-"""Workspace files, notes, plots, and persisted chat history."""
+"""Workspace files, knowledge base, documents, plots, and persisted chat history."""
 
 import base64
 import json
@@ -27,18 +27,35 @@ class Workspace:
         self.path = Path(path).resolve()
         self.path.mkdir(parents=True, exist_ok=True)
         self.nocturnomath_path = self.path / ".nocturnomath"
-        self.notes_dir_path = self.nocturnomath_path / "notes"
+        self.kb_path = self.nocturnomath_path / "kb"
+        self.documents_path = self.nocturnomath_path / "documents"
         self.sessions_path = self.nocturnomath_path / "sessions"
         self.scratch_path = self.nocturnomath_path / "scratch"
+        self.config_path = self.nocturnomath_path / "config.json"
         for directory in (
-            self.notes_dir_path,
+            self.kb_path,
+            self.documents_path,
             self.sessions_path,
             self.scratch_path,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-        self.notes = ResearchNotes(self.notes_dir_path)
+        self.notes = ResearchNotes(self.kb_path)
         self.start_new_transcript()
+
+    def read_config(self) -> dict[str, Any]:
+        """Per-workspace settings shared with the research environment choice."""
+        if not self.config_path.exists():
+            return {}
+        try:
+            return json.loads(self.config_path.read_text())
+        except json.JSONDecodeError:
+            return {}
+
+    def update_config(self, **fields):
+        data = self.read_config()
+        data.update(fields)
+        self.config_path.write_text(json.dumps(data, indent=2) + "\n")
 
     def start_new_transcript(self):
         numbers = [
@@ -117,7 +134,7 @@ class Workspace:
     def opening_notes(self) -> str:
         return (
             "Scientific record (struck entries are invalid; thoughts are interpretations, "
-            "not observations). Relative links are based in .nocturnomath/notes/.\n\n"
+            "not observations). Relative links are based in .nocturnomath/kb/.\n\n"
             + self.notes.read()
             + "\n---\n\n"
         )
@@ -197,40 +214,63 @@ class Workspace:
             )
         return links
 
-    def list_markdown_files(self) -> list[dict[str, Any]]:
-        files = []
-        try:
-            for path in self.path.glob("**/*.md"):
-                if any(
-                    ignored in path.parts
-                    for ignored in (
-                        ".git",
-                        "node_modules",
-                        ".venv",
-                        "venv",
-                        ".pytest_cache",
-                    )
-                ):
-                    continue
-                try:
-                    relative = path.relative_to(self.path)
-                    stat = path.stat()
-                    files.append(
-                        {
-                            "name": str(relative),
-                            "path": str(relative),
-                            "size": stat.st_size,
-                            "modified": stat.st_mtime,
-                            "is_notes": path
-                            in (self.notes.evidence_path, self.notes.thoughts_path),
-                        }
-                    )
-                except Exception as exc:
-                    logger.debug(f"Skipped {path}: {exc}")
-        except Exception as exc:
-            logger.warning(f"Error listing markdown files: {exc}")
-        files.sort(key=lambda item: (not item["is_notes"], item["name"].lower()))
-        return files
+    def list_documents(self) -> list[dict[str, Any]]:
+        """Markdown documents kept as extra context under .nocturnomath/documents/."""
+        documents = []
+        for path in sorted(
+            self.documents_path.glob("*.md"), key=lambda p: p.name.lower()
+        ):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            documents.append(
+                {
+                    "name": path.name,
+                    "path": str(path.relative_to(self.path)),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                }
+            )
+        return documents
+
+    def document_file(self, name: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md", name) or ".." in name:
+            raise ValueError("Use a document name such as report.md.")
+        return self.documents_path / name
+
+    def read_document(self, name: str) -> dict[str, Any]:
+        path = self.document_file(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"Document {name} not found")
+        stat = path.stat()
+        return {
+            "name": name,
+            "path": str(path.relative_to(self.path)),
+            "content": path.read_text(encoding="utf-8", errors="replace"),
+            "modified": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+    @staticmethod
+    def document_name(title: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title.strip()).strip("-.")
+        if not slug:
+            raise ValueError("Give the document a title.")
+        return slug if slug.endswith(".md") else slug + ".md"
+
+    def create_document(self, title: str, text: str) -> str:
+        name = self.document_name(title)
+        path = self.document_file(name)
+        if path.exists():
+            raise FileExistsError(f"Document {name} already exists")
+        write_text(path, text if text.endswith("\n") else text + "\n")
+        return name
+
+    def write_document(self, name: str, text: str):
+        path = self.document_file(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"Document {name} not found")
+        write_text(path, text if text.endswith("\n") else text + "\n")
 
     def read_file(self, relative_path: str) -> dict[str, Any]:
         target = (self.path / relative_path).resolve()

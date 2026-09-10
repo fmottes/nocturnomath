@@ -91,6 +91,7 @@ class CommandCompleter(Completer):
             ] + [("--kernel", "replay the stored probes")]
         if name == "/docs":
             return [
-                (document["path"], "") for document in session.list_markdown_files()
+                (document["name"], "included" if document["included"] else "")
+                for document in session.list_documents()
             ]
         return []

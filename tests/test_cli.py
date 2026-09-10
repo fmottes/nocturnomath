@@ -423,10 +423,18 @@ async def test_workspace_and_environment_switch_in_place(terminal, tmp_path):
 
 @pytest.mark.asyncio
 async def test_docs_lists_and_renders_markdown(terminal, tmp_path):
-    (tmp_path / "report.md").write_text("# Report\n\nThe effect is small.\n")
+    await terminal.run("/docs")
+    assert "No documents" in terminal.output()
+
+    documents = tmp_path / ".nocturnomath" / "documents"
+    (documents / "report.md").write_text("# Report\n\nThe effect is small.\n")
+    (documents / "inputs.md").write_text("# Inputs\n")
+    terminal.session.set_document_included("inputs.md", False)
 
     await terminal.run("/docs")
-    assert "report.md" in terminal.output()
+    listing = terminal.output()
+    assert "[x] report.md" in listing
+    assert "[ ] inputs.md" in listing
 
     await terminal.run("/docs report.md")
     rendered = terminal.output()
@@ -608,14 +616,14 @@ def test_completer_suggests_command_arguments(completer, terminal):
     assert resumable["S001"] == "how large is the effect?"
     assert "--kernel" in resumable
 
-    (terminal.session.workspace_path / "report.md").write_text("# Report\n")
-    assert "report.md" in [text for text, _ in complete(completer, "/docs report")]
+    documents = terminal.session.workspace.documents_path
+    (documents / "report.md").write_text("# Report\n")
+    assert complete(completer, "/docs report") == [("report.md", "included")]
 
 
 def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     (terminal.session.workspace_path / "other-workspace").mkdir()
     (terminal.session.workspace_path / "workspace with spaces").mkdir()
-    (terminal.session.workspace_path / "report with spaces.md").write_text("# Report\n")
     assert "managed" in [text for text, _ in complete(completer, "/env man")]
 
     root = terminal.session.workspace_path
@@ -628,7 +636,3 @@ def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     completions = list(completer.get_completions(document, CompleteEvent()))
     assert [completion.text for completion in completions] == [" spaces"]
     assert completions[0].display_text.startswith("workspace with spaces")
-
-    assert "report with spaces.md" in [
-        text for text, _ in complete(completer, "/docs report with")
-    ]

@@ -17,7 +17,8 @@ def test_workspace_defers_session_folder_until_first_activity(tmp_path):
     assert workspace.transcript_path == first
     assert not workspace.probes_path.exists()
     assert workspace.scratch_path.is_dir()
-    assert not (workspace.notes_dir_path / "notes.md").exists()
+    assert not (workspace.kb_path / "notes.md").exists()
+    assert workspace.documents_path.is_dir()
 
     workspace.log_transcript("user", text="first question")
     assert workspace.transcript_path == first
@@ -45,11 +46,7 @@ def test_sources_remain_citable_across_sessions_and_reopening(tmp_path):
         "../sessions/S001/probes/P001/code.py"
         in workspace.notes.evidence_path.read_text()
     )
-    assert [item["path"] for item in workspace.list_markdown_files()] == [
-        ".nocturnomath/notes/evidence.md",
-        ".nocturnomath/notes/thoughts.md",
-        "report.md",
-    ]
+    assert workspace.list_documents() == []
     [plot] = workspace.list_plots()
     assert plot["filename"] == "S001/P001/plot-1.png"
     assert plot["session"] == "S001"
@@ -129,3 +126,31 @@ def test_notebook_export_structures_turns_and_embeds_probe_results(tmp_path):
         == base64.b64encode(b"png-data").decode()
     )
     assert notebook["cells"][4]["source"] == "**Verdict:** The prediction held."
+
+
+def test_documents_are_created_listed_and_edited(tmp_path):
+    workspace = Workspace(tmp_path)
+    (tmp_path / "README.md").write_text("# Not a document\n")
+
+    name = workspace.create_document("Growth rates: first pass", "# Growth\n\nk = 0.3")
+    assert name == "Growth-rates-first-pass.md"
+    assert (workspace.documents_path / name).read_text() == "# Growth\n\nk = 0.3\n"
+    with pytest.raises(FileExistsError):
+        workspace.create_document("Growth rates: first pass", "again")
+    with pytest.raises(ValueError):
+        workspace.create_document("   ", "empty title")
+
+    workspace.write_document(name, "# Growth\n\nk = 0.4\n")
+    document = workspace.read_document(name)
+    assert document["content"] == "# Growth\n\nk = 0.4\n"
+    assert document["path"] == f".nocturnomath/documents/{name}"
+
+    listed = workspace.list_documents()
+    assert [item["name"] for item in listed] == [name]
+    assert listed[0]["size"] == len("# Growth\n\nk = 0.4\n")
+
+    with pytest.raises(FileNotFoundError):
+        workspace.read_document("missing.md")
+    for bad in ("../config.json", "kb/evidence.md", "notes.txt", ".hidden.md"):
+        with pytest.raises(ValueError):
+            workspace.document_file(bad)
