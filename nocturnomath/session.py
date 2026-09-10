@@ -195,6 +195,11 @@ class ExplorationSession:
         self.document_choices[name] = bool(included)
         return self.document_choices[name]
 
+    def delete_document(self, name: str):
+        self.workspace.delete_document(name)
+        self.document_choices.pop(name, None)
+        self._sent_documents.pop(name, None)
+
     def set_documents_default(self, enabled: bool) -> bool:
         """Persist the default and reset the current selection to match it."""
         self.documents_default = bool(enabled)

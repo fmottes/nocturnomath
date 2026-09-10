@@ -448,6 +448,14 @@ def test_documents_api_creates_edits_and_selects_documents(session):
         assert client.get("/api/documents").json()["documents"][0]["included"] is False
         assert client.get("/api/workspace").json()["documents"][0]["included"] is False
 
+        assert client.delete("/api/documents/missing.md").status_code == 404
+        deleted = client.delete("/api/documents/Inputs.md")
+        assert deleted.status_code == 200
+        assert deleted.json()["documents"] == []
+        assert not (session.workspace.documents_path / "Inputs.md").exists()
+        assert "Inputs.md" not in session.document_choices
+
+        client.post("/api/documents", json={"title": "Inputs", "text": "# Inputs"})
         changed = client.post("/api/documents/default", json={"enabled": False})
         assert changed.json()["documents_default"] is False
         assert changed.json()["documents"][0]["included"] is False

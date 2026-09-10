@@ -310,6 +310,17 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.delete("/api/documents/{name}")
+    async def delete_document(name: str):
+        session = active_session()
+        try:
+            session.delete_document(name)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Document not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return documents_payload(session)
+
     @app.post("/api/documents/{name}/include")
     async def include_document(name: str, request: DocumentIncludeRequest):
         session = active_session()

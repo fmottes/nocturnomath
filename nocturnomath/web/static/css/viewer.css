@@ -419,3 +419,15 @@
   line-height: 1.6;
 }
 .documents-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.document-row-delete {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 3px;
+  color: var(--ink-faint);
+  background: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.document-row-delete:hover { color: var(--danger); border-color: var(--danger); }
+.document-row-delete:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }

@@ -272,6 +272,12 @@ class Workspace:
             raise FileNotFoundError(f"Document {name} not found")
         write_text(path, text if text.endswith("\n") else text + "\n")
 
+    def delete_document(self, name: str):
+        path = self.document_file(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"Document {name} not found")
+        path.unlink()
+
     def read_file(self, relative_path: str) -> dict[str, Any]:
         target = (self.path / relative_path).resolve()
         # Preserve the prototype's current path check exactly.

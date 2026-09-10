@@ -89,9 +89,33 @@ function renderDocumentsList() {
     meta.className = "document-row-meta";
     meta.textContent = formatMeta(doc);
 
-    row.append(box, title, meta);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "document-row-delete";
+    remove.title = `Delete ${doc.name}`;
+    remove.setAttribute("aria-label", `Delete ${doc.name}`);
+    remove.innerHTML = TRASH_ICON;
+    remove.addEventListener("click", () => deleteDocument(doc.name));
+
+    row.append(box, title, meta, remove);
     list.appendChild(row);
   });
+}
+
+// A small drafted bin: lid, body, two slats. Inherits the row's ink colour.
+const TRASH_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">'
+  + '<path d="M2.5 4.5h11M6 4.5V3h4v1.5M4 4.5l.7 9h6.6l.7-9M6.7 7v4.5M9.3 7v4.5"/></svg>';
+
+async function deleteDocument(name) {
+  if (!window.confirm(`Delete ${name}? This removes the file from .nocturnomath/documents/.`)) return;
+  try {
+    const res = await fetch(`/api/documents/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    setDocuments(data.documents || [], data.documents_default);
+  } catch (error) {
+    console.error("Unable to delete document:", error);
+  }
 }
 
 async function toggleIncluded(name, included, box) {
