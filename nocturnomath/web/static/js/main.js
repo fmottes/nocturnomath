@@ -167,8 +167,8 @@ function setupEventListeners() {
   elements.settingsModal.addEventListener("click", (event) => {
     if (event.target === elements.settingsModal) elements.settingsModal.classList.add("hidden");
   });
-  elements.btnExit.addEventListener("click", async () => {
-    elements.btnExit.disabled = true;
+  const exitService = async (button, reportError) => {
+    button.disabled = true;
     try {
       const response = await fetch("/api/exit", { method: "POST" });
       if (!response.ok) throw new Error((await response.json()).detail || "Unable to stop service");
@@ -181,10 +181,16 @@ function setupEventListeners() {
       message.textContent = "Nocturnomath is stopping. You can close this tab.";
       document.body.appendChild(message);
     } catch (error) {
-      appendErrorMessage(error.message);
-      elements.btnExit.disabled = false;
+      reportError(error.message);
+      button.disabled = false;
     }
-  });
+  };
+  elements.btnExit.addEventListener("click", () => exitService(elements.btnExit, appendErrorMessage));
+  elements.btnExitLanding.addEventListener("click", () =>
+    exitService(elements.btnExitLanding, (message) => {
+      document.getElementById("recent-workspace-error").textContent = message;
+    }),
+  );
   document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
     button.addEventListener("click", () => {
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");

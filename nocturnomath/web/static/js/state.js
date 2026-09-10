@@ -33,6 +33,7 @@ export const elements = {
   workspaceApp: document.getElementById("workspace-app"),
   btnOpenWorkspace: document.getElementById("btn-open-workspace"),
   btnAuthLanding: document.getElementById("btn-auth-landing"),
+  btnExitLanding: document.getElementById("btn-exit-landing"),
   btnAboutToggle: document.getElementById("btn-about-toggle"),
   btnAboutClose: document.getElementById("btn-about-close"),
   aboutPanel: document.getElementById("about-panel"),
