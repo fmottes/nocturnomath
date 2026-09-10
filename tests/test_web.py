@@ -37,6 +37,15 @@ def test_startup_discovers_models_without_querying(sdk_model_catalog):
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
 
 
+def test_startup_opens_the_dashboard_in_a_new_tab():
+    with (
+        patch("nocturnomath.web.app.asyncio.sleep", new=AsyncMock()),
+        patch("nocturnomath.web.app.webbrowser.open") as open_browser,
+        TestClient(create_app(browser_url="http://127.0.0.1:8000")),
+    ):
+        open_browser.assert_called_once_with("http://127.0.0.1:8000", new=2)
+
+
 def test_authentication_can_be_changed_before_opening_a_workspace(
     sdk_model_catalog,
 ):

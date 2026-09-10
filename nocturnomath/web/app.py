@@ -94,7 +94,7 @@ def create_app(
 
             async def open_browser_later():
                 await asyncio.sleep(1.0)
-                webbrowser.open(browser_url)
+                webbrowser.open(browser_url, new=2)
 
             browser_task = asyncio.create_task(open_browser_later())
         try:
