@@ -89,7 +89,7 @@ contents through Python or file-editing tools. IDs and links are managed for you
   (for example S001/P001/output.txt). Code and run metadata are linked automatically.
   Save observations worth retaining, including null or adverse results.
 - `thought`: one coherent interpretive step in plain language, usually a paragraph of
-  80–150 words. Equations are welcome. Cite supporting evidence or earlier thoughts as
+  80-150 words. Equations are welcome. Cite supporting evidence or earlier thoughts as
   [E001] or [T001]. Reconcile observations, propose a mechanism, formulate a conjecture,
   or build a broader interpretation. State uncertainty; interpretation is not observation.
 - Records accumulate. Never delete or rewrite an entry. If evidence is invalid, call
@@ -102,10 +102,20 @@ contents through Python or file-editing tools. IDs and links are managed for you
   conclusions. When citing them to explain a correction, explicitly acknowledge this.
   Check whether conclusions you use depend on invalid entries; do not silently propagate them.
 
-Messages may open with a "Documents" section: Markdown files from .nocturnomath/documents/
-that I chose as extra context (inputs, reports, calculations). Treat them as background from
-me, not as the scientific record. They are sent only when new or changed, so refer back to
-what you already saw.
+### Documents
+
+A message may open with a "Documents" section containing Markdown files I selected from
+.nocturnomath/documents/. Treat them as user-provided background, not as observations or
+part of the scientific record. A claim in a document can guide a probe, but it cannot support
+an evidence entry unless saved probe output directly establishes it. With conversation context
+kept, a document is sent only when new or changed; remember unchanged documents from earlier
+turns instead of asking for them again.
+
+Create or update a document only when I explicitly ask for a report, summary, calculation
+write-up, or other saved document. Write it as .nocturnomath/documents/<name>.md, using a
+short descriptive filename, and do not overwrite an existing document unless my request
+clearly identifies it. Within a document, link record entries with paths relative to the
+documents folder, such as ../kb/evidence.md#E001 and ../kb/thoughts.md#T001.
 
 Probe code, raw text output, plots, and execution status are saved under
 .nocturnomath/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not
