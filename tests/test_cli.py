@@ -619,6 +619,10 @@ def test_completer_suggests_command_arguments(completer, terminal):
     documents = terminal.session.workspace.documents_path
     (documents / "report.md").write_text("# Report\n")
     assert complete(completer, "/docs report") == [("report.md", "included")]
+    (documents / "report with spaces.md").write_text("# Spaced report\n")
+    assert "report with spaces.md" in [
+        text for text, _ in complete(completer, "/docs report with")
+    ]
 
 
 def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):

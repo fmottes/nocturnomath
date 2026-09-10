@@ -273,7 +273,8 @@ def create_app(
         return documents_payload(active_session())
 
     @app.post("/api/documents", status_code=201)
-    async def create_document(request: DocumentCreateRequest):
+    async def create_document(request: DocumentCreateRequest, http_request: Request):
+        require_same_origin(http_request, "Document changes")
         session = active_session()
         try:
             name = session.workspace.create_document(request.title, request.text)
@@ -284,7 +285,10 @@ def create_app(
         return {"name": name, **documents_payload(session)}
 
     @app.post("/api/documents/default")
-    async def set_documents_default(request: DocumentsDefaultRequest):
+    async def set_documents_default(
+        request: DocumentsDefaultRequest, http_request: Request
+    ):
+        require_same_origin(http_request, "Document changes")
         session = active_session()
         session.set_documents_default(request.enabled)
         return documents_payload(session)
@@ -300,7 +304,10 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.put("/api/documents/{name}")
-    async def write_document(name: str, request: DocumentWriteRequest):
+    async def write_document(
+        name: str, request: DocumentWriteRequest, http_request: Request
+    ):
+        require_same_origin(http_request, "Document changes")
         session = active_session()
         try:
             session.workspace.write_document(name, request.text)
@@ -311,7 +318,8 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.delete("/api/documents/{name}")
-    async def delete_document(name: str):
+    async def delete_document(name: str, request: Request):
+        require_same_origin(request, "Document deletion")
         session = active_session()
         try:
             session.delete_document(name)
@@ -322,7 +330,10 @@ def create_app(
         return documents_payload(session)
 
     @app.post("/api/documents/{name}/include")
-    async def include_document(name: str, request: DocumentIncludeRequest):
+    async def include_document(
+        name: str, request: DocumentIncludeRequest, http_request: Request
+    ):
+        require_same_origin(http_request, "Document changes")
         session = active_session()
         try:
             included = session.set_document_included(name, request.included)

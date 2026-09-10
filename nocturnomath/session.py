@@ -207,9 +207,10 @@ class ExplorationSession:
         self.document_choices = {}
         return self.documents_default
 
-    def document_context(self) -> str:
-        """Included documents the conversation has not seen in their current form."""
+    def document_context(self) -> tuple[str, dict[str, str]]:
+        """Build document context and the contents to mark sent after submission."""
         sections = []
+        sent_documents = {}
         for document in self.list_documents():
             if not document["included"]:
                 continue
@@ -219,14 +220,15 @@ class ExplorationSession:
                 and self._sent_documents.get(document["name"]) == content
             ):
                 continue
-            self._sent_documents[document["name"]] = content
+            sent_documents[document["name"]] = content
             sections.append(f"### {document['name']}\n\n{content.rstrip()}\n")
         if not sections:
-            return ""
-        return (
+            return "", sent_documents
+        context = (
             "Documents (extra context selected by the user, stored in "
             ".nocturnomath/documents/):\n\n" + "\n".join(sections) + "\n---\n\n"
         )
+        return context, sent_documents
 
     def read_file(self, relative_path: str) -> dict[str, Any]:
         return self.workspace.read_file(relative_path)
@@ -343,47 +345,57 @@ class ExplorationSession:
 
         self._is_busy = True
         self._pending_verdict = None
-        await self.emit("status_change", status="thinking")
-        self.log_transcript("user", text=user_text)
-        options = ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT,
-            mcp_servers={"explore": create_sdk_mcp_server("explore", tools=self.tools)},
-            disallowed_tools=[
-                "Bash",
-                "BashOutput",
-                "KillShell",
-                "Task",
-                "Agent",
-                "Workflow",
-                "Monitor",
-            ],
-            permission_mode="bypassPermissions",
-            model=self.model,
-            max_buffer_size=20 * 1024 * 1024,
-            include_partial_messages=True,
-            env=self.auth.sdk_env(),
-            # Deliberately preserve the existing SDK working-directory behavior.
-            resume=self._sdk_session_id if self.carry_chat_context else None,
-        )
-
         try:
+            # Snapshot the selection before yielding so changes made while this turn runs
+            # apply to the next message.
+            document_prefix, sent_documents = self.document_context()
+            await self.emit("status_change", status="thinking")
+            self.log_transcript("user", text=user_text)
+            options = ClaudeAgentOptions(
+                system_prompt=SYSTEM_PROMPT,
+                mcp_servers={
+                    "explore": create_sdk_mcp_server("explore", tools=self.tools)
+                },
+                disallowed_tools=[
+                    "Bash",
+                    "BashOutput",
+                    "KillShell",
+                    "Task",
+                    "Agent",
+                    "Workflow",
+                    "Monitor",
+                ],
+                permission_mode="bypassPermissions",
+                model=self.model,
+                max_buffer_size=20 * 1024 * 1024,
+                include_partial_messages=True,
+                env=self.auth.sdk_env(),
+                # Deliberately preserve the existing SDK working-directory behavior.
+                resume=self._sdk_session_id if self.carry_chat_context else None,
+            )
             async with ClaudeSDKClient(options) as client:
                 self._current_client = client
                 prefix = ""
                 resume_prefix = self._resume_prefix
-                self._resume_prefix = None
+                initialize_session = False
                 if self.carry_chat_context and resume_prefix:
                     prefix = self.opening_notes() + resume_prefix
-                    self._session_initialized = True
+                    initialize_session = True
                 elif not self.carry_chat_context or not self._session_initialized:
                     prefix = self.opening_notes()
-                    self._session_initialized = True
+                    initialize_session = True
 
-                prefix += self.document_context()
-                prefix += self._kernel_notice
-                self._kernel_notice = ""
+                prefix += document_prefix
+                kernel_notice = self._kernel_notice
+                prefix += kernel_notice
                 prompt = prefix + user_text if prefix else user_text
                 await client.query(prompt)
+                self._resume_prefix = None
+                if initialize_session:
+                    self._session_initialized = True
+                if self._kernel_notice == kernel_notice:
+                    self._kernel_notice = ""
+                self._sent_documents.update(sent_documents)
                 accumulated_text = []
                 async for message in client.receive_response():
                     self._track_session_id(getattr(message, "session_id", None))

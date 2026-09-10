@@ -217,9 +217,11 @@ class Workspace:
     def list_documents(self) -> list[dict[str, Any]]:
         """Markdown documents kept as extra context under .nocturnomath/documents/."""
         documents = []
-        for path in sorted(
-            self.documents_path.glob("*.md"), key=lambda p: p.name.lower()
-        ):
+        for path in sorted(self.documents_path.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                path = self.document_file(path.name)
+            except ValueError:
+                continue
             if not path.is_file():
                 continue
             stat = path.stat()
@@ -234,9 +236,20 @@ class Workspace:
         return documents
 
     def document_file(self, name: str) -> Path:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md", name) or ".." in name:
+        if (
+            not name
+            or name != name.strip()
+            or name.startswith(".")
+            or not name.endswith(".md")
+            or "/" in name
+            or "\\" in name
+            or "\0" in name
+        ):
             raise ValueError("Use a document name such as report.md.")
-        return self.documents_path / name
+        path = self.documents_path / name
+        if path.is_symlink():
+            raise ValueError("Document symlinks are not supported.")
+        return path
 
     def read_document(self, name: str) -> dict[str, Any]:
         path = self.document_file(name)

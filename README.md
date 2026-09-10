@@ -108,7 +108,7 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 
 Evidence links to its probe output or plots, code, and run metadata. The web reader follows citations and opens those artifacts; `/notes`, `/docs`, and `/plots` expose them in the terminal.
 
-`documents/` holds free-form Markdown files that give the agent extra context: your inputs, generated reports, calculations. The Documents tab lists them with a checkbox that decides whether each one is sent with the next message, renders a document on click, and lets you create or modify one in place. Settings chooses whether new documents start checked. With context kept, a document is sent only when it is new or has changed.
+`documents/` holds free-form Markdown files that give the agent extra context: your inputs, generated reports, calculations. The Documents tab lists them with a checkbox that decides whether each one is sent with the next message, renders a document on click, and lets you create, modify, or delete one in place. Settings chooses whether new documents start checked. With context kept, a document is sent only when it is new or has changed.
 
 Entries keep stable wording and IDs. Invalid evidence is struck in full, and its correction becomes a new observation. Corrected thoughts are also appended and linked to the superseded entries. Struck entries remain part of the citable history but are not valid support for conclusions.
 

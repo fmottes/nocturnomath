@@ -115,6 +115,7 @@ async function deleteDocument(name) {
     setDocuments(data.documents || [], data.documents_default);
   } catch (error) {
     console.error("Unable to delete document:", error);
+    showDocumentError(error.message);
   }
 }
 
@@ -153,7 +154,10 @@ export async function openDocument(name, quiet = false) {
   const res = await fetch(`/api/documents/${encodeURIComponent(name)}`);
   if (!res.ok) {
     if (!quiet) {
-      elements.documentsMarkdown.innerHTML = `<p class="empty-state">Document not found: ${name}</p>`;
+      const message = document.createElement("p");
+      message.className = "empty-state";
+      message.textContent = `Document not found: ${name}`;
+      elements.documentsMarkdown.replaceChildren(message);
       state.openDocument = name;
       showDocumentsView("read");
     }
@@ -195,7 +199,7 @@ export function cancelEdit() {
   showDocumentsView(state.openDocument ? "read" : "list");
 }
 
-function showEditorError(message) {
+function showDocumentError(message) {
   elements.documentsError.textContent = message;
   elements.documentsError.classList.remove("hidden");
 }
@@ -218,7 +222,7 @@ export async function saveEdit() {
     else await fetchDocuments();
     await openDocument(creating ? data.name : state.openDocument);
   } catch (error) {
-    showEditorError(error.message);
+    showDocumentError(error.message);
   } finally {
     elements.documentsSave.disabled = false;
   }

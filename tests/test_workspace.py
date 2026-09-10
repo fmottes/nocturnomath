@@ -149,8 +149,21 @@ def test_documents_are_created_listed_and_edited(tmp_path):
     assert [item["name"] for item in listed] == [name]
     assert listed[0]["size"] == len("# Growth\n\nk = 0.4\n")
 
+    spaced = workspace.documents_path / "field notes.md"
+    spaced.write_text("# Field notes\n")
+    assert workspace.read_document(spaced.name)["content"] == "# Field notes\n"
+
     with pytest.raises(FileNotFoundError):
         workspace.read_document("missing.md")
     for bad in ("../config.json", "kb/evidence.md", "notes.txt", ".hidden.md"):
         with pytest.raises(ValueError):
             workspace.document_file(bad)
+
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n")
+    linked = workspace.documents_path / "linked.md"
+    linked.symlink_to(outside)
+    assert "linked.md" not in [item["name"] for item in workspace.list_documents()]
+    with pytest.raises(ValueError, match="symlinks"):
+        workspace.write_document("linked.md", "changed")
+    assert outside.read_text() == "outside\n"

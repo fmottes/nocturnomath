@@ -44,6 +44,11 @@ class FakeClient:
         )
 
 
+class FailingClient(FakeClient):
+    async def query(self, prompt):
+        raise RuntimeError("send failed")
+
+
 @pytest.mark.asyncio
 async def test_query_streams_text_tracks_context_and_logs(session):
     events = []
@@ -186,3 +191,17 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
         await session.query("fifth")
         await session.query("sixth")
         assert "N = 20" in FakeClient.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_document_context_is_retried_when_submission_fails(session):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FailingClient):
+        await session.query("first")
+    assert session._sent_documents == {}
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("second")
+    assert "### inputs.md\n\n# Inputs\n" in FakeClient.prompts[-1]
+    assert "# Evidence" in FakeClient.prompts[-1]

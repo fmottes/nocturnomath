@@ -449,11 +449,18 @@ def test_documents_api_creates_edits_and_selects_documents(session):
         assert client.get("/api/workspace").json()["documents"][0]["included"] is False
 
         assert client.delete("/api/documents/missing.md").status_code == 404
+        session._sent_documents["Inputs.md"] = "# Inputs\n\nN = 20\n"
+        rejected = client.delete(
+            "/api/documents/Inputs.md", headers={"Origin": "https://example.com"}
+        )
+        assert rejected.status_code == 403
+        assert (session.workspace.documents_path / "Inputs.md").is_file()
         deleted = client.delete("/api/documents/Inputs.md")
         assert deleted.status_code == 200
         assert deleted.json()["documents"] == []
         assert not (session.workspace.documents_path / "Inputs.md").exists()
         assert "Inputs.md" not in session.document_choices
+        assert "Inputs.md" not in session._sent_documents
 
         client.post("/api/documents", json={"title": "Inputs", "text": "# Inputs"})
         changed = client.post("/api/documents/default", json={"enabled": False})
