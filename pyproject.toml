@@ -31,9 +31,11 @@ packages = ["nocturnomath"]
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "pre-commit>=4.6.2",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
-    "ruff>=0.12.12",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.6",
 ]
 
 [tool.ruff.lint]
