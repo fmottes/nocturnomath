@@ -47,7 +47,7 @@ def session(tmp_path):
         patch("nocturnomath.session.Kernel", FakeKernel),
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
     ):
-        return ExplorationSession(tmp_path)
+        return ExplorationSession(tmp_path, model="test")
 
 
 class FakeEnvironment:

@@ -34,6 +34,7 @@ def test_startup_discovers_models_without_querying(sdk_model_catalog):
         snapshot = client.get("/api/workspace").json()
         assert snapshot["models"] == ["sonnet"]
         assert snapshot["model_labels"]["sonnet"] == "claude-sonnet-5"
+        assert snapshot["model"] == "sonnet"
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
 
 
@@ -63,7 +64,7 @@ def test_authentication_can_be_changed_before_opening_a_workspace(
         assert response.status_code == 200
         assert response.json()["auth"]["method"] == "subscription"
         assert response.json()["models"] == ["sonnet"]
-        assert response.json()["model"] == "claude-opus-5"
+        assert response.json()["model"] == "sonnet"
         assert "oauth-secret" not in response.text
         assert event["type"] == "auth_changed"
         assert event["auth"]["method"] == "subscription"
@@ -110,7 +111,9 @@ def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
         "SDK unavailable"
     )
     with TestClient(create_app(model="custom-model")) as client:
-        assert client.get("/api/workspace").json()["models"] == []
+        snapshot = client.get("/api/workspace").json()
+        assert snapshot["models"] == []
+        assert snapshot["model"] is None
 
 
 NoopKernel = FakeKernel

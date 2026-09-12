@@ -50,7 +50,7 @@ class ExplorationSession:
     def __init__(
         self,
         workspace_path: Path | str = ".",
-        model: str = "claude-opus-5",
+        model: str | None = None,
         timeout_s: int = 600,
         image_cap: int = 2,
         carry_chat_context: bool = CARRY_CHAT_CONTEXT,
@@ -342,6 +342,8 @@ class ExplorationSession:
     async def query(self, user_text: str):
         if self._is_busy:
             raise RuntimeError("Agent is already running a query.")
+        if self.model is None:
+            raise RuntimeError("No model available.")
 
         self._is_busy = True
         self._pending_verdict = None

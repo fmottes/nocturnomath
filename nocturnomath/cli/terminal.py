@@ -210,7 +210,7 @@ class TerminalApp:
                 style="dim",
             )
             self.write(f"workspace: {session.workspace_path}", style="dim")
-            self.write(f"model: {session.model}", style="dim")
+            self.write(f"model: {session.model or 'No model available'}", style="dim")
             auth = self.runtime.auth.public()
             self.write(f"Claude auth: {auth['label']}", style="dim")
             if auth["note"]:
@@ -234,7 +234,7 @@ class TerminalApp:
             kernel = "busy"
         else:
             kernel = "ready" if session.kernel.is_alive() else "dead"
-        model = session.model
+        model = session.model or "No model available"
         if self.pending_model:
             model += f" → {self.pending_model}"
         context = "on" if session.carry_chat_context else "off"
@@ -449,10 +449,12 @@ class TerminalApp:
         if self.runtime.changing or session.has_active_query():
             raise RuntimeError(f"Cannot {action} while the agent is running a query.")
 
-    def check_model(self, model: str):
+    def check_model(self, requested: str | None):
         if not self.runtime.models:
+            self.write("No model available.", style="dim")
+        elif requested and requested not in self.runtime.models:
             self.write(
-                f"Model catalogue unavailable; /model cannot switch from {model}.",
+                f"Model {requested} is unavailable; using {self.runtime.model}.",
                 style="dim",
             )
 

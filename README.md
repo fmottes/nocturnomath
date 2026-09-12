@@ -56,7 +56,7 @@ Both interfaces accept:
 
 - `--path`, `-p`: starting folder; the terminal opens it immediately
 - `--python`: research Python executable, or `managed`
-- `--model`: Claude model (default: `claude-opus-5`)
+- `--model`: Claude model to use when available; otherwise the first model reported by the SDK is selected
 - `--timeout`: kernel-run limit in seconds (default: `600`)
 - `--images`: plots returned to Claude per run (default: `2`)
 
@@ -76,7 +76,13 @@ Manually entered credentials override credential environment variables only for 
 
 ### Terminal mode
 
-Run Nocturnomath without a browser:
+Run Nocturnomath without a browser after installing it as a tool:
+
+```bash
+nocturnomath-cli --path /path/to/project
+```
+
+From a local checkout, use:
 
 ```bash
 uv run nocturnomath-cli --path /path/to/project

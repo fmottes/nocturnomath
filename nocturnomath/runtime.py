@@ -25,7 +25,7 @@ class Runtime:
         self,
         session: ExplorationSession | None = None,
         *,
-        model: str = "claude-opus-5",
+        model: str | None = None,
         timeout_s: int = 600,
         image_cap: int = 2,
         navigator_root: Path | str = ".",
@@ -90,6 +90,12 @@ class Runtime:
             logger.warning("Could not discover Claude models: %s", exc)
         self.models = models
         self.model_labels = labels
+        selected = (
+            self.model if self.model in models else (models[0] if models else None)
+        )
+        self.model = selected
+        if self.session:
+            self.session.model = selected
 
     async def authenticate(
         self, method: AuthMethod, credential: str | None = None
@@ -258,6 +264,8 @@ class Runtime:
             raise RuntimeError("Open a workspace folder before starting a query.")
         if self.session.has_active_query():
             raise RuntimeError("The agent is already running a query.")
+        if model is None and self.session.model is None:
+            raise ValueError("No model available.")
         if model is not None:
             if model not in self.models:
                 raise ValueError("Choose a model from the model selector.")

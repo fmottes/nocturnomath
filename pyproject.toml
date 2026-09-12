@@ -1,11 +1,11 @@
 [project]
 name = "nocturnomath"
 version = "0.1.0"
+authors = [{ name = "Francesco Mottes" }]
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.2.152",
     "fastapi>=0.115.0",
-    "ipykernel>=7.3.0",
     "jupyter-client>=8.10.0",
     "prompt-toolkit>=3.0.53",
     "rich>=15.0.0",

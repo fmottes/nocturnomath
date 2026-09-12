@@ -47,6 +47,8 @@ def test_terminal_command_uses_shared_options():
     assert args.model == "test"
     assert args.timeout == 20
 
+    assert terminal_parser().parse_args([]).model is None
+
 
 class Harness:
     """Drive a TerminalApp and read back everything it printed."""

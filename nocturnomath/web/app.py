@@ -66,7 +66,7 @@ def create_app(
     session: ExplorationSession | None = None,
     *,
     browser_url: str | None = None,
-    model: str = "claude-opus-5",
+    model: str | None = None,
     timeout_s: int = 600,
     image_cap: int = 2,
     navigator_root: Path | str = ".",

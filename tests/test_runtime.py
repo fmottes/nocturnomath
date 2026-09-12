@@ -65,6 +65,14 @@ async def test_start_query_validates_the_model_and_reports_failures(session):
     assert "meta" in kinds
 
 
+def test_start_query_requires_a_discovered_model(session):
+    session.model = None
+    runtime = Runtime(session)
+
+    with pytest.raises(ValueError, match="No model available"):
+        runtime.start_query("question")
+
+
 @pytest.mark.asyncio
 async def test_transition_rejects_concurrent_changes(session):
     runtime = Runtime(session)

@@ -14,7 +14,9 @@ def add_session_arguments(parser: argparse.ArgumentParser):
         "--python",
         help="research environment Python executable (or managed); remembered per workspace",
     )
-    parser.add_argument("--model", default="claude-opus-5", help="Claude model to use")
+    parser.add_argument(
+        "--model", help="Claude model to use when it is available in the SDK catalogue"
+    )
     parser.add_argument(
         "--timeout", type=int, default=600, help="seconds allowed per kernel run"
     )
