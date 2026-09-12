@@ -43,3 +43,20 @@ export function highlightBlocks(container) {
     });
   }
 }
+
+export function renderMath(container) {
+  if (typeof window.renderMathInElement !== "function") return;
+  try {
+    window.renderMathInElement(container, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "\\[", right: "\\]", display: true },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "$", right: "$", display: false },
+      ],
+      throwOnError: false,
+    });
+  } catch (error) {
+    console.warn("KaTeX error, leaving formula source visible:", error);
+  }
+}

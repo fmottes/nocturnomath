@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js?v=20260910-1";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260910-1";
-import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260910-1";
+import { elements, state } from "./state.js?v=20260910-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260910-2";
+import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260910-2";
 
 // ============================================================================
 // Documents tab: a list of .nocturnomath/documents/*.md with a checkbox that
@@ -172,6 +172,7 @@ export async function openDocument(name, quiet = false) {
   rewriteEmbeddedImageUrls(elements.documentsMarkdown, data.path);
   rewriteDocumentLinks(elements.documentsMarkdown, data.path);
   highlightBlocks(elements.documentsMarkdown);
+  renderMath(elements.documentsMarkdown);
   if (!quiet) showDocumentsView("read");
   elements.documentsMeta.textContent = `Updated: ${new Date(data.modified * 1000).toLocaleTimeString()} (${data.size} B)`;
 }

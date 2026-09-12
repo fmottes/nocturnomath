@@ -205,6 +205,7 @@
 }
 .markdown-body td:not(:first-child) { text-align: right; }
 .markdown-body img { max-width: 100%; border: 1px solid var(--rule-strong); background: var(--image-sheet); }
+.markdown-body .katex-display { overflow-x: auto; overflow-y: hidden; }
 
 /* Highlighter, reserved for results the agent marked as important */
 .markdown-body mark {
