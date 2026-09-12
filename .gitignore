@@ -224,6 +224,7 @@ __marimo__/
 ._*
 
 # Test runs & exploration artifacts
+.nocturnomath/
 test_runs/
 scratch/
 notes.md

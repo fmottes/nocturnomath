@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+MANAGED_RESEARCH_PACKAGES = ("ipykernel", "matplotlib", "numpy", "pandas")
+
 
 class ResearchEnvironment:
     def __init__(self, workspace, python=None):
@@ -37,7 +39,7 @@ class ResearchEnvironment:
                     [
                         str(self.python),
                         "-c",
-                        "import ipykernel, matplotlib, numpy, pandas",
+                        f"import {', '.join(MANAGED_RESEARCH_PACKAGES)}",
                     ]
                 )
             except ValueError:
@@ -49,10 +51,7 @@ class ResearchEnvironment:
                         "install",
                         "--python",
                         str(self.python),
-                        "ipykernel",
-                        "matplotlib",
-                        "numpy",
-                        "pandas",
+                        *MANAGED_RESEARCH_PACKAGES,
                     ]
                 )
         self.command(
