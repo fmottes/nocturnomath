@@ -24,6 +24,12 @@ uv tool install git+https://github.com/fmottes/nocturnomath.git
 nocturnomath
 ```
 
+Update an installation made this way to the latest version:
+
+```bash
+uv tool upgrade nocturnomath
+```
+
 For a local checkout:
 
 ```bash
@@ -33,10 +39,17 @@ uv sync
 uv run nocturnomath
 ```
 
-Set the folder navigator's starting location with `--path` / `-p`:
+By default, Nocturnomath uses the current directory: the web app starts its workspace picker there, and the terminal client opens it directly. Change to the directory you want before launching:
 
 ```bash
-uv run nocturnomath --path /path/to/project
+cd /path/to/project
+nocturnomath
+```
+
+Alternatively, set that location without changing directories by passing `--path` / `-p`:
+
+```bash
+nocturnomath --path /path/to/project
 ```
 
 Both interfaces accept:
