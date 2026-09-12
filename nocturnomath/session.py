@@ -22,7 +22,7 @@ from claude_agent_sdk import (
 from .auth import ClaudeAuth
 from .environment import ResearchEnvironment
 from .kernel import Kernel
-from .prompt import SYSTEM_PROMPT
+from .prompt import build_system_prompt
 from .tools import build_tools
 from .workspace import Workspace
 
@@ -354,7 +354,7 @@ class ExplorationSession:
             await self.emit("status_change", status="thinking")
             self.log_transcript("user", text=user_text)
             options = ClaudeAgentOptions(
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=build_system_prompt(),
                 mcp_servers={
                     "explore": create_sdk_mcp_server("explore", tools=self.tools)
                 },
