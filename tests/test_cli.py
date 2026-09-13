@@ -37,17 +37,34 @@ def test_web_command_options():
     assert args.timeout == 10
     assert args.images == 1
     assert args.port == 9000
+    assert args.default_model is None
+    assert args.default_effort is None
 
 
 def test_terminal_command_uses_shared_options():
     args = terminal_parser().parse_args(
-        ["--path", "/tmp/project", "--model", "test", "--timeout", "20"]
+        [
+            "--path",
+            "/tmp/project",
+            "--default-model",
+            "test",
+            "--default-effort",
+            "xhigh",
+            "--timeout",
+            "20",
+        ]
     )
     assert args.path == "/tmp/project"
-    assert args.model == "test"
+    assert args.default_model == "test"
+    assert args.default_effort == "xhigh"
     assert args.timeout == 20
 
-    assert terminal_parser().parse_args([]).model is None
+    defaults = terminal_parser().parse_args([])
+    assert defaults.default_model is None
+    assert defaults.default_effort is None
+
+    with pytest.raises(SystemExit):
+        terminal_parser().parse_args(["--default-effort", "default"])
 
 
 class Harness:

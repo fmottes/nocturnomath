@@ -35,7 +35,7 @@ async def test_subscribers_receive_session_events(session):
 
 
 @pytest.mark.asyncio
-async def test_start_query_validates_the_model_and_reports_failures(session):
+async def test_start_query_validates_model_and_effort_and_reports_failures(session):
     runtime = Runtime(session)
     runtime.start()
     events = []
@@ -46,14 +46,22 @@ async def test_start_query_validates_the_model_and_reports_failures(session):
 
     session.query = query
     runtime.models = ["sonnet"]
+    runtime.model_efforts = {"sonnet": ["low", "medium", "high", "xhigh"]}
 
     with pytest.raises(ValueError, match="model selector"):
         runtime.start_query("question", "unknown")
     assert session.model != "unknown"
 
-    runtime.start_query("question", "sonnet")
+    with pytest.raises(ValueError, match="effort supported"):
+        runtime.start_query("question", "sonnet", "extreme")
+    assert session.model == "test"
+    assert session.effort == "high"
+
+    runtime.start_query("question", "sonnet", "low")
     assert session.model == "sonnet"
+    assert session.effort == "low"
     assert runtime.model == "sonnet"
+    assert runtime.effort == "low"
     await asyncio.gather(session._current_task, return_exceptions=True)
 
     assert ("error", {"message": "query exploded"}) in events
@@ -125,7 +133,11 @@ async def test_auth_selection_reaches_sdk_and_keeps_context(session):
             return_value={
                 "models": [
                     {"value": "default"},
-                    {"value": "sonnet", "resolvedModel": "claude-sonnet-5"},
+                    {
+                        "value": "sonnet",
+                        "resolvedModel": "claude-sonnet-5",
+                        "supportedEffortLevels": ["low", "medium", "high"],
+                    },
                 ]
             }
         )
@@ -138,7 +150,7 @@ async def test_auth_selection_reaches_sdk_and_keeps_context(session):
     assert "oauth-secret" not in repr(result)
     assert session.auth is runtime.auth
     assert session._sdk_session_id == "resumed-session"
-    assert runtime.models == ["sonnet"]
+    assert runtime.models == ["claude-sonnet-5"]
 
 
 @pytest.mark.asyncio

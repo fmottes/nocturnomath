@@ -300,7 +300,7 @@
   padding: 13px 18px 15px;
   border-top: 1px solid var(--rule-strong);
 }
-.command-chips { display: flex; align-items: center; gap: 7px; }
+.command-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .chips-hint {
   margin-left: auto;
   font-family: var(--font-mono);

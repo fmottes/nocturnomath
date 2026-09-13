@@ -17,11 +17,28 @@ def sdk_model_catalog():
         sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
             return_value={
                 "models": [
-                    {"value": "default", "displayName": "Default (recommended)"},
+                    {
+                        "value": "default",
+                        "displayName": "Default (recommended)",
+                        "resolvedModel": "claude-opus-5",
+                        "supportedEffortLevels": [
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                            "max",
+                        ],
+                    },
                     {
                         "value": "sonnet",
                         "displayName": "Sonnet",
                         "resolvedModel": "claude-sonnet-5",
+                        "supportedEffortLevels": [
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                        ],
                     },
                 ]
             }
@@ -32,10 +49,29 @@ def sdk_model_catalog():
 def test_startup_discovers_models_without_querying(sdk_model_catalog):
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
-        assert snapshot["models"] == ["sonnet"]
-        assert snapshot["model_labels"]["sonnet"] == "claude-sonnet-5"
-        assert snapshot["model"] == "sonnet"
+        assert snapshot["models"] == ["claude-opus-5", "claude-sonnet-5"]
+        assert snapshot["model_labels"]["claude-sonnet-5"] == "claude-sonnet-5"
+        assert snapshot["model"] == "claude-opus-5"
+        assert snapshot["effort"] == "high"
+        assert snapshot["model_efforts"]["claude-opus-5"][-1] == "max"
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
+
+
+def test_startup_uses_first_model_when_sdk_has_no_resolved_default(sdk_model_catalog):
+    sdk_model_catalog.return_value.__aenter__.return_value.get_server_info = AsyncMock(
+        return_value={
+            "models": [
+                {"value": "sonnet", "resolvedModel": "claude-sonnet-5"},
+                {"value": "opus", "resolvedModel": "claude-opus-5"},
+            ]
+        }
+    )
+
+    with TestClient(create_app()) as client:
+        snapshot = client.get("/api/workspace").json()
+
+    assert snapshot["model"] == "claude-sonnet-5"
+    assert snapshot["model_labels"]["claude-opus-5"] == "claude-opus-5"
 
 
 def test_startup_opens_the_dashboard_in_a_new_tab():
@@ -63,8 +99,11 @@ def test_authentication_can_be_changed_before_opening_a_workspace(
 
         assert response.status_code == 200
         assert response.json()["auth"]["method"] == "subscription"
-        assert response.json()["models"] == ["sonnet"]
-        assert response.json()["model"] == "sonnet"
+        assert response.json()["models"] == [
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ]
+        assert response.json()["model"] == "claude-opus-5"
         assert "oauth-secret" not in response.text
         assert event["type"] == "auth_changed"
         assert event["auth"]["method"] == "subscription"
@@ -166,6 +205,13 @@ def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
     app = create_app(navigator_root=tmp_path)
     with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
         assert websocket.receive_json()["workspace"]["is_open"] is False
+        assert (
+            client.post(
+                "/api/session/defaults",
+                json={"model": "claude-opus-5", "effort": "high"},
+            ).status_code
+            == 409
+        )
         websocket.send_json({"action": "query", "text": "question"})
         assert websocket.receive_json() == {
             "type": "error",
@@ -191,6 +237,9 @@ def test_http_workspace_files_and_static_assets(session, tmp_path):
             == "# Report"
         )
         assert client.get("/").status_code == 200
+        page = client.get("/").text
+        assert 'id="effort-select"' in page
+        assert 'value="default">Effort:' not in page
         static_script = client.get("/static/js/main.js")
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store"
@@ -292,6 +341,8 @@ def test_new_session_restarts_kernel_and_broadcasts_reset(session):
         assert websocket.receive_json() == {
             "type": "session_reset",
             "session_id": "S002",
+            "model": "claude-opus-5",
+            "effort": "high",
         }
         assert session.kernel.restarts == 1
         websocket.send_json({"action": "query", "text": "/new"})
@@ -322,11 +373,11 @@ def test_resume_session_can_restore_kernel(session):
     assert session.kernel.executed_codes == ["value = 3"]
 
 
-def test_model_selection_applies_to_next_query_without_resetting_context(session):
-    seen_models = []
+def test_model_and_effort_apply_to_next_query_without_resetting_context(session):
+    seen_settings = []
 
     async def query(text):
-        seen_models.append(session.model)
+        seen_settings.append((session.model, session.effort))
         await session.emit("turn_complete")
 
     session.query = query
@@ -336,15 +387,65 @@ def test_model_selection_applies_to_next_query_without_resetting_context(session
         client.websocket_connect("/ws") as websocket,
     ):
         websocket.receive_json()
-        websocket.send_json({"action": "query", "text": "question", "model": "sonnet"})
+        websocket.send_json(
+            {
+                "action": "query",
+                "text": "question",
+                "model": "claude-sonnet-5",
+                "effort": "xhigh",
+            }
+        )
         assert websocket.receive_json()["type"] == "user_message"
         assert websocket.receive_json()["type"] == "turn_complete"
-        assert seen_models == ["sonnet"]
+        assert seen_settings == [("claude-sonnet-5", "xhigh")]
         assert session._sdk_session_id == "keep-context"
         assert session.kernel.restarts == 0
         websocket.send_json({"action": "query", "text": "question", "model": "unknown"})
         assert websocket.receive_json()["type"] == "error"
-        assert seen_models == ["sonnet"]
+        websocket.send_json(
+            {
+                "action": "query",
+                "text": "question",
+                "model": "claude-sonnet-5",
+                "effort": "extreme",
+            }
+        )
+        assert websocket.receive_json()["type"] == "error"
+        assert seen_settings == [("claude-sonnet-5", "xhigh")]
+
+
+def test_workspace_defaults_apply_only_when_a_new_session_starts(session):
+    app = create_app(session)
+    with TestClient(app) as client:
+        before = client.get("/api/workspace").json()
+        assert before["model"] == "claude-opus-5"
+        assert before["session_defaults"] == {
+            "model": "claude-opus-5",
+            "effort": "high",
+        }
+
+        changed = client.post(
+            "/api/session/defaults",
+            json={"model": "claude-sonnet-5", "effort": "xhigh"},
+        )
+        assert changed.status_code == 200
+        assert changed.json()["session_defaults"] == {
+            "model": "claude-sonnet-5",
+            "effort": "xhigh",
+        }
+        assert session.model == "claude-opus-5"
+        assert session.workspace.read_config()["default_model"] == "claude-sonnet-5"
+
+        assert client.post("/api/session/new").status_code == 200
+        after = client.get("/api/workspace").json()
+        assert after["model"] == "claude-sonnet-5"
+        assert after["effort"] == "xhigh"
+
+        invalid = client.post(
+            "/api/session/defaults",
+            json={"model": "claude-sonnet-5", "effort": "max"},
+        )
+        assert invalid.status_code == 400
 
 
 def test_exit_requests_launcher_shutdown_and_rejects_foreign_origin(session):

@@ -57,6 +57,11 @@ class DocumentsDefaultRequest(BaseModel):
     enabled: bool
 
 
+class SessionDefaultsRequest(BaseModel):
+    model: str
+    effort: str | None = None
+
+
 class AuthRequest(BaseModel):
     method: Literal["claude_code", "subscription", "api_key"]
     credential: SecretStr | None = None
@@ -67,6 +72,7 @@ def create_app(
     *,
     browser_url: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     timeout_s: int = 600,
     image_cap: int = 2,
     navigator_root: Path | str = ".",
@@ -77,6 +83,7 @@ def create_app(
     runtime = WebRuntime(
         session,
         model=model,
+        effort=effort,
         timeout_s=timeout_s,
         image_cap=image_cap,
         navigator_root=navigator_root,
@@ -177,6 +184,16 @@ def create_app(
             "model": runtime.session.model if runtime.session else runtime.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,
+            "model_efforts": runtime.model_efforts,
+            "effort": runtime.session.effort if runtime.session else runtime.effort,
+            "session_defaults": (
+                {
+                    "model": runtime.session.default_model,
+                    "effort": runtime.session.default_effort,
+                }
+                if runtime.session
+                else None
+            ),
         }
 
     @app.get("/api/auth")
@@ -402,15 +419,39 @@ def create_app(
         await session.interrupt()
         return {"status": "ok"}
 
+    @app.post("/api/session/defaults")
+    async def set_session_defaults(defaults: SessionDefaultsRequest, request: Request):
+        require_same_origin(request, "Session default changes")
+        try:
+            runtime.set_session_defaults(defaults.model, defaults.effort)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        session = active_session()
+        data = {
+            "session_defaults": {
+                "model": session.default_model,
+                "effort": session.default_effort,
+            }
+        }
+        await runtime.broadcast("session_defaults_changed", data)
+        return data
+
     @app.post("/api/session/new")
     async def new_session():
         try:
             session = active_session()
-            await runtime.transition(session.reset_client_session)
+            await runtime.transition(runtime.reset_session)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         await runtime.broadcast(
-            "session_reset", {"session_id": session.workspace.session_id}
+            "session_reset",
+            {
+                "session_id": session.workspace.session_id,
+                "model": session.model,
+                "effort": session.effort,
+            },
         )
         return {"status": "ok"}
 
@@ -493,10 +534,14 @@ def create_app(
                                 },
                             )
                             continue
-                        await runtime.transition(session.reset_client_session)
+                        await runtime.transition(runtime.reset_session)
                         await runtime.broadcast(
                             "session_reset",
-                            {"session_id": session.workspace.session_id},
+                            {
+                                "session_id": session.workspace.session_id,
+                                "model": session.model,
+                                "effort": session.effort,
+                            },
                         )
                         continue
                     if text == "/restart":
@@ -533,8 +578,20 @@ def create_app(
                             {"message": "Choose a model from the model selector."},
                         )
                         continue
+                    effort = data.get("effort")
+                    target_model = model or session.model
+                    if effort is not None and effort not in runtime.model_efforts.get(
+                        target_model or "", []
+                    ):
+                        await runtime.broadcast(
+                            "error",
+                            {
+                                "message": "Choose an effort supported by the selected model."
+                            },
+                        )
+                        continue
                     await runtime.broadcast("user_message", {"text": text})
-                    runtime.start_query(text, model)
+                    runtime.start_query(text, model, effort)
 
                 elif action == "interrupt":
                     await session.interrupt()
@@ -560,9 +617,14 @@ def create_app(
                             },
                         )
                         continue
-                    await runtime.transition(session.reset_client_session)
+                    await runtime.transition(runtime.reset_session)
                     await runtime.broadcast(
-                        "session_reset", {"session_id": session.workspace.session_id}
+                        "session_reset",
+                        {
+                            "session_id": session.workspace.session_id,
+                            "model": session.model,
+                            "effort": session.effort,
+                        },
                     )
                 elif action == "resume_session":
                     session_id = data.get("id")

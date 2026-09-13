@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20260910-2";
-import { initWebSocket, sendWs } from "./transport.js?v=20260910-2";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260910-3";
-import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260910-2";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260910-2";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260910-2";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260910-2";
-import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20260910-2";
+import { elements, state } from "./state.js?v=20260913-1";
+import { initWebSocket, sendWs } from "./transport.js?v=20260913-1";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260913-1";
+import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260913-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260913-1";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260913-1";
+import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20260913-1";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -114,8 +114,13 @@ function handleServerEvent(event) {
 
     case "session_reset":
       setSessionId(event.session_id);
+      setActiveModelAndEffort(event.model, event.effort);
       clearChat();
       updateKernelStatus(true, false);
+      break;
+
+    case "session_defaults_changed":
+      setSessionDefaults(event.session_defaults);
       break;
 
     case "session_resumed":
@@ -205,7 +210,11 @@ function setupEventListeners() {
     if (!text) return;
     if (!elements.modelSelect.value) return;
 
-    sendWs("query", { text, model: elements.modelSelect.value });
+    sendWs("query", {
+      text,
+      model: elements.modelSelect.value,
+      effort: elements.effortSelect.value || null,
+    });
     elements.promptInput.value = "";
     elements.promptInput.style.height = "44px";
   });
@@ -223,6 +232,13 @@ function setupEventListeners() {
     elements.promptInput.style.height = "44px";
     elements.promptInput.style.height = Math.min(elements.promptInput.scrollHeight, 160) + "px";
   });
+  elements.modelSelect.addEventListener("change", () => {
+    setEffortForModel(elements.effortSelect, elements.modelSelect.value);
+  });
+  elements.defaultModelSelect.addEventListener("change", () => {
+    setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value);
+  });
+  elements.sessionDefaultsForm.addEventListener("submit", saveSessionDefaults);
 
   // Figures session filter
   elements.plotsFilterBtn.addEventListener("click", () => togglePlotsFilterMenu());
@@ -377,8 +393,39 @@ function setupEventListeners() {
 
 function applyAuthChange(data) {
   setAuthStatus(data.auth);
-  setModelCatalogue(data.models || [], data.model_labels || {}, data.model);
+  setModelCatalogue(
+    data.models || [],
+    data.model_labels || {},
+    data.model,
+    data.model_efforts || {},
+    data.effort,
+  );
+  if (data.session_defaults) setSessionDefaults(data.session_defaults);
   refreshSendButton();
+}
+
+async function saveSessionDefaults(event) {
+  event.preventDefault();
+  elements.sessionDefaultsSave.disabled = true;
+  elements.sessionDefaultsStatus.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/session/defaults", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: elements.defaultModelSelect.value,
+        effort: elements.defaultEffortSelect.value || null,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to save session defaults");
+    setSessionDefaults(data.session_defaults);
+    elements.sessionDefaultsStatus.textContent = "Saved for this workspace.";
+  } catch (error) {
+    elements.sessionDefaultsStatus.textContent = error.message;
+  } finally {
+    elements.sessionDefaultsSave.disabled = !state.models.length;
+  }
 }
 
 function openAuthModal() {

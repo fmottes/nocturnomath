@@ -58,6 +58,7 @@ async def test_query_streams_text_tracks_context_and_logs(session):
 
     assert session._sdk_session_id == "sdk-session"
     assert FakeClient.options_used[-1].include_partial_messages is True
+    assert FakeClient.options_used[-1].effort == "high"
     assert [event_type for event_type, _ in events] == [
         "status_change",
         "assistant_delta",
@@ -85,6 +86,16 @@ async def test_query_streams_text_tracks_context_and_logs(session):
     assert [record["text"] for record in records if record["kind"] == "agent"] == [
         "answer"
     ]
+
+
+@pytest.mark.asyncio
+async def test_query_passes_selected_effort_to_the_sdk(session):
+    session.effort = "xhigh"
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("question")
+
+    assert FakeClient.options_used[-1].effort == "xhigh"
 
 
 @pytest.mark.asyncio

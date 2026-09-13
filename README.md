@@ -56,11 +56,14 @@ Both interfaces accept:
 
 - `--path`, `-p`: starting folder; the terminal opens it immediately
 - `--python`: research Python executable, or `managed`
-- `--model`: Claude model to use when available; otherwise the first model reported by the SDK is selected
+- `--default-model`: exact Claude model identifier for new sessions; when omitted, uses the model reported as the SDK default
+- `--default-effort`: reasoning effort for new sessions (`low`, `medium`, `high`, `xhigh`, or `max`); when omitted, Nocturnomath uses `high`
 - `--timeout`: kernel-run limit in seconds (default: `600`)
 - `--images`: plots returned to Claude per run (default: `2`)
 
 The web app also accepts `--port` (default `8000`), `--host` (default `127.0.0.1`), and `--no-browser`.
+
+The web Settings panel can override the model and effort used for each new session in the current workspace. The message composer still controls only the next message.
 
 ### Claude authentication
 

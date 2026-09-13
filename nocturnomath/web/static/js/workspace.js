@@ -1,8 +1,8 @@
-import { elements, state } from "./state.js?v=20260910-2";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260910-2";
-import { openLightbox } from "./ui.js?v=20260910-2";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260910-2";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260910-2";
+import { elements, state } from "./state.js?v=20260913-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-1";
+import { openLightbox } from "./ui.js?v=20260913-1";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260913-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -18,6 +18,10 @@ export function applyWorkspace(ws) {
     state.documentContent = null;
     state.documentPath = null;
     state.openDocumentContent = null;
+    state.sessionDefaults = null;
+    elements.modelSelect.value = "";
+    elements.effortSelect.value = "";
+    elements.sessionDefaultsStatus.textContent = "";
     showDocumentsView("list");
   }
   state.workspace = ws;
@@ -31,7 +35,14 @@ export function applyWorkspace(ws) {
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
   setSessionId(ws.session_id);
-  setModelCatalogue(ws.models || [], ws.model_labels || {}, ws.model);
+  setModelCatalogue(
+    ws.models || [],
+    ws.model_labels || {},
+    ws.model,
+    ws.model_efforts || {},
+    ws.effort,
+  );
+  setSessionDefaults(ws.session_defaults);
 
   updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
   updateAgentStatus(ws.is_busy ? "thinking" : "idle");
@@ -80,15 +91,60 @@ export function setAuthStatus(auth) {
   elements.authNote.classList.toggle("hidden", !auth.note);
 }
 
-export function setModelCatalogue(models = [], labels = {}, serverModel = null) {
+function fillModelSelect(select, models, labels, preferred) {
+  select.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
+  if (!models.length) select.add(new Option("No model available", ""));
+  select.disabled = !models.length;
+  select.value = models.includes(preferred) ? preferred : models[0] || "";
+}
+
+export function setEffortForModel(select, model, preferred = null) {
+  const efforts = state.modelEfforts[model] || [];
+  select.replaceChildren(...efforts.map((effort) => new Option(effort, effort)));
+  if (!efforts.length) select.add(new Option("No effort setting", ""));
+  select.disabled = !efforts.length;
+  select.value = efforts.includes(preferred)
+    ? preferred
+    : efforts.includes("high")
+      ? "high"
+      : efforts[0] || "";
+}
+
+export function setActiveModelAndEffort(model, effort) {
+  if (state.models.includes(model)) elements.modelSelect.value = model;
+  setEffortForModel(elements.effortSelect, elements.modelSelect.value, effort);
+}
+
+export function setSessionDefaults(defaults) {
+  state.sessionDefaults = defaults || null;
+  const preferredModel = defaults?.model || state.models[0] || "";
+  fillModelSelect(elements.defaultModelSelect, state.models, state.modelLabels, preferredModel);
+  setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value, defaults?.effort);
+  elements.sessionDefaultsSave.disabled = !state.models.length;
+}
+
+export function setModelCatalogue(
+  models = [],
+  labels = {},
+  serverModel = null,
+  modelEfforts = {},
+  serverEffort = null,
+) {
   // The dropdown decides the model of the next message, so an unsent choice
   // survives a catalogue refresh; otherwise follow the server's model.
-  const current = elements.modelSelect.value;
-  elements.modelSelect.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
-  if (!models.length) elements.modelSelect.add(new Option("No model available", ""));
-  elements.modelSelect.disabled = !models.length;
-  const preferred = [current, serverModel].find((model) => models.includes(model));
-  elements.modelSelect.value = preferred || models[0] || "";
+  const currentModel = elements.modelSelect.value;
+  const currentEffort = elements.effortSelect.value;
+  state.models = models;
+  state.modelLabels = labels;
+  state.modelEfforts = modelEfforts;
+  const preferred = [currentModel, serverModel].find((model) => models.includes(model));
+  fillModelSelect(elements.modelSelect, models, labels, preferred);
+  setEffortForModel(
+    elements.effortSelect,
+    elements.modelSelect.value,
+    currentModel === elements.modelSelect.value ? currentEffort : serverEffort,
+  );
+  if (state.sessionDefaults) setSessionDefaults(state.sessionDefaults);
 }
 
 const RECENT_WORKSPACES_KEY = "nocturnomath.recent-workspaces";

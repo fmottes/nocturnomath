@@ -33,7 +33,8 @@ def main():
     url = f"http://{args.host}:{args.port}"
     app = create_app(
         browser_url=None if args.no_browser else url,
-        model=args.model,
+        model=args.default_model,
+        effort=args.default_effort,
         timeout_s=args.timeout,
         image_cap=args.images,
         navigator_root=navigator_root,

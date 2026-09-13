@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js?v=20260910-2";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260910-2";
-import { openLightbox } from "./ui.js?v=20260910-2";
+import { elements, state } from "./state.js?v=20260913-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-1";
+import { openLightbox } from "./ui.js?v=20260913-1";
 
 // ============================================================================
 // Chat UI Rendering

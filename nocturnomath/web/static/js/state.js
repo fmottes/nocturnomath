@@ -26,6 +26,10 @@ export const state = {
   folderPickerMode: "open",
   historyLoading: false,
   auth: null,
+  models: [],
+  modelLabels: {},
+  modelEfforts: {},
+  sessionDefaults: null,
 };
 
 export const elements = {
@@ -40,6 +44,12 @@ export const elements = {
   recentWorkspaces: document.getElementById("recent-workspaces"),
   workspacePath: document.getElementById("workspace-path"),
   modelSelect: document.getElementById("model-select"),
+  effortSelect: document.getElementById("effort-select"),
+  defaultModelSelect: document.getElementById("default-model-select"),
+  defaultEffortSelect: document.getElementById("default-effort-select"),
+  sessionDefaultsForm: document.getElementById("session-defaults-form"),
+  sessionDefaultsSave: document.getElementById("session-defaults-save"),
+  sessionDefaultsStatus: document.getElementById("session-defaults-status"),
   kernelDot: document.getElementById("kernel-dot"),
   kernelText: document.getElementById("kernel-text"),
   chatStatusBadge: document.getElementById("chat-status-badge"),

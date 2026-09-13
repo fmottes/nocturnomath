@@ -40,6 +40,7 @@
 }
 .file-select:focus,
 .model-select-native:focus { border-color: var(--blue); }
+.effort-select-native { max-width: 150px; }
 
 .toggle-label {
   display: flex;

@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js?v=20260910-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260910-2";
-import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260910-2";
+import { elements, state } from "./state.js?v=20260913-1";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260913-1";
+import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260913-1";
 
 // ============================================================================
 // Documents tab: a list of .nocturnomath/documents/*.md with a checkbox that

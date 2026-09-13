@@ -75,13 +75,23 @@
 .form-input:focus { border-color: var(--blue); }
 #auth-form { display: flex; flex-direction: column; gap: 16px; }
 
-.environment-settings {
+.settings-card {
   display: flex;
   flex-direction: column;
   gap: 14px;
   padding: 14px;
   background: var(--sheet-sunk);
   border: 1px solid var(--rule);
+}
+.session-defaults-form { gap: 12px; }
+.session-default-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(120px, 1fr);
+  gap: 10px;
+}
+.session-default-fields .form-input { width: 100%; }
+@media (max-width: 520px) {
+  .session-default-fields { grid-template-columns: 1fr; }
 }
 .environment-current {
   display: grid;

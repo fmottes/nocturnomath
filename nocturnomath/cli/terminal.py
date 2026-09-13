@@ -211,6 +211,7 @@ class TerminalApp:
             )
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model or 'No model available'}", style="dim")
+            self.write(f"effort: {session.effort}", style="dim")
             auth = self.runtime.auth.public()
             self.write(f"Claude auth: {auth['label']}", style="dim")
             if auth["note"]:
@@ -241,8 +242,8 @@ class TerminalApp:
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
         return (
-            f"kernel {kernel} · model {model} · auth {self.runtime.auth.method} · context {context} · "
-            f"chat {chat} · {self.status}"
+            f"kernel {kernel} · model {model} · effort {session.effort} · "
+            f"auth {self.runtime.auth.method} · context {context} · chat {chat} · {self.status}"
         )
 
     def show_help(self):
@@ -522,8 +523,7 @@ class TerminalApp:
 
     async def _command_new(self, argument: str) -> bool:
         self.require_idle("start a new session")
-        session = self.runtime.session
-        await self.runtime.transition(session.reset_client_session)
+        await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
 
@@ -793,7 +793,8 @@ async def run_terminal(args: argparse.Namespace):
     console = Console()
     app = TerminalApp(
         Runtime(
-            model=args.model,
+            model=args.default_model,
+            effort=args.default_effort,
             timeout_s=args.timeout,
             image_cap=args.images,
             navigator_root=args.path,
@@ -810,7 +811,7 @@ async def run_terminal(args: argparse.Namespace):
         return
     app.initial_python = None
     await app.runtime.discover_models()
-    app.check_model(args.model)
+    app.check_model(args.default_model)
     app.banner()
 
     loop = asyncio.get_running_loop()

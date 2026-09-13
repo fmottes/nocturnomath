@@ -167,6 +167,7 @@
           <!-- Slash command helper chips -->
           <div class="command-chips">
             <select id="model-select" class="model-select-native" aria-label="Model for next message"></select>
+            <select id="effort-select" class="model-select-native effort-select-native" aria-label="Reasoning effort for next message" title="Reasoning effort for next message"></select>
             <span class="chips-hint">Shift+Enter for a new line</span>
           </div>
 
@@ -287,8 +288,26 @@
           <h4>Claude authentication</h4>
           <p id="auth-summary" class="modal-help"></p>
           <button class="btn btn-outline" id="btn-auth-settings" type="button">Change Claude login</button>
+          <h4>New session defaults</h4>
+          <form id="session-defaults-form" class="settings-card session-defaults-form">
+            <div class="session-default-fields">
+              <div class="form-group">
+                <label for="default-model-select">Model</label>
+                <select id="default-model-select" class="form-input"></select>
+              </div>
+              <div class="form-group">
+                <label for="default-effort-select">Effort</label>
+                <select id="default-effort-select" class="form-input"></select>
+              </div>
+            </div>
+            <p class="environment-note">Applied when you start a new session in this workspace.</p>
+            <div class="environment-actions">
+              <button class="btn btn-primary" id="session-defaults-save" type="submit">Save defaults</button>
+            </div>
+            <p id="session-defaults-status" class="environment-status" role="status" aria-live="polite"></p>
+          </form>
           <h4>Research environment</h4>
-          <div class="environment-settings">
+          <div class="settings-card environment-settings">
             <div class="environment-current">
               <span class="environment-current-label">Active</span>
               <code id="environment-info"></code>
@@ -451,7 +470,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260910-3"></script>
-  <script src="/static/js/sketch.js?v=20260910-2"></script>
+  <script type="module" src="/static/js/main.js?v=20260913-1"></script>
+  <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

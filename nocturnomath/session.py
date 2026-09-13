@@ -29,6 +29,8 @@ from .workspace import Workspace
 logger = logging.getLogger("nocturnomath")
 
 CARRY_CHAT_CONTEXT = True
+DEFAULT_EFFORT = "high"
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 def _stream_delta_text(event: StreamEvent) -> str | None:
@@ -51,13 +53,19 @@ class ExplorationSession:
         self,
         workspace_path: Path | str = ".",
         model: str | None = None,
+        effort: str | None = None,
         timeout_s: int = 600,
         image_cap: int = 2,
         carry_chat_context: bool = CARRY_CHAT_CONTEXT,
         python: str | None = None,
         auth: ClaudeAuth | None = None,
     ):
+        if effort is not None and effort not in EFFORT_LEVELS:
+            raise ValueError(f"Unknown effort level: {effort}")
         self.model = model
+        self.effort = effort or DEFAULT_EFFORT
+        self.default_model = model
+        self.default_effort: str | None = self.effort
         self.timeout_s = timeout_s
         self.image_cap = image_cap
         self.carry_chat_context = carry_chat_context
@@ -206,6 +214,12 @@ class ExplorationSession:
         self.workspace.update_config(documents_default=self.documents_default)
         self.document_choices = {}
         return self.documents_default
+
+    def set_session_defaults(self, model: str, effort: str | None):
+        """Persist the model and effort applied when the next session starts."""
+        self.default_model = model
+        self.default_effort = effort
+        self.workspace.update_config(default_model=model, default_effort=effort)
 
     def document_context(self) -> tuple[str, dict[str, str]]:
         """Build document context and the contents to mark sent after submission."""
@@ -369,6 +383,7 @@ class ExplorationSession:
                 ],
                 permission_mode="bypassPermissions",
                 model=self.model,
+                effort=self.effort,
                 max_buffer_size=20 * 1024 * 1024,
                 include_partial_messages=True,
                 env=self.auth.sdk_env(),
@@ -446,6 +461,8 @@ class ExplorationSession:
         self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
+        self.model = self.default_model
+        self.effort = self.default_effort
 
     def record_environment(self):
         directory = self.transcript_path.parent / "environments"
