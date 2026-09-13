@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20260910-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20260910-2";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260910-2";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setAuthStatus, setCarryContext, setModelCatalogue, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260910-3";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260910-2";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260910-2";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260910-2";

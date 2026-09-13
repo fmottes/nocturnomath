@@ -179,9 +179,13 @@ export function setCarryContext(enabled) {
 }
 
 export function selectViewerTab(tab) {
+  const resetDocuments = tab === "documents" && state.activeTab === "documents";
   setViewerTab(tab);
   if (tab === "plots") return loadPlots();
-  if (tab === "documents") return fetchDocuments().then(refreshOpenDocument);
+  if (tab === "documents") {
+    if (resetDocuments) showDocumentsView("list");
+    return fetchDocuments().then(refreshOpenDocument);
+  }
   const path = tab === "evidence" ? state.workspace?.evidence_path : state.workspace?.thoughts_path;
   if (path) loadDocument(path, "", false, tab);
 }
