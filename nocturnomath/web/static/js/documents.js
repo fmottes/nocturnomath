@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260913-1";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260913-2";
 import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260913-1";
 
 // ============================================================================
@@ -168,7 +168,7 @@ export async function openDocument(name, quiet = false) {
   if (quiet && state.openDocumentContent === data.content) return;
   state.openDocument = name;
   state.openDocumentContent = data.content;
-  elements.documentsMarkdown.innerHTML = renderMarkdown(data.content || "");
+  elements.documentsMarkdown.innerHTML = renderMarkdown(data.content || "", { breaks: false });
   rewriteEmbeddedImageUrls(elements.documentsMarkdown, data.path);
   rewriteDocumentLinks(elements.documentsMarkdown, data.path);
   highlightBlocks(elements.documentsMarkdown);

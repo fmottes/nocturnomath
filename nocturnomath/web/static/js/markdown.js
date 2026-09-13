@@ -1,7 +1,7 @@
-export function renderMarkdown(markdown) {
+export function renderMarkdown(markdown, { breaks = true } = {}) {
   if (window.marked && typeof window.marked.parse === "function") {
     try {
-      return window.marked.parse(markdown, { gfm: true, breaks: true });
+      return window.marked.parse(markdown, { gfm: true, breaks });
     } catch (error) {
       console.warn("marked.js error, falling back:", error);
     }

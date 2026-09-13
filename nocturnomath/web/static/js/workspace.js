@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-1";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-2";
 import { openLightbox } from "./ui.js?v=20260913-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
 import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260913-1";
@@ -301,7 +301,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
 
     // Render markdown
     if (filePath.endsWith(".md")) {
-      elements.markdownContainer.innerHTML = renderMarkdown(content);
+      elements.markdownContainer.innerHTML = renderMarkdown(content, { breaks: false });
     } else {
       const pre = document.createElement("pre");
       const code = document.createElement("code");
