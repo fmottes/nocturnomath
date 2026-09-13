@@ -64,7 +64,7 @@ The verdict is the report. Do not add a summary, a recap of what you did, or "do
 - Saying what you do not know.
 """
 
-RUNTIME_PROMPT = """# Nocturnomath runtime contract
+RUNTIME_PROMPT = r"""# Nocturnomath runtime contract
 
 These instructions describe application behavior and data invariants. They remain in force
 regardless of the customizable exploration instructions above. If the two sections conflict
@@ -126,9 +126,64 @@ short descriptive filename, and do not overwrite an existing document unless my 
 clearly identifies it. Within a document, link record entries with paths relative to the
 documents folder, such as ../kb/evidence.md#E001 and ../kb/thoughts.md#T001.
 
-Documents render as Markdown with KaTeX math. Use `$...$` for inline formulas and `$$...$$`
-for display formulas. Use only mathematical TeX; full LaTeX document commands and packages
-are not supported.
+Documents render Markdown first, then run KaTeX on the resulting text. Use only mathematical
+TeX; full LaTeX document commands and packages are not supported. Follow these rules whenever
+creating or updating a document so formulas survive the Markdown pass.
+
+#### KaTeX layout
+
+- Inline math: `$...$`, never across a line break.
+- Display math: `$$...$$` on one line, with a blank line before and after.
+- Do not use `\tag`. Put labels such as `\qquad \text{(B1)}` at the end of the display.
+- For multi-line derivations, use one display per line. Do not use `aligned`, `cases`, `array`,
+  or `gather`.
+- Delimiters such as `\left[ ... \right]` and `\left( ... \right)` are safe.
+
+#### Underscores
+
+Markdown may treat `_..._` as italics inside math. Every `_` must directly follow a letter
+or digit.
+
+- Do not write `\mathcal{H}_N`, `\bar{w}_{ol}`, `\mathrm{shift}_s`, or `\right)_t`.
+- Write `\mathcal H_N`, `\bar w_{ol}`, `\tau_s`, `V_{r-1}`, `\sum_u`, or `\sigma_o`.
+- Give a named quantity that needs a subscript a single-letter symbol: use `C_t`, not
+  `\mathrm{const}_t`.
+
+#### Backslashes and punctuation
+
+Markdown strips the backslash when it precedes ASCII punctuation.
+
+- Do not use `\,`, `\;`, `\!`, `\\`, `\{`, `\}`, `\|`, `\_`, `\#`, `\%`, or `\&`.
+- For spacing, use `\ ` (backslash followed by a space), `\quad`, `\qquad`, or nothing.
+- For braces, use `\lbrace ... \rbrace`. For a norm or KL bar, use `\Vert`.
+- Use `\left\lbrace ... \right\rbrace` when braces need sizing.
+
+#### Markdown- and HTML-sensitive characters
+
+- Use `\ast` instead of `*`, as in `u^\ast`.
+- Use `\lt` and `\gt` instead of `<` and `>`.
+- Never use `&`; alignment environments are unsupported.
+- Use `^\prime` instead of `'`, as in `k^\prime` or `H_{\theta^\prime}`.
+- Do not put Unicode symbols inside math. Spell them as TeX commands such as `\to`, `\ell`,
+  or `\sigma`.
+
+#### Prose around math
+
+- Do not put a digit immediately after a closing `$`: write `$W$ 33.07`, not `$W$33.07`.
+- Do not use `_` or `*` in prose near math; Markdown pair-matching can cross `$` boundaries.
+- Write ranges as `$3$ to $1600$`, not `$3$–$1600$`.
+
+Known-safe KaTeX commands include `\frac`, `\sqrt`, `\sum`, `\min`, `\max`, `\ln`, `\exp`,
+`\mathbb`, `\mathcal`, `\mathrm`, `\operatorname`, `\hat`, `\bar`, `\langle`, `\rangle`,
+`\mid`, `\perp`, `\approx`, `\gtrsim`, `\infty`, `\dots`, `\cdot`, `\to`, `\leftarrow`,
+`\Longleftrightarrow`, and `\text{...}`.
+
+Before saving a document:
+
+1. Search for `}_`, `)_`, `]_`, and ` _`; fix every occurrence.
+2. Search for `\,`, `\;`, `\\`, `\{`, and `\|`; fix every occurrence.
+3. Search for `*`, `<`, `>`, and `'` inside `$`; fix every occurrence.
+4. Confirm that no `$$` block spans more than one line.
 
 Probe code, raw text output, plots, and execution status are saved under
 .nocturnomath/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not

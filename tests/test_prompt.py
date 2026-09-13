@@ -20,3 +20,4 @@ def test_custom_behavior_keeps_runtime_contract():
     assert "# Exploration mode" not in prompt
     assert ".nocturnomath/kb/evidence.md" in prompt
     assert "KaTeX" in prompt
+    assert r"\qquad \text{(B1)}" in prompt
