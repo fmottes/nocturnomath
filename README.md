@@ -149,6 +149,8 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 │           ├── probe.json
 │           ├── output.txt
 │           └── plot-1.png
+├── runtime/
+├── venv/
 └── scratch/
 ```
 
@@ -169,6 +171,8 @@ Both interfaces provide model selection for the next message and context carry-o
 ## Research environments
 
 Opening a workspace prepares `.nocturnomath/venv`, separate from any project `.venv`, with ipykernel, matplotlib, NumPy, and pandas. Packages persist across sessions; kernel variables do not. The first setup may download packages, while later openings reuse the environment.
+
+Kernels start in the workspace with their home, temporary, cache, configuration, and history locations redirected under `.nocturnomath/runtime/`. Nocturnomath also removes its Claude credentials and SSH-agent access from the kernel environment. This keeps routine library and shell activity local to the workspace, but it is not an operating-system sandbox: code using an explicit absolute path can still access files allowed to your user account.
 
 Select another Python executable in Settings → Research environment, with `/env /path/to/venv/bin/python`, or through `--python`. A custom environment must already contain ipykernel and matplotlib and is not modified during selection. The choice is saved in `.nocturnomath/config.json`; choose **Use managed environment**, `/env managed`, or `--python managed` to return to the default. Switching environments starts a new session.
 

@@ -23,6 +23,7 @@ PRIVATE_APP_ENV = (
 class ResearchEnvironment:
     def __init__(self, workspace, python=None):
         self.workspace = Path(workspace).expanduser().resolve()
+        self.runtime = self.workspace / ".nocturnomath/runtime"
         config = self.workspace / ".nocturnomath/config.json"
         saved = json.loads(config.read_text()) if config.exists() else {}
         selected = python or saved.get("python") or ".nocturnomath/venv/bin/python"
@@ -95,6 +96,11 @@ class ResearchEnvironment:
             )
 
     def process_env(self):
+        """Build a kernel environment whose default writable paths stay local.
+
+        This is soft confinement, not a filesystem sandbox: code that names an
+        absolute path can still access anything permitted to the application user.
+        """
         env = os.environ.copy()
         for key in (
             "VIRTUAL_ENV",
@@ -102,12 +108,40 @@ class ResearchEnvironment:
             "PYTHONPATH",
             "CONDA_PREFIX",
             "CONDA_DEFAULT_ENV",
+            "OLDPWD",
             *PRIVATE_APP_ENV,
         ):
             env.pop(key, None)
         env["VIRTUAL_ENV"] = str(self.python.parent.parent)
         env["PATH"] = str(self.python.parent) + os.pathsep + env.get("PATH", "")
+        env["PWD"] = str(self.workspace)
         env["PYTHONNOUSERSITE"] = "1"
+
+        paths = {
+            "HOME": self.runtime / "home",
+            "USERPROFILE": self.runtime / "home",
+            "TMPDIR": self.runtime / "tmp",
+            "TMP": self.runtime / "tmp",
+            "TEMP": self.runtime / "tmp",
+            "XDG_CACHE_HOME": self.runtime / "cache",
+            "XDG_CONFIG_HOME": self.runtime / "config",
+            "XDG_DATA_HOME": self.runtime / "data",
+            "XDG_STATE_HOME": self.runtime / "state",
+            "XDG_RUNTIME_DIR": self.runtime / "run",
+            "JUPYTER_CONFIG_DIR": self.runtime / "jupyter/config",
+            "JUPYTER_DATA_DIR": self.runtime / "jupyter/data",
+            "JUPYTER_RUNTIME_DIR": self.runtime / "jupyter/run",
+            "IPYTHONDIR": self.runtime / "ipython",
+            "MPLCONFIGDIR": self.runtime / "matplotlib",
+            "PIP_CACHE_DIR": self.runtime / "cache/pip",
+            "UV_CACHE_DIR": self.runtime / "cache/uv",
+            "PYTHONPYCACHEPREFIX": self.runtime / "cache/pycache",
+            "PYTHONUSERBASE": self.runtime / "python-user",
+        }
+        for path in set(paths.values()):
+            path.mkdir(parents=True, exist_ok=True)
+        paths["XDG_RUNTIME_DIR"].chmod(0o700)
+        env.update({key: str(path) for key, path in paths.items()})
         return env
 
     def command(self, argv):

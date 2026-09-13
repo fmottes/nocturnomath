@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -40,6 +41,49 @@ def test_environment_does_not_inherit_app_python_paths(tmp_path, monkeypatch):
     assert "SSH_AUTH_SOCK" not in values
     assert values["VIRTUAL_ENV"] == "/other/venv"
     assert values["PATH"].split(":")[0] == "/other/venv/bin"
+
+
+def test_environment_redirects_default_writable_paths_to_workspace(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", "/real/home")
+    monkeypatch.setenv("TMPDIR", "/real/tmp")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/real/config")
+    monkeypatch.setenv("PWD", "/somewhere/else")
+    monkeypatch.setenv("OLDPWD", "/previous/directory")
+    with patch.object(ResearchEnvironment, "command", return_value="3.12"):
+        env = ResearchEnvironment(tmp_path, "/other/venv/bin/python")
+    values = env.process_env()
+
+    assert values["PWD"] == str(tmp_path)
+    assert "OLDPWD" not in values
+    assert values["HOME"] == str(tmp_path / ".nocturnomath/runtime/home")
+    assert values["TMPDIR"] == str(tmp_path / ".nocturnomath/runtime/tmp")
+    assert values["XDG_CONFIG_HOME"] == str(tmp_path / ".nocturnomath/runtime/config")
+    assert values["JUPYTER_RUNTIME_DIR"] == str(
+        tmp_path / ".nocturnomath/runtime/jupyter/run"
+    )
+    for key in (
+        "HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "JUPYTER_CONFIG_DIR",
+        "JUPYTER_DATA_DIR",
+        "JUPYTER_RUNTIME_DIR",
+        "IPYTHONDIR",
+        "MPLCONFIGDIR",
+        "PIP_CACHE_DIR",
+        "UV_CACHE_DIR",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONUSERBASE",
+    ):
+        path = Path(values[key])
+        assert path.is_relative_to(tmp_path / ".nocturnomath/runtime")
+        assert path.is_dir()
 
 
 def test_resume_and_restart_record_fresh_kernel(session):
