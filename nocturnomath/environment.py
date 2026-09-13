@@ -8,6 +8,16 @@ import sys
 from pathlib import Path
 
 MANAGED_RESEARCH_PACKAGES = ("ipykernel", "matplotlib", "numpy", "pandas")
+PRIVATE_APP_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+)
 
 
 class ResearchEnvironment:
@@ -92,6 +102,7 @@ class ResearchEnvironment:
             "PYTHONPATH",
             "CONDA_PREFIX",
             "CONDA_DEFAULT_ENV",
+            *PRIVATE_APP_ENV,
         ):
             env.pop(key, None)
         env["VIRTUAL_ENV"] = str(self.python.parent.parent)

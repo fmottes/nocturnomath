@@ -293,8 +293,7 @@ class Workspace:
 
     def read_file(self, relative_path: str) -> dict[str, Any]:
         target = (self.path / relative_path).resolve()
-        # Preserve the prototype's current path check exactly.
-        if not str(target).startswith(str(self.path)):
+        if not target.is_relative_to(self.path):
             raise ValueError("File path outside workspace")
         if not target.exists() or not target.is_file():
             raise FileNotFoundError(f"File {relative_path} not found")

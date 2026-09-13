@@ -39,6 +39,8 @@ def test_web_command_options():
     assert args.port == 9000
     assert args.default_model is None
     assert args.default_effort is None
+    with pytest.raises(SystemExit):
+        web_parser().parse_args(["--host", "0.0.0.0"])
 
 
 def test_terminal_command_uses_shared_options():

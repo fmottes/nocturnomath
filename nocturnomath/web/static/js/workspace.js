@@ -287,7 +287,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     const res = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
     if (state.activeDoc !== filePath) return;
     if (!res.ok) {
-      elements.markdownContainer.innerHTML = `<p class="empty-state">File not found or empty: ${filePath}</p>`;
+      showDocumentError(`File not found or empty: ${filePath}`);
       state.documentContent = null;
       return;
     }
@@ -323,8 +323,15 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     elements.docMetaLabel.textContent = `Updated: ${modifiedDate} (${data.size} B)`;
   } catch (e) {
     console.error("Error loading document:", e);
-    elements.markdownContainer.innerHTML = `<p class="empty-state">Failed to load document: ${e.message}</p>`;
+    showDocumentError(`Failed to load document: ${e.message}`);
   }
+}
+
+function showDocumentError(text) {
+  const message = document.createElement("p");
+  message.className = "empty-state";
+  message.textContent = text;
+  elements.markdownContainer.replaceChildren(message);
 }
 
 export function rewriteDocumentLinks(container, documentPath) {

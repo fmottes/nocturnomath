@@ -57,8 +57,14 @@ async def test_query_streams_text_tracks_context_and_logs(session):
         await session.query("question")
 
     assert session._sdk_session_id == "sdk-session"
-    assert FakeClient.options_used[-1].include_partial_messages is True
-    assert FakeClient.options_used[-1].effort == "high"
+    options = FakeClient.options_used[-1]
+    assert options.include_partial_messages is True
+    assert options.effort == "high"
+    assert options.tools == []
+    assert options.strict_mcp_config is True
+    assert options.setting_sources == ["user"]
+    assert options.skills == []
+    assert options.cwd == session.workspace_path
     assert [event_type for event_type, _ in events] == [
         "status_change",
         "assistant_delta",

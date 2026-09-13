@@ -39,7 +39,7 @@ uv sync
 uv run nocturnomath
 ```
 
-By default, Nocturnomath uses the current directory: the web app starts its workspace picker there, and the terminal client opens it directly. Change to the directory you want before launching:
+By default, Nocturnomath uses the current directory: the web app confines its workspace picker to that directory tree, and the terminal client opens it directly. Change to the directory you want before launching:
 
 ```bash
 cd /path/to/project
@@ -61,7 +61,24 @@ Both interfaces accept:
 - `--timeout`: kernel-run limit in seconds (default: `600`)
 - `--images`: plots returned to Claude per run (default: `2`)
 
-The web app also accepts `--port` (default `8000`), `--host` (default `127.0.0.1`), and `--no-browser`.
+The web app also accepts `--port` (default `8000`), a loopback-only `--host` (default `127.0.0.1`), and `--no-browser`.
+
+### Remote use over SSH
+
+Start the web app on the private remote machine without opening a browser there:
+
+```bash
+nocturnomath --host 127.0.0.1 --port 8000 --no-browser --path /path/to/workspace-root
+```
+
+Forward the loopback port from your local machine, then open `http://127.0.0.1:8000` locally:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:8000:127.0.0.1:8000 user@remote-host
+```
+
+The web launcher refuses non-loopback bind addresses.
 
 The web Settings panel can override the model and effort used for each new session in the current workspace. The message composer still controls only the next message.
 

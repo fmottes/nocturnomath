@@ -23,7 +23,10 @@ export async function loadSessions() {
     state.carryChatContext = Boolean(data.carry_chat_context);
     renderSessions(data.sessions || []);
   } catch (e) {
-    elements.sessionList.innerHTML = `<div class="empty-state">Failed to load history: ${e.message}</div>`;
+    const message = document.createElement("div");
+    message.className = "empty-state";
+    message.textContent = `Failed to load history: ${e.message}`;
+    elements.sessionList.replaceChildren(message);
   }
 }
 

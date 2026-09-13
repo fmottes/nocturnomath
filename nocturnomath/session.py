@@ -368,26 +368,25 @@ class ExplorationSession:
             await self.emit("status_change", status="thinking")
             self.log_transcript("user", text=user_text)
             options = ClaudeAgentOptions(
+                # The research MCP tools are the complete execution surface. Do not
+                # inherit Claude Code's built-ins or unrelated MCP configuration.
+                tools=[],
                 system_prompt=build_system_prompt(),
                 mcp_servers={
                     "explore": create_sdk_mcp_server("explore", tools=self.tools)
                 },
-                disallowed_tools=[
-                    "Bash",
-                    "BashOutput",
-                    "KillShell",
-                    "Task",
-                    "Agent",
-                    "Workflow",
-                    "Monitor",
-                ],
+                strict_mcp_config=True,
+                # Keep the user's authentication/provider settings, but do not load
+                # instructions or hooks from the selected research workspace.
+                setting_sources=["user"],
+                skills=[],
                 permission_mode="bypassPermissions",
                 model=self.model,
                 effort=self.effort,
                 max_buffer_size=20 * 1024 * 1024,
                 include_partial_messages=True,
                 env=self.auth.sdk_env(),
-                # Deliberately preserve the existing SDK working-directory behavior.
+                cwd=self.workspace_path,
                 resume=self._sdk_session_id if self.carry_chat_context else None,
             )
             async with ClaudeSDKClient(options) as client:

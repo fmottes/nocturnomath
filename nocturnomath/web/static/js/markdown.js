@@ -1,11 +1,73 @@
+const ALLOWED_TAGS = new Set([
+  "a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4",
+  "h5", "h6", "hr", "img", "li", "ol", "p", "pre", "strong", "table",
+  "tbody", "td", "th", "thead", "tr", "ul",
+]);
+
+function safeUrl(value, image = false) {
+  const source = value.trim();
+  if (!source || source.startsWith("#") || source.startsWith("/") || source.startsWith("./") || source.startsWith("../")) {
+    return source;
+  }
+  try {
+    const protocol = new URL(source).protocol;
+    return image
+      ? (protocol === "https:" ? source : null)
+      : (["http:", "https:", "mailto:"].includes(protocol) ? source : null);
+  } catch (error) {
+    return null;
+  }
+}
+
+function sanitizeHtml(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  for (const element of [...template.content.querySelectorAll("*")]) {
+    const tag = element.localName;
+    if (!ALLOWED_TAGS.has(tag)) {
+      element.replaceWith(document.createTextNode(element.textContent || ""));
+      continue;
+    }
+
+    const attributes = Object.fromEntries(
+      [...element.attributes].map((attribute) => [attribute.name, attribute.value])
+    );
+    for (const attribute of [...element.attributes]) element.removeAttribute(attribute.name);
+
+    if (tag === "a") {
+      const original = attributes.href ?? null;
+      const href = original === null ? null : safeUrl(original);
+      if (href !== null) element.setAttribute("href", href);
+    } else if (tag === "img") {
+      const source = attributes.src ?? null;
+      const src = source === null ? null : safeUrl(source, true);
+      if (src !== null) element.setAttribute("src", src);
+      const alt = attributes.alt ?? null;
+      if (alt !== null) element.setAttribute("alt", alt);
+    } else if (tag === "code") {
+      const className = attributes.class ?? null;
+      if (/^language-[A-Za-z0-9_-]+$/.test(className || "")) {
+        element.setAttribute("class", className);
+      }
+    }
+
+    const id = attributes.id ?? null;
+    if (/^[ET]\d+$/.test(id || "")) element.setAttribute("id", id);
+  }
+  return template.innerHTML;
+}
+
 export function renderMarkdown(markdown, { breaks = true } = {}) {
+  let rendered = null;
   if (window.marked && typeof window.marked.parse === "function") {
     try {
-      return window.marked.parse(markdown, { gfm: true, breaks });
+      rendered = window.marked.parse(markdown, { gfm: true, breaks });
     } catch (error) {
       console.warn("marked.js error, falling back:", error);
     }
   }
+  if (rendered !== null) return sanitizeHtml(rendered);
 
   let html = markdown
     .replace(/&/g, "&amp;")
@@ -29,7 +91,8 @@ export function renderMarkdown(markdown, { breaks = true } = {}) {
   html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
   html = html.replace(/^\- (.*$)/gim, "<li>$1</li>");
   html = html.replace(/(<li>.*<\/li>)/s, "<ul>$1</ul>");
-  return html.replace(/\n\n/g, "<p></p>");
+  html = html.replace(/\n\n/g, "<p></p>");
+  return sanitizeHtml(html);
 }
 
 export function highlightBlocks(container) {

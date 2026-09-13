@@ -70,6 +70,16 @@ def test_missing_and_non_probe_sources_are_rejected(tmp_path):
         workspace.evidence_sources(["S001/P001/output.txt"])
 
 
+def test_file_reader_rejects_sibling_with_workspace_name_prefix(tmp_path):
+    workspace = Workspace(tmp_path / "work")
+    sibling = tmp_path / "work-secret"
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("secret")
+
+    with pytest.raises(ValueError, match="outside workspace"):
+        workspace.read_file("../work-secret/secret.txt")
+
+
 def test_recap_preserves_interpretation_and_corrections():
     recap = Workspace.recap(
         [

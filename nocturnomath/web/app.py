@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import (
     BackgroundTasks,
@@ -18,16 +19,33 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, SecretStr
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..session import ExplorationSession
 from .runtime import WebRuntime
 
 logger = logging.getLogger("nocturnomath.web")
 STATIC_DIR = Path(__file__).parent / "static"
+SAFE_HOSTS = ["127.0.0.1", "localhost", "[::1]", "testserver"]
+
+
+def _same_origin(origin: str, scheme: str, host: str) -> bool:
+    """Compare an HTTP Origin header with the request endpoint."""
+    try:
+        parsed = urlsplit(origin)
+        expected_scheme = "https" if scheme in ("https", "wss") else "http"
+        return (
+            parsed.scheme == expected_scheme
+            and parsed.netloc == host
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
 
 
 class WorkspaceChangeRequest(BaseModel):
@@ -116,6 +134,10 @@ def create_app(
     app.state.request_shutdown = None
     app.state.exiting = False
 
+    # SSH forwarding presents the app through localhost. Reject alternate Host
+    # values so DNS rebinding cannot turn another web origin into this one.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=SAFE_HOSTS)
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         # FastAPI's default 422 body echoes the rejected input, which for
@@ -126,19 +148,38 @@ def create_app(
         ]
         return JSONResponse(status_code=422, content={"detail": errors})
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
     @app.middleware("http")
-    async def disable_static_cache(request, call_next):
+    async def protect_browser_boundary(request: Request, call_next):
+        origin = request.headers.get("origin")
+        if (
+            request.method not in ("GET", "HEAD", "OPTIONS")
+            and origin
+            and not _same_origin(
+                origin, request.url.scheme, request.headers.get("host", "")
+            )
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Changes must be requested from this app."},
+            )
         response = await call_next(request)
-        if request.url.path.startswith("/static/"):
+        if request.url.path == "/" or request.url.path.startswith(
+            ("/api/", "/static/")
+        ):
             response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+            "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; connect-src 'self' ws: wss:; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        )
         return response
 
     async def workspace_snapshot():
@@ -160,12 +201,11 @@ def create_app(
                 detail=f"Cannot {action} while the agent is running a query.",
             )
 
-    def require_same_origin(request: Request, action: str):
-        origin = request.headers.get("origin")
-        if origin and origin != str(request.base_url).rstrip("/"):
-            raise HTTPException(
-                status_code=403, detail=f"{action} must be requested from this app."
-            )
+    def navigation_path(path: Path | str) -> Path:
+        target = Path(path).expanduser().resolve()
+        if not target.is_relative_to(runtime.navigator_root):
+            raise PermissionError("Folder is outside the configured workspace root.")
+        return target
 
     @app.get("/", response_class=HTMLResponse)
     async def get_index():
@@ -201,8 +241,7 @@ def create_app(
         return auth_payload()
 
     @app.post("/api/auth")
-    async def set_auth(auth_request: AuthRequest, request: Request):
-        require_same_origin(request, "Authentication")
+    async def set_auth(auth_request: AuthRequest):
         credential = (
             auth_request.credential.get_secret_value()
             if auth_request.credential is not None
@@ -219,8 +258,7 @@ def create_app(
         return data
 
     @app.post("/api/exit")
-    async def exit_service(request: Request, background_tasks: BackgroundTasks):
-        require_same_origin(request, "Exit")
+    async def exit_service(background_tasks: BackgroundTasks):
         if app.state.request_shutdown is None:
             raise HTTPException(
                 status_code=503, detail="Stop this service using its launcher."
@@ -239,9 +277,12 @@ def create_app(
     @app.post("/api/workspace")
     async def change_workspace(request: WorkspaceChangeRequest):
         nonlocal initial_python
+        if runtime.session is not None:
+            require_idle("change workspace")
         try:
+            target = navigation_path(request.path)
             await runtime.transition(
-                runtime.open_workspace, request.path, request.python or initial_python
+                runtime.open_workspace, target, request.python or initial_python
             )
             initial_python = None
             info = await workspace_snapshot()
@@ -249,6 +290,8 @@ def create_app(
             return {"status": "ok", "workspace": info}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
         except Exception as exc:
             logger.exception("Failed to change workspace")
             raise HTTPException(status_code=400, detail=str(exc))
@@ -257,7 +300,10 @@ def create_app(
     async def list_folders(path: str | None = None):
         """List child directories for the visual workspace picker without writing."""
         requested = path or str(runtime.navigator_root)
-        directory = Path(requested).expanduser().resolve()
+        try:
+            directory = navigation_path(requested)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
         if not directory.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
         try:
@@ -275,7 +321,9 @@ def create_app(
             raise HTTPException(status_code=403, detail="Folder cannot be read")
         return {
             "path": str(directory),
-            "parent": str(directory.parent) if directory.parent != directory else None,
+            "parent": (
+                str(directory.parent) if directory != runtime.navigator_root else None
+            ),
             "folders": folders,
         }
 
@@ -290,8 +338,7 @@ def create_app(
         return documents_payload(active_session())
 
     @app.post("/api/documents", status_code=201)
-    async def create_document(request: DocumentCreateRequest, http_request: Request):
-        require_same_origin(http_request, "Document changes")
+    async def create_document(request: DocumentCreateRequest):
         session = active_session()
         try:
             name = session.workspace.create_document(request.title, request.text)
@@ -302,10 +349,7 @@ def create_app(
         return {"name": name, **documents_payload(session)}
 
     @app.post("/api/documents/default")
-    async def set_documents_default(
-        request: DocumentsDefaultRequest, http_request: Request
-    ):
-        require_same_origin(http_request, "Document changes")
+    async def set_documents_default(request: DocumentsDefaultRequest):
         session = active_session()
         session.set_documents_default(request.enabled)
         return documents_payload(session)
@@ -321,10 +365,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.put("/api/documents/{name}")
-    async def write_document(
-        name: str, request: DocumentWriteRequest, http_request: Request
-    ):
-        require_same_origin(http_request, "Document changes")
+    async def write_document(name: str, request: DocumentWriteRequest):
         session = active_session()
         try:
             session.workspace.write_document(name, request.text)
@@ -335,8 +376,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.delete("/api/documents/{name}")
-    async def delete_document(name: str, request: Request):
-        require_same_origin(request, "Document deletion")
+    async def delete_document(name: str):
         session = active_session()
         try:
             session.delete_document(name)
@@ -347,10 +387,7 @@ def create_app(
         return documents_payload(session)
 
     @app.post("/api/documents/{name}/include")
-    async def include_document(
-        name: str, request: DocumentIncludeRequest, http_request: Request
-    ):
-        require_same_origin(http_request, "Document changes")
+    async def include_document(name: str, request: DocumentIncludeRequest):
         session = active_session()
         try:
             included = session.set_document_included(name, request.included)
@@ -420,8 +457,7 @@ def create_app(
         return {"status": "ok"}
 
     @app.post("/api/session/defaults")
-    async def set_session_defaults(defaults: SessionDefaultsRequest, request: Request):
-        require_same_origin(request, "Session default changes")
+    async def set_session_defaults(defaults: SessionDefaultsRequest):
         try:
             runtime.set_session_defaults(defaults.model, defaults.effort)
         except RuntimeError as exc:
@@ -491,6 +527,12 @@ def create_app(
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        origin = websocket.headers.get("origin")
+        if origin and not _same_origin(
+            origin, websocket.url.scheme, websocket.headers.get("host", "")
+        ):
+            await websocket.close(code=1008, reason="WebSocket origin is not allowed.")
+            return
         await websocket.accept()
         runtime.websockets.add(websocket)
         try:
@@ -649,6 +691,7 @@ def create_app(
                     target_path = data.get("path")
                     if target_path:
                         try:
+                            target_path = navigation_path(target_path)
                             await runtime.transition(
                                 runtime.open_workspace, target_path, data.get("python")
                             )

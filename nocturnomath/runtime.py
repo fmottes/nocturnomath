@@ -84,7 +84,12 @@ class Runtime:
             async with asyncio.timeout(15):
                 async with ClaudeSDKClient(
                     ClaudeAgentOptions(
-                        tools=[], mcp_servers={}, env=self.auth.sdk_env()
+                        tools=[],
+                        mcp_servers={},
+                        strict_mcp_config=True,
+                        setting_sources=["user"],
+                        skills=[],
+                        env=self.auth.sdk_env(),
                     )
                 ) as client:
                     info = await client.get_server_info()

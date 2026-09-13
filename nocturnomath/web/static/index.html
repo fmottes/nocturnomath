@@ -6,17 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>Nocturnomath</title>
   <meta name="description" content="Local web app dashboard for hypothesis-driven scientific exploration with persistent Jupyter kernel and live markdown reader.">
-  <script>
-    (() => {
-      const key = "nocturnomath.theme";
-      let theme = null;
-      try { theme = window.localStorage.getItem(key); } catch (error) { /* use system preference */ }
-      if (theme !== "light" && theme !== "dark") {
-        theme = window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-      }
-      document.documentElement.dataset.theme = theme;
-    })();
-  </script>
+  <script src="/static/js/theme-init.js?v=20260913-1"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">

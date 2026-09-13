@@ -115,7 +115,9 @@ export function appendProbeStart(expected, code) {
 
   const expBox = document.createElement("div");
   expBox.className = "probe-expected";
-  expBox.innerHTML = `<strong>Expected:</strong> ${expected}`;
+  const expectedLabel = document.createElement("strong");
+  expectedLabel.textContent = "Expected:";
+  expBox.append(expectedLabel, document.createTextNode(` ${expected}`));
 
   const details = document.createElement("details");
   details.className = "probe-code-details";

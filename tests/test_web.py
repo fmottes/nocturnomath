@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from nocturnomath.web import create_app
 
@@ -199,6 +200,41 @@ def test_landing_defers_workspace_creation_and_browses_folders(tmp_path):
             assert not (workspace / ".nocturnomath" / "sessions" / "S001").exists()
             assert (workspace / ".nocturnomath" / "documents").is_dir()
             assert (workspace / ".nocturnomath" / "scratch").is_dir()
+
+
+def test_browser_boundary_rejects_foreign_origins_and_navigation(tmp_path):
+    app = create_app(navigator_root=tmp_path)
+    with TestClient(app) as client:
+        workspace = client.get("/api/workspace")
+        assert "access-control-allow-origin" not in workspace.headers
+        assert workspace.headers["x-content-type-options"] == "nosniff"
+        assert (
+            client.get(
+                "/api/folders", params={"path": str(tmp_path.parent)}
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/workspace",
+                json={"path": str(tmp_path)},
+                headers={"Origin": "https://elsewhere.example"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/api/workspace", headers={"Host": "elsewhere.example"}
+            ).status_code
+            == 400
+        )
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect(
+                "/ws", headers={"Origin": "https://elsewhere.example"}
+            ),
+        ):
+            pass
 
 
 def test_landing_websocket_rejects_queries_without_a_workspace(tmp_path):
