@@ -288,15 +288,35 @@
           <p id="auth-summary" class="modal-help"></p>
           <button class="btn btn-outline" id="btn-auth-settings" type="button">Change Claude login</button>
           <h4>Research environment</h4>
-          <p id="environment-info" class="modal-help"></p>
-          <form id="environment-form">
-            <label for="environment-python">Python executable</label>
-            <input id="environment-python" type="text" style="width:100%" placeholder="/path/to/venv/bin/python">
-            <p class="modal-help">Changing environments starts a new session. Existing environments need ipykernel and matplotlib. Package installs will modify the selected environment.</p>
-            <button class="btn btn-outline" type="submit">Use this environment</button>
-            <button class="btn btn-outline" id="environment-managed" type="button">Use managed environment</button>
-            <p id="environment-error" class="modal-help" role="status"></p>
-          </form>
+          <div class="environment-settings">
+            <div class="environment-current">
+              <span class="environment-current-label">Active</span>
+              <code id="environment-info"></code>
+            </div>
+            <form id="environment-form" class="environment-form">
+              <div class="form-group">
+                <label for="environment-python">Python executable</label>
+                <input
+                  id="environment-python"
+                  class="form-input environment-python-input"
+                  type="text"
+                  placeholder="/path/to/venv/bin/python"
+                  spellcheck="false"
+                  autocomplete="off"
+                  aria-describedby="environment-help environment-error"
+                >
+                <p class="environment-field-help" id="environment-help">
+                  Select a virtual or Conda environment containing <code>ipykernel</code> and <code>matplotlib</code>.
+                </p>
+              </div>
+              <div class="environment-actions">
+                <button class="btn btn-primary" type="submit">Use executable</button>
+                <button class="btn btn-outline" id="environment-managed" type="button">Use managed environment</button>
+              </div>
+              <p class="environment-note">Changing environments starts a new session. Package installs go into the selected environment.</p>
+              <p id="environment-error" class="environment-status" role="status" aria-live="polite"></p>
+            </form>
+          </div>
           <h4>Experimental</h4>
           <label class="toggle-label switch-label">
             <span>Keep context</span>

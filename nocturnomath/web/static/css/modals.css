@@ -75,6 +75,64 @@
 .form-input:focus { border-color: var(--blue); }
 #auth-form { display: flex; flex-direction: column; gap: 16px; }
 
+.environment-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  background: var(--sheet-sunk);
+  border: 1px solid var(--rule);
+}
+.environment-current {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.environment-current-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--blue);
+}
+.environment-current code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.environment-form { display: flex; flex-direction: column; gap: 12px; }
+.environment-python-input { width: 100%; }
+.environment-field-help,
+.environment-note {
+  color: var(--ink-soft);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+.environment-field-help code {
+  padding: 0 2px;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+.environment-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.environment-status {
+  padding: 8px 10px;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  background: var(--blue-wash);
+  border-left: 2px solid var(--blue);
+}
+.environment-status:empty { display: none; }
+
 .folder-path-control { display: flex; gap: 8px; }
 .folder-path-control .form-input { min-width: 0; flex: 1; }
 
