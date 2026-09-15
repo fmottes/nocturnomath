@@ -7,14 +7,6 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It com
 > [!WARNING]
 > Nocturnomath is an experimental research preview. It executes model-generated Python and can read and modify files in the workspace you select. Run the web interface only on a trusted machine using its default loopback address; it has no authentication and must not be exposed to a network. Expect breaking changes and verify important scientific results independently.
 
-## Features
-
-- **Web dashboard:** Chat with Claude beside a live Markdown reader and a figures gallery that can be filtered by session. Probe cards show predictions, code, output, plots, and kernel status.
-- **Terminal client:** Stream Markdown replies, run the same probes and commands, and view compact kernel, model, context, and session status.
-- **Persistent research record:** Save session transcripts, probe artifacts, numbered evidence, interpretations, and notebook exports inside each workspace.
-- **Flexible environments:** Use an automatically managed Python environment or select an existing interpreter.
-- **Explicit authentication:** Use Claude Code's existing login, a subscription token, or an API key. Credentials entered in the app stay in process memory.
-
 ## Quick start
 
 Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to Claude through Claude Code or an API key.
