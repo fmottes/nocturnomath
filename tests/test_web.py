@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -144,6 +145,12 @@ def test_authentication_ui_is_served_without_embedding_credentials():
         assert 'id="btn-auth-landing"' in page
         assert 'id="auth-modal"' in page
         assert 'type="password"' in page
+        external_scripts = re.findall(
+            r'<script\b[^>]*src="https://[^>]+></script>', page
+        )
+        assert external_scripts
+        assert all('integrity="sha384-' in tag for tag in external_scripts)
+        assert all('crossorigin="anonymous"' in tag for tag in external_scripts)
 
 
 def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):

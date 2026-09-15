@@ -154,6 +154,11 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 └── scratch/
 ```
 
+The hidden `.nocturnomath/` folder can contain prompts, transcripts, generated code,
+outputs, plots, and other sensitive research context. If the selected workspace is
+version-controlled, add `.nocturnomath/` to that workspace's `.gitignore` before use;
+Nocturnomath does not modify the surrounding repository's ignore rules.
+
 `evidence.md` contains numbered observations (`E001`, `E002`, …), each limited to 250 characters plus generated source links. Observations state what happened and under which conditions. `thoughts.md` contains numbered interpretations (`T001`, `T002`, …), usually one 80–150-word paragraph, with citations such as `[E001]` and `[T001]`.
 
 Evidence links to its probe output or plots, code, and run metadata. The web reader follows citations and opens those artifacts; `/notes`, `/docs`, and `/plots` expose them in the terminal.

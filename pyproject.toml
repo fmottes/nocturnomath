@@ -1,8 +1,19 @@
 [project]
 name = "nocturnomath"
 version = "0.1.0"
+description = "A hypothesis-driven scientific probing tool with a persistent Jupyter kernel and citable research record."
+readme = "README.md"
+license = "Apache-2.0"
 authors = [{ name = "Francesco Mottes" }]
 requires-python = ">=3.12"
+keywords = ["agents", "jupyter", "research", "scientific-computing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "claude-agent-sdk>=0.2.152",
     "fastapi>=0.115.0",
@@ -13,6 +24,11 @@ dependencies = [
     "uvicorn>=0.34.0",
     "websockets>=13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/fmottes/nocturnomath"
+Repository = "https://github.com/fmottes/nocturnomath"
+Issues = "https://github.com/fmottes/nocturnomath/issues"
 
 [project.scripts]
 nocturnomath = "nocturnomath.cli.web:main"
