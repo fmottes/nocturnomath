@@ -2,6 +2,8 @@
 
 Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It combines a persistent Jupyter kernel, citable Markdown evidence and thoughts, and two interfaces on one shared runtime: a split-screen local web app and a terminal client.
 
+![Nocturnomath exploring the birthday paradox in a town with uneven birthday frequencies](docs/images/nocturnomath-app.webp)
+
 > [!WARNING]
 > Nocturnomath is an experimental research preview. It executes model-generated Python and can read and modify files in the workspace you select. Run the web interface only on a trusted machine using its default loopback address; it has no authentication and must not be exposed to a network. Expect breaking changes and verify important scientific results independently.
 
