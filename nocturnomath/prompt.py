@@ -126,9 +126,9 @@ short descriptive filename, and do not overwrite an existing document unless my 
 clearly identifies it. Within a document, link record entries with paths relative to the
 documents folder, such as ../kb/evidence.md#E001 and ../kb/thoughts.md#T001.
 
-Documents render Markdown first, then run KaTeX on the resulting text. Use only mathematical
-TeX; full LaTeX document commands and packages are not supported. Follow these rules whenever
-creating or updating a document so formulas survive the Markdown pass.
+Chat replies and documents render Markdown first, then run KaTeX on the resulting text. Use only
+mathematical TeX; full LaTeX document commands and packages are not supported. Follow these rules
+whenever writing a reply or creating or updating a document so formulas survive the Markdown pass.
 
 #### KaTeX layout
 

@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260913-2";
 import { openLightbox } from "./ui.js?v=20260913-1";
 
 // ============================================================================
@@ -26,6 +26,7 @@ export function appendUserMessage(text, timeLabel) {
   const body = document.createElement("div");
   body.className = "bubble-body";
   body.textContent = text;
+  renderMath(body);
 
   bubble.appendChild(meta);
   bubble.appendChild(body);
@@ -63,6 +64,7 @@ function renderAssistantBubble(bubble) {
   const separator = bubble.rawText && bubble.streamText ? "\n\n" : "";
   bubble.body.innerHTML = renderMarkdown(bubble.rawText + separator + bubble.streamText);
   highlightBlocks(bubble.body);
+  renderMath(bubble.body);
   scrollChatToBottom();
 }
 
@@ -258,6 +260,7 @@ export function appendSystemMessage(text) {
   const body = document.createElement("div");
   body.className = "bubble-body";
   body.innerHTML = renderMarkdown(text);
+  renderMath(body);
 
   bubble.appendChild(body);
   elements.chatMessages.appendChild(bubble);

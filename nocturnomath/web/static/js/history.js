@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260913-1";
+import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260921-1";
 
 // ============================================================================
 // Chat History (past sessions)
