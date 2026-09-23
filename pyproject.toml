@@ -1,6 +1,6 @@
 [project]
 name = "nocturnomath"
-version = "0.1.0"
+version = "0.2.0"
 description = "A hypothesis-driven scientific probing tool with a persistent Jupyter kernel and citable research record."
 readme = "README.md"
 license = "Apache-2.0"
