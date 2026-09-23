@@ -29,7 +29,10 @@ function renderLightboxItem() {
 export function openLightbox(imgSrc, caption, items) {
   state.lightboxItems = normalizeLightboxItems(imgSrc, caption, items);
   state.lightboxIndex = state.lightboxItems.findIndex((item) => item.src === imgSrc);
-  if (state.lightboxIndex < 0) state.lightboxIndex = 0;
+  if (state.lightboxIndex < 0) {
+    state.lightboxItems = [{ src: imgSrc, caption: caption || "" }];
+    state.lightboxIndex = 0;
+  }
   renderLightboxItem();
   elements.lightboxModal.classList.remove("hidden");
 }

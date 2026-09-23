@@ -1,8 +1,8 @@
 import { elements, state } from "./state.js?v=20260913-1";
 import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
-import { openLightbox } from "./ui.js?v=20260913-1";
+import { openLightbox } from "./ui.js?v=20260923-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260913-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260923-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -348,7 +348,11 @@ export function rewriteDocumentLinks(container, documentPath) {
       if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
       event.preventDefault();
       if (/\.png$/i.test(path)) {
-        openLightbox(link.href, path, state.plots || []);
+        const plot = state.plots.find((item) =>
+          new URL(item.url, link.href).searchParams.get("path") === path
+        );
+        if (plot) openLightbox(plot.url, plot.filename, state.plots);
+        else openLightbox(link.href, path);
       } else {
         loadDocument(path, anchor);
       }
