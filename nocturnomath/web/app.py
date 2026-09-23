@@ -185,17 +185,24 @@ def create_app(
     async def workspace_snapshot():
         return runtime.workspace_snapshot()
 
-    def active_session() -> ExplorationSession:
+    def active_session(agent_id: str | None = None) -> ExplorationSession:
         if runtime.session is None:
             raise HTTPException(
                 status_code=409,
                 detail="Open a workspace folder before using the agent.",
             )
-        return runtime.session
+        try:
+            return runtime.get_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    def require_idle(action: str):
-        session = active_session()
-        if runtime.changing or session.has_active_query():
+    def require_idle(action: str, agent_id: str | None = None):
+        session = active_session(agent_id)
+        if (
+            runtime.changing
+            or agent_id in runtime._changing_agents
+            or session.has_active_query()
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=f"Cannot {action} while the agent is running a query.",
@@ -217,6 +224,61 @@ def create_app(
     @app.get("/api/workspace")
     async def get_workspace_info():
         return await workspace_snapshot()
+
+    @app.get("/api/agents/{agent_id}")
+    async def get_agent(agent_id: str):
+        try:
+            return runtime.agent_snapshot(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/agents", status_code=201)
+    async def create_agent():
+        if runtime.session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Open a workspace folder before using the agent.",
+            )
+        try:
+            agent_id = await asyncio.to_thread(runtime.create_agent)
+            snapshot = runtime.agent_snapshot(agent_id)
+        except Exception as exc:
+            logger.exception("Failed to create explorer")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await runtime.broadcast("agent_added", snapshot)
+        return snapshot
+
+    @app.delete("/api/agents/{agent_id}")
+    async def close_agent(agent_id: str):
+        try:
+            await runtime.transition_agent(agent_id, runtime.close_agent, agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await runtime.broadcast("agent_removed", {"agent_id": agent_id})
+        return {"status": "ok"}
+
+    @app.post("/api/agents/{agent_id}/resume")
+    async def replace_agent(agent_id: str, request: SessionResumeRequest):
+        try:
+            resolved_id, data, focused = await runtime.transition_agent(
+                agent_id,
+                runtime.replace_agent,
+                agent_id,
+                request.id,
+                request.restore_kernel,
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Session not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        event = "agent_focused" if focused else "session_resumed"
+        payload = {"agent_id": resolved_id, **data}
+        await runtime.broadcast(event, payload)
+        return {"status": "ok", "focused_existing": focused, **payload}
 
     def auth_payload():
         return {
@@ -334,12 +396,14 @@ def create_app(
         }
 
     @app.get("/api/documents")
-    async def list_documents():
-        return documents_payload(active_session())
+    async def list_documents(agent_id: str | None = None):
+        return documents_payload(active_session(agent_id))
 
     @app.post("/api/documents", status_code=201)
-    async def create_document(request: DocumentCreateRequest):
-        session = active_session()
+    async def create_document(
+        request: DocumentCreateRequest, agent_id: str | None = None
+    ):
+        session = active_session(agent_id)
         try:
             name = session.workspace.create_document(request.title, request.text)
         except FileExistsError as exc:
@@ -349,14 +413,20 @@ def create_app(
         return {"name": name, **documents_payload(session)}
 
     @app.post("/api/documents/default")
-    async def set_documents_default(request: DocumentsDefaultRequest):
-        session = active_session()
+    async def set_documents_default(
+        request: DocumentsDefaultRequest, agent_id: str | None = None
+    ):
+        session = active_session(agent_id)
         session.set_documents_default(request.enabled)
+        for other in runtime.agents.values():
+            if other is not session:
+                other.documents_default = session.documents_default
+                other.document_choices = {}
         return documents_payload(session)
 
     @app.get("/api/documents/{name}")
-    async def read_document(name: str):
-        session = active_session()
+    async def read_document(name: str, agent_id: str | None = None):
+        session = active_session(agent_id)
         try:
             return session.workspace.read_document(name)
         except FileNotFoundError:
@@ -365,8 +435,10 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.put("/api/documents/{name}")
-    async def write_document(name: str, request: DocumentWriteRequest):
-        session = active_session()
+    async def write_document(
+        name: str, request: DocumentWriteRequest, agent_id: str | None = None
+    ):
+        session = active_session(agent_id)
         try:
             session.workspace.write_document(name, request.text)
             return session.workspace.read_document(name)
@@ -376,10 +448,14 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.delete("/api/documents/{name}")
-    async def delete_document(name: str):
-        session = active_session()
+    async def delete_document(name: str, agent_id: str | None = None):
+        session = active_session(agent_id)
         try:
             session.delete_document(name)
+            for other in runtime.agents.values():
+                if other is not session:
+                    other.document_choices.pop(name, None)
+                    other._sent_documents.pop(name, None)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Document not found")
         except ValueError as exc:
@@ -387,8 +463,10 @@ def create_app(
         return documents_payload(session)
 
     @app.post("/api/documents/{name}/include")
-    async def include_document(name: str, request: DocumentIncludeRequest):
-        session = active_session()
+    async def include_document(
+        name: str, request: DocumentIncludeRequest, agent_id: str | None = None
+    ):
+        session = active_session(agent_id)
         try:
             included = session.set_document_included(name, request.included)
         except FileNotFoundError:
@@ -398,8 +476,8 @@ def create_app(
         return {"name": name, "included": included}
 
     @app.get("/api/file")
-    async def read_file(path: str):
-        session = active_session()
+    async def read_file(path: str, agent_id: str | None = None):
+        session = active_session(agent_id)
         try:
             return session.read_file(path)
         except FileNotFoundError:
@@ -410,8 +488,8 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
     @app.get("/api/asset")
-    async def read_asset(path: str):
-        session = active_session()
+    async def read_asset(path: str, agent_id: str | None = None):
+        session = active_session(agent_id)
         try:
             return FileResponse(session.workspace.asset_file(path))
         except FileNotFoundError:
@@ -420,18 +498,18 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc))
 
     @app.get("/api/plots")
-    async def list_plots():
-        session = active_session()
+    async def list_plots(agent_id: str | None = None):
+        session = active_session(agent_id)
         return {
             "plots": session.list_plots(),
             "current_session": session.workspace.session_id,
         }
 
     @app.get("/api/session/notebook")
-    async def download_notebook():
-        require_idle("download the current session")
+    async def download_notebook(agent_id: str | None = None):
+        require_idle("download the current session", agent_id)
         try:
-            filename, notebook = runtime.export_notebook()
+            filename, notebook = runtime.export_notebook(agent_id)
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         return Response(
@@ -441,18 +519,21 @@ def create_app(
         )
 
     @app.post("/api/kernel/restart")
-    async def restart_kernel():
-        require_idle("restart the kernel")
-        session = active_session()
-        await runtime.transition(session.kernel.restart)
+    async def restart_kernel(agent_id: str | None = None):
+        require_idle("restart the kernel", agent_id)
+        session = active_session(agent_id)
+        await runtime.transition_agent(
+            agent_id or runtime.primary_agent_id, session.kernel.restart
+        )
         await runtime.broadcast(
-            "kernel_restarted", {"kernel_alive": session.kernel.is_alive()}
+            "kernel_restarted",
+            {"agent_id": agent_id, "kernel_alive": session.kernel.is_alive()},
         )
         return {"status": "ok", "kernel_alive": session.kernel.is_alive()}
 
     @app.post("/api/kernel/interrupt")
-    async def interrupt_kernel():
-        session = active_session()
+    async def interrupt_kernel(agent_id: str | None = None):
+        session = active_session(agent_id)
         await session.interrupt()
         return {"status": "ok"}
 
@@ -494,8 +575,16 @@ def create_app(
     @app.get("/api/sessions")
     async def list_sessions():
         session = active_session()
+        open_agents = {
+            candidate.workspace.session_id: agent_id
+            for agent_id, candidate in runtime.agents.items()
+            if not candidate.workspace.session_pending
+        }
+        sessions = session.list_sessions()
+        for item in sessions:
+            item["open_agent_id"] = open_agents.get(item["id"])
         return {
-            "sessions": session.list_sessions(),
+            "sessions": sessions,
             "carry_chat_context": session.carry_chat_context,
         }
 
@@ -547,11 +636,15 @@ def create_app(
                 action = data.get("action")
                 if app.state.exiting:
                     continue
-                session = runtime.session
-                if action != "set_workspace" and session is None:
+                if action != "set_workspace" and runtime.session is None:
+                    error = {
+                        "message": "Open a workspace folder before using the agent."
+                    }
+                    if data.get("agent_id") is not None:
+                        error["agent_id"] = data["agent_id"]
                     await runtime.broadcast(
                         "error",
-                        {"message": "Open a workspace folder before using the agent."},
+                        error,
                     )
                     continue
                 if runtime.changing:
@@ -563,131 +656,17 @@ def create_app(
                     )
                     continue
 
-                if action == "query":
-                    text = data.get("text", "").strip()
-                    if not text:
-                        continue
-                    if text == "/new":
-                        if runtime.changing or session.has_active_query():
-                            await runtime.broadcast(
-                                "error",
-                                {
-                                    "message": "Cannot start a new session while the agent is running a query."
-                                },
-                            )
-                            continue
-                        await runtime.transition(runtime.reset_session)
-                        await runtime.broadcast(
-                            "session_reset",
-                            {
-                                "session_id": session.workspace.session_id,
-                                "model": session.model,
-                                "effort": session.effort,
-                            },
-                        )
-                        continue
-                    if text == "/restart":
-                        if runtime.changing or session.has_active_query():
-                            await runtime.broadcast(
-                                "error",
-                                {
-                                    "message": "Cannot restart the kernel while the agent is running a query."
-                                },
-                            )
-                            continue
-                        await runtime.transition(session.kernel.restart)
-                        await runtime.broadcast(
-                            "system_message",
-                            {"text": "Kernel restarted. In-memory state is cleared."},
-                        )
-                        continue
-                    if text == "/notes":
-                        notes = session.workspace.notes.read()
-                        await runtime.broadcast(
-                            "system_message", {"text": f"```markdown\n{notes}\n```"}
-                        )
-                        continue
-                    if runtime.changing or session.has_active_query():
-                        await runtime.broadcast(
-                            "error",
-                            {"message": "The agent is already running a query."},
-                        )
-                        continue
-                    model = data.get("model")
-                    if model is not None and model not in runtime.models:
-                        await runtime.broadcast(
-                            "error",
-                            {"message": "Choose a model from the model selector."},
-                        )
-                        continue
-                    effort = data.get("effort")
-                    target_model = model or session.model
-                    if effort is not None and effort not in runtime.model_efforts.get(
-                        target_model or "", []
-                    ):
-                        await runtime.broadcast(
-                            "error",
-                            {
-                                "message": "Choose an effort supported by the selected model."
-                            },
-                        )
-                        continue
-                    await runtime.broadcast("user_message", {"text": text})
-                    runtime.start_query(text, model, effort)
-
-                elif action == "interrupt":
-                    await session.interrupt()
-                elif action == "restart_kernel":
-                    if runtime.changing or session.has_active_query():
-                        await runtime.broadcast(
-                            "error",
-                            {
-                                "message": "Cannot restart the kernel while the agent is running a query."
-                            },
-                        )
-                        continue
-                    await runtime.transition(session.kernel.restart)
-                    await runtime.broadcast(
-                        "kernel_restarted", {"kernel_alive": session.kernel.is_alive()}
-                    )
-                elif action == "new_session":
-                    if runtime.changing or session.has_active_query():
-                        await runtime.broadcast(
-                            "error",
-                            {
-                                "message": "Cannot start a new session while the agent is running a query."
-                            },
-                        )
-                        continue
-                    await runtime.transition(runtime.reset_session)
-                    await runtime.broadcast(
-                        "session_reset",
-                        {
-                            "session_id": session.workspace.session_id,
-                            "model": session.model,
-                            "effort": session.effort,
-                        },
-                    )
-                elif action == "resume_session":
-                    session_id = data.get("id")
-                    if session_id:
-                        try:
-                            resumed = await runtime.transition(
-                                session.resume_session, session_id
-                            )
-                            await runtime.broadcast("session_resumed", resumed)
-                        except Exception as exc:
-                            await runtime.broadcast("error", {"message": str(exc)})
-                elif action == "set_carry_context":
+                if action == "new_agent":
                     try:
-                        enabled = session.set_carry_chat_context(data.get("enabled"))
-                    except RuntimeError as exc:
+                        agent_id = await asyncio.to_thread(runtime.create_agent)
+                        await runtime.broadcast(
+                            "agent_added", runtime.agent_snapshot(agent_id)
+                        )
+                    except Exception as exc:
                         await runtime.broadcast("error", {"message": str(exc)})
-                        continue
-                    await runtime.broadcast(
-                        "carry_context_changed", {"carry_chat_context": enabled}
-                    )
-                elif action == "set_workspace":
+                    continue
+
+                if action == "set_workspace":
                     target_path = data.get("path")
                     if target_path:
                         try:
@@ -701,6 +680,136 @@ def create_app(
                             )
                         except Exception as exc:
                             await runtime.broadcast("error", {"message": str(exc)})
+                    continue
+
+                agent_id = data.get("agent_id") or runtime.primary_agent_id
+                try:
+                    session = runtime.get_agent(agent_id)
+                except ValueError as exc:
+                    await runtime.broadcast(
+                        "error", {"agent_id": agent_id, "message": str(exc)}
+                    )
+                    continue
+
+                if action == "query":
+                    text = data.get("text", "").strip()
+                    if not text:
+                        continue
+                    if text == "/new":
+                        try:
+                            new_id = await asyncio.to_thread(runtime.create_agent)
+                            await runtime.broadcast(
+                                "agent_added",
+                                {
+                                    "requested_by": agent_id,
+                                    **runtime.agent_snapshot(new_id),
+                                },
+                            )
+                        except Exception as exc:
+                            await runtime.broadcast(
+                                "error", {"agent_id": agent_id, "message": str(exc)}
+                            )
+                        continue
+                    if text == "/restart":
+                        try:
+                            await runtime.transition_agent(
+                                agent_id, session.kernel.restart
+                            )
+                            await runtime.broadcast(
+                                "system_message",
+                                {
+                                    "agent_id": agent_id,
+                                    "text": "Kernel restarted. In-memory state is cleared.",
+                                },
+                            )
+                        except RuntimeError as exc:
+                            await runtime.broadcast(
+                                "error", {"agent_id": agent_id, "message": str(exc)}
+                            )
+                        continue
+                    if text == "/notes":
+                        notes = session.workspace.notes.read()
+                        await runtime.broadcast(
+                            "system_message",
+                            {
+                                "agent_id": agent_id,
+                                "text": f"```markdown\n{notes}\n```",
+                            },
+                        )
+                        continue
+                    model = data.get("model")
+                    if model is not None and model not in runtime.models:
+                        await runtime.broadcast(
+                            "error",
+                            {
+                                "agent_id": agent_id,
+                                "message": "Choose a model from the model selector.",
+                            },
+                        )
+                        continue
+                    effort = data.get("effort")
+                    target_model = model or session.model
+                    if effort is not None and effort not in runtime.model_efforts.get(
+                        target_model or "", []
+                    ):
+                        await runtime.broadcast(
+                            "error",
+                            {
+                                "agent_id": agent_id,
+                                "message": "Choose an effort supported by the selected model.",
+                            },
+                        )
+                        continue
+                    try:
+                        runtime.start_query(text, model, effort, agent_id)
+                    except (RuntimeError, ValueError) as exc:
+                        await runtime.broadcast(
+                            "error", {"agent_id": agent_id, "message": str(exc)}
+                        )
+                        continue
+                    await runtime.broadcast(
+                        "user_message",
+                        {
+                            "agent_id": agent_id,
+                            "session_id": session.workspace.session_id,
+                            "text": text,
+                        },
+                    )
+
+                elif action == "interrupt":
+                    await session.interrupt()
+                elif action == "restart_kernel":
+                    try:
+                        await runtime.transition_agent(agent_id, session.kernel.restart)
+                        await runtime.broadcast(
+                            "kernel_restarted",
+                            {
+                                "agent_id": agent_id,
+                                "kernel_alive": session.kernel.is_alive(),
+                            },
+                        )
+                    except RuntimeError as exc:
+                        await runtime.broadcast(
+                            "error", {"agent_id": agent_id, "message": str(exc)}
+                        )
+                elif action == "new_session":
+                    new_id = await asyncio.to_thread(runtime.create_agent)
+                    await runtime.broadcast(
+                        "agent_added",
+                        {"requested_by": agent_id, **runtime.agent_snapshot(new_id)},
+                    )
+                elif action == "set_carry_context":
+                    try:
+                        enabled = session.set_carry_chat_context(data.get("enabled"))
+                    except RuntimeError as exc:
+                        await runtime.broadcast(
+                            "error", {"agent_id": agent_id, "message": str(exc)}
+                        )
+                        continue
+                    await runtime.broadcast(
+                        "carry_context_changed",
+                        {"agent_id": agent_id, "carry_chat_context": enabled},
+                    )
         except WebSocketDisconnect:
             runtime.websockets.discard(websocket)
         except Exception as exc:

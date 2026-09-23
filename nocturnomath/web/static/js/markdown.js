@@ -58,18 +58,41 @@ function sanitizeHtml(html) {
   return template.innerHTML;
 }
 
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function protectMath(markdown) {
+  const formulas = [];
+  const protectedText = markdown.replace(
+    /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\n])+?(?<!\s)\$/g,
+    (formula) => {
+      const token = `NocturnomathMathToken${formulas.length}End`;
+      formulas.push(formula);
+      return token;
+    },
+  );
+  return {
+    text: protectedText,
+    restore: (html) => html.replace(/NocturnomathMathToken(\d+)End/g, (token, index) =>
+      formulas[Number(index)] === undefined ? token : escapeHtml(formulas[Number(index)])),
+  };
+}
+
 export function renderMarkdown(markdown, { breaks = true } = {}) {
+  const math = protectMath(markdown);
   let rendered = null;
   if (window.marked && typeof window.marked.parse === "function") {
     try {
-      rendered = window.marked.parse(markdown, { gfm: true, breaks });
+      rendered = window.marked.parse(math.text, { gfm: true, breaks });
     } catch (error) {
       console.warn("marked.js error, falling back:", error);
     }
   }
-  if (rendered !== null) return sanitizeHtml(rendered);
+  if (rendered !== null) return math.restore(sanitizeHtml(rendered));
 
-  let html = markdown
+  let html = math.text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
@@ -92,7 +115,7 @@ export function renderMarkdown(markdown, { breaks = true } = {}) {
   html = html.replace(/^\- (.*$)/gim, "<li>$1</li>");
   html = html.replace(/(<li>.*<\/li>)/s, "<ul>$1</ul>");
   html = html.replace(/\n\n/g, "<p></p>");
-  return sanitizeHtml(html);
+  return math.restore(sanitizeHtml(html));
 }
 
 export function highlightBlocks(container) {

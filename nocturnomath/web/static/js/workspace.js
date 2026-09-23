@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260913-2";
+import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20260913-1";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
 import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260913-1";
@@ -25,6 +25,8 @@ export function applyWorkspace(ws) {
     showDocumentsView("list");
   }
   state.workspace = ws;
+  const selected = ws.agents?.find((agent) => agent.agent_id === state.activeAgentId)
+    || ws.agents?.[0] || null;
   document.getElementById("environment-info").textContent = ws.environment
     ? `Python ${ws.environment.version} — ${ws.environment.python}` : "";
   document.getElementById("environment-python").value = ws.environment?.python || "";
@@ -34,24 +36,24 @@ export function applyWorkspace(ws) {
 
   elements.workspacePath.textContent = workspaceName(ws.path);
   elements.workspacePill.title = ws.path;
-  setSessionId(ws.session_id);
+  setSessionId(selected?.session_id);
   setModelCatalogue(
     ws.models || [],
     ws.model_labels || {},
-    ws.model,
+    selected?.model || ws.model,
     ws.model_efforts || {},
-    ws.effort,
+    selected?.effort || ws.effort,
   );
   setSessionDefaults(ws.session_defaults);
 
-  updateKernelStatus(ws.kernel_alive, ws.kernel_busy);
-  updateAgentStatus(ws.is_busy ? "thinking" : "idle");
-  setCarryContext(ws.carry_chat_context);
+  updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
+  updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
+  setCarryContext(selected?.carry_chat_context);
 
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
     state.activeDoc = ws.evidence_path;
   }
-  setDocuments(ws.documents || [], ws.documents_default);
+  setDocuments(selected?.documents || [], selected?.documents_default);
 
   // Refresh the record view without pulling the user off the figures or documents tab.
   loadDocument(state.activeDoc, "", ["plots", "documents"].includes(state.activeTab));
@@ -62,7 +64,7 @@ export function applyWorkspace(ws) {
 
 export function setSessionId(id) {
   state.currentSession = id || null;
-  elements.sessionIdBadge.textContent = id || "";
+  if (elements.sessionIdBadge) elements.sessionIdBadge.textContent = id || "";
 }
 
 function workspaceName(path) {
@@ -374,7 +376,8 @@ export function rewriteEmbeddedImageUrls(container, documentPath) {
 export async function loadPlots() {
   if (!state.workspace?.is_open) return;
   try {
-    const res = await fetch("/api/plots");
+    const query = state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
+    const res = await fetch(`/api/plots${query}`);
     if (!res.ok) return;
     const data = await res.json();
     const plots = data.plots || [];

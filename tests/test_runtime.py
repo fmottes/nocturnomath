@@ -108,6 +108,33 @@ async def test_transition_rejects_concurrent_changes(session):
         await runtime.transition(prepare)
 
 
+@pytest.mark.asyncio
+async def test_agent_transition_blocks_queries_and_other_transitions(session):
+    runtime = Runtime(session)
+    entered = threading.Event()
+    release = threading.Event()
+    agent_id = runtime.primary_agent_id
+
+    def prepare():
+        entered.set()
+        release.wait(5)
+
+    task = asyncio.create_task(runtime.transition_agent(agent_id, prepare))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert runtime.agent_snapshot(agent_id)["is_busy"] is True
+        with pytest.raises(RuntimeError, match="changing"):
+            runtime.start_query("question", agent_id=agent_id)
+        with pytest.raises(RuntimeError, match="already changing"):
+            await runtime.transition_agent(agent_id, prepare)
+        with pytest.raises(RuntimeError, match="explorer is changing"):
+            await runtime.transition(prepare)
+    finally:
+        release.set()
+        await task
+    assert runtime.agent_snapshot(agent_id)["is_busy"] is False
+
+
 def test_export_notebook_names_the_file_after_workspace_and_session(session):
     runtime = Runtime(session)
 

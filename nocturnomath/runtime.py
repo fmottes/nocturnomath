@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,11 @@ class Runtime:
         session_factory: Callable[..., ExplorationSession] = ExplorationSession,
         auth: ClaudeAuth | None = None,
     ):
+        # ``session`` remains the terminal client's single-explorer facade.
+        # The web client uses the ordered registry below and always supplies an id.
         self.session = session
+        self.agents: dict[str, ExplorationSession] = {}
+        self.primary_agent_id: str | None = None
         self._auth = auth or (session.auth if session else ClaudeAuth())
         if session:
             session.auth = self._auth
@@ -52,12 +57,16 @@ class Runtime:
         self.subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._started = False
         self.changing = False
-        self._subscribed_session: ExplorationSession | None = None
+        self._changing_agents: set[str] = set()
+        self._agent_subscribers: dict[str, Callable[[str, dict[str, Any]], Any]] = {}
         self._workspace_defaults_pending = session is not None
+        if session is not None:
+            self.primary_agent_id = self._new_agent_id()
+            self.agents[self.primary_agent_id] = session
 
     @property
     def has_workspace(self) -> bool:
-        return self.session is not None
+        return bool(self.agents)
 
     @property
     def auth(self) -> ClaudeAuth:
@@ -67,12 +76,13 @@ class Runtime:
     @auth.setter
     def auth(self, auth: ClaudeAuth):
         self._auth = auth
-        if self.session:
-            self.session.auth = auth
+        for session in self.agents.values():
+            session.auth = auth
 
     def start(self):
         self._started = True
-        self._subscribe_to_session()
+        for agent_id, session in self.agents.items():
+            self._subscribe_to_agent(agent_id, session)
 
     async def discover_models(self):
         """Read the CLI's model catalog without sending an inference request."""
@@ -134,18 +144,15 @@ class Runtime:
         )
         self.model = self._select_model(self.model or self.startup_default_model)
         self.effort = self._select_effort(self.model, self.effort)
-        if self.session:
-            self.session.model = self.model
-            self.session.effort = self.effort
+        if self.agents:
             if self._workspace_defaults_pending:
                 self._apply_workspace_defaults()
             else:
-                self.session.default_model = self._select_model(
-                    self.session.default_model
-                )
-                self.session.default_effort = self._select_effort(
-                    self.session.default_model, self.session.default_effort
-                )
+                for session in self.agents.values():
+                    session.default_model = self._select_model(session.default_model)
+                    session.default_effort = self._select_effort(
+                        session.default_model, session.default_effort
+                    )
 
     def _select_model(self, preferred: str | None) -> str | None:
         if preferred in self.models:
@@ -177,13 +184,37 @@ class Runtime:
             else self.startup_default_effort
         )
         default_effort = self._select_effort(default_model, effort_preference)
-        session.default_model = default_model
-        session.default_effort = default_effort
-        session.model = default_model
-        session.effort = default_effort
+        for session in self.agents.values():
+            self._apply_defaults_to(session, default_model, default_effort)
         self.model = default_model
         self.effort = default_effort
         self._workspace_defaults_pending = False
+
+    @staticmethod
+    def _apply_defaults_to(
+        session: ExplorationSession, model: str | None, effort: str | None
+    ):
+        session.default_model = model
+        session.default_effort = effort
+        session.model = model
+        session.effort = effort
+
+    def _workspace_defaults(
+        self, session: ExplorationSession
+    ) -> tuple[str | None, str | None]:
+        config = session.workspace.read_config()
+        model = self._select_model(
+            config.get("default_model")
+            if isinstance(config.get("default_model"), str)
+            else self.startup_default_model
+        )
+        effort = self._select_effort(
+            model,
+            config.get("default_effort")
+            if isinstance(config.get("default_effort"), str)
+            else self.startup_default_effort,
+        )
+        return model, effort
 
     def set_session_defaults(self, model: str, effort: str | None):
         session = self.require_session()
@@ -195,6 +226,9 @@ class Runtime:
         if supported and effort is None:
             raise ValueError("Choose an effort supported by the selected model.")
         session.set_session_defaults(model, effort)
+        for other in self.agents.values():
+            other.default_model = model
+            other.default_effort = effort
 
     def reset_session(self):
         """Start a session with the workspace's configured defaults."""
@@ -211,8 +245,7 @@ class Runtime:
         Nothing is verified here: the CLI reports a bad credential on the next
         message. The model catalogue is refreshed as a courtesy and may be empty.
         """
-        if self.session:
-            self.session.require_idle("change Claude authentication")
+        self.require_all_idle("change Claude authentication")
         self.auth = ClaudeAuth.interactive(method, credential)
         await self.discover_models()
         return self.auth.public()
@@ -220,47 +253,64 @@ class Runtime:
     def shutdown(self):
         self._started = False
         self.changing = False
-        if self._subscribed_session:
-            self._subscribed_session.unsubscribe(self.forward_session_event)
-            self._subscribed_session = None
-        if self.session:
-            self.session.shutdown()
+        for agent_id in list(self.agents):
+            self._unsubscribe_agent(agent_id)
+            self.agents[agent_id].shutdown()
 
     def open_workspace(self, path: Path | str, python=None) -> ExplorationSession:
         """Open an existing directory, creating runtime state only after validation."""
-        if self.session is not None:
-            self.session.require_idle("change workspace")
+        if self.agents:
+            self.require_all_idle("change workspace")
         target = Path(path).expanduser().resolve()
         if not target.is_dir():
             raise ValueError("Choose an existing folder for the workspace.")
 
-        if self.session is None:
-            self.session = self.session_factory(
-                workspace_path=target,
-                python=python,
-                model=self.model,
-                effort=self.effort,
-                timeout_s=self.timeout_s,
-                image_cap=self.image_cap,
-                auth=self.auth,
-            )
-            self._subscribe_to_session()
-        else:
-            self.session.set_workspace(target, python)
+        # Keep the terminal's long-standing in-place session contract when it
+        # is the only explorer. Multi-tab workspace changes intentionally tear
+        # down every independent kernel below.
+        if len(self.agents) == 1:
+            session = self.require_session()
+            session.set_workspace(target, python)
+            self._workspace_defaults_pending = True
+            if self.models:
+                self._apply_workspace_defaults()
+            return session
+
+        for agent_id in list(self.agents):
+            self._unsubscribe_agent(agent_id)
+            self.agents[agent_id].shutdown()
+        self.agents.clear()
+        self.primary_agent_id = None
+        self.session = None
+        self._workspace_defaults_pending = True
+        self.create_agent(target, python=python)
         self._workspace_defaults_pending = True
         if self.models:
             self._apply_workspace_defaults()
-        return self.session
+        return self.require_session()
 
-    def _subscribe_to_session(self):
-        if not self._started or not self.session:
+    def _new_agent_id(self) -> str:
+        return uuid.uuid4().hex
+
+    def _subscribe_to_agent(self, agent_id: str, session: ExplorationSession):
+        if not self._started or agent_id in self._agent_subscribers:
             return
-        if self._subscribed_session is self.session:
-            return
-        if self._subscribed_session:
-            self._subscribed_session.unsubscribe(self.forward_session_event)
-        self.session.subscribe(self.forward_session_event)
-        self._subscribed_session = self.session
+
+        async def forward(event_type: str, payload: dict[str, Any]):
+            if event_type == "record_changed":
+                for other_id, other in self.agents.items():
+                    if other_id != agent_id:
+                        other.mark_record_dirty()
+            await self.emit(event_type, {"agent_id": agent_id, **payload})
+
+        session.subscribe(forward)
+        self._agent_subscribers[agent_id] = forward
+
+    def _unsubscribe_agent(self, agent_id: str):
+        session = self.agents.get(agent_id)
+        callback = self._agent_subscribers.pop(agent_id, None)
+        if session and callback:
+            session.unsubscribe(callback)
 
     def subscribe(self, callback: Callable[[str, dict[str, Any]], Any]):
         self.subscribers.append(callback)
@@ -279,8 +329,108 @@ class Runtime:
             except Exception as exc:
                 logger.error(f"Error in runtime subscriber: {exc}")
 
-    async def forward_session_event(self, event_type: str, payload: dict[str, Any]):
-        await self.emit(event_type, payload)
+    def create_agent(
+        self, workspace_path: Path | str | None = None, *, python: str | None = None
+    ) -> str:
+        """Create an independent exploration in the current workspace."""
+        if workspace_path is None:
+            workspace_path = self.require_session().workspace_path
+        session = self.session_factory(
+            workspace_path=workspace_path,
+            python=python,
+            model=self.model,
+            effort=self.effort,
+            timeout_s=self.timeout_s,
+            image_cap=self.image_cap,
+            auth=self._auth,
+        )
+        agent_id = self._new_agent_id()
+        self.agents[agent_id] = session
+        if self.primary_agent_id is None:
+            self.primary_agent_id = agent_id
+            self.session = session
+        if self.models:
+            default_model, default_effort = self._workspace_defaults(session)
+            self._apply_defaults_to(session, default_model, default_effort)
+        self._subscribe_to_agent(agent_id, session)
+        return agent_id
+
+    def get_agent(self, agent_id: str | None = None) -> ExplorationSession:
+        if agent_id is None:
+            return self.require_session()
+        try:
+            return self.agents[agent_id]
+        except KeyError as exc:
+            raise ValueError("Explorer not found.") from exc
+
+    def agent_snapshot(self, agent_id: str) -> dict[str, Any]:
+        session = self.get_agent(agent_id)
+        return {
+            "agent_id": agent_id,
+            "session_id": None
+            if session.workspace.session_pending
+            else session.workspace.session_id,
+            "records": session.workspace.current_records(),
+            "model": session.model,
+            "effort": session.effort,
+            "carry_chat_context": session.carry_chat_context,
+            "kernel_alive": session.kernel.is_alive(),
+            "kernel_busy": session.kernel.busy,
+            "is_busy": session.has_active_query() or agent_id in self._changing_agents,
+            "documents": session.list_documents(),
+            "documents_default": session.documents_default,
+        }
+
+    def close_agent(self, agent_id: str):
+        if len(self.agents) == 1:
+            raise RuntimeError("Keep one explorer open.")
+        session = self.get_agent(agent_id)
+        session.require_idle("close this explorer")
+        self._unsubscribe_agent(agent_id)
+        session.shutdown()
+        del self.agents[agent_id]
+        if self.primary_agent_id == agent_id:
+            self.primary_agent_id = next(iter(self.agents))
+            self.session = self.agents[self.primary_agent_id]
+
+    def find_agent_for_session(self, session_id: str) -> str | None:
+        for agent_id, session in self.agents.items():
+            if (
+                not session.workspace.session_pending
+                and session.workspace.session_id == session_id
+            ):
+                return agent_id
+        return None
+
+    def replace_agent(
+        self, agent_id: str, session_id: str, restore_kernel: bool = False
+    ) -> tuple[str, dict[str, Any], bool]:
+        """Load history into an idle tab, unless it is already open elsewhere."""
+        existing = self.find_agent_for_session(session_id)
+        if existing is not None and existing != agent_id:
+            return existing, self.agent_snapshot(existing), True
+        old = self.get_agent(agent_id)
+        old.require_idle("resume a past session")
+        replacement = self.session_factory(
+            workspace_path=old.workspace_path,
+            model=old.model,
+            effort=old.effort,
+            timeout_s=old.timeout_s,
+            image_cap=old.image_cap,
+            auth=self._auth,
+        )
+        try:
+            data = replacement.resume_session(session_id, restore_kernel)
+        except Exception:
+            replacement.shutdown()
+            raise
+        self._unsubscribe_agent(agent_id)
+        old.shutdown()
+        self.agents[agent_id] = replacement
+        if self.primary_agent_id == agent_id:
+            self.session = replacement
+        self._subscribe_to_agent(agent_id, replacement)
+        return agent_id, {**self.agent_snapshot(agent_id), **data}, False
 
     def workspace_snapshot(self) -> dict[str, Any]:
         """Describe the current workspace for a client that just connected."""
@@ -295,22 +445,18 @@ class Runtime:
                 "model_labels": self.model_labels,
                 "model_efforts": self.model_efforts,
                 "session_defaults": None,
-                "kernel_alive": False,
-                "kernel_busy": False,
-                "is_busy": False,
-                "carry_chat_context": True,
                 "evidence_path": EVIDENCE_PATH,
                 "thoughts_path": THOUGHTS_PATH,
-                "documents": [],
-                "documents_default": True,
                 "plots": [],
-                "records": [],
+                "agents": [],
                 "navigator_root": str(self.navigator_root),
                 "auth": self.auth.public(),
             }
         return {
             "is_open": True,
             "path": str(session.workspace_path),
+            # Legacy single-explorer fields keep the terminal-adjacent HTTP
+            # surface useful while web clients consume ``agents`` below.
             "session_id": session.workspace.session_id,
             "records": session.workspace.current_records(),
             "environment": {
@@ -326,21 +472,24 @@ class Runtime:
                 "model": session.default_model,
                 "effort": session.default_effort,
             },
-            "kernel_alive": session.kernel.is_alive(),
-            "kernel_busy": session.kernel.busy,
-            "is_busy": session._is_busy,
-            "carry_chat_context": session.carry_chat_context,
             "evidence_path": EVIDENCE_PATH,
             "thoughts_path": THOUGHTS_PATH,
+            "kernel_alive": session.kernel.is_alive(),
+            "kernel_busy": session.kernel.busy,
+            "is_busy": session.has_active_query(),
+            "carry_chat_context": session.carry_chat_context,
             "documents": session.list_documents(),
             "documents_default": session.documents_default,
             "plots": session.list_plots(),
+            "agents": [self.agent_snapshot(agent_id) for agent_id in self.agents],
             "auth": self.auth.public(),
         }
 
-    def export_notebook(self) -> tuple[str, dict[str, Any]]:
+    def export_notebook(
+        self, agent_id: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """Render the active session as a notebook and the filename to save it under."""
-        session = self.require_session()
+        session = self.get_agent(agent_id)
         if session.workspace.session_pending:
             raise ValueError("The current session has no messages to download.")
         notebook = session.workspace.export_notebook(
@@ -357,13 +506,18 @@ class Runtime:
             raise RuntimeError("Open a workspace folder before using the agent.")
         return self.session
 
+    def require_all_idle(self, action: str):
+        if self._changing_agents:
+            raise RuntimeError(f"Cannot {action} while an explorer is changing.")
+        for session in self.agents.values():
+            session.require_idle(action)
+
     async def transition(self, operation, *args):
         if self.changing:
             raise RuntimeError(
                 "The research environment is being prepared. Please wait."
             )
-        if self.session:
-            self.session.require_idle("change kernel or workspace")
+        self.require_all_idle("change kernel or workspace")
         self.changing = True
         task = asyncio.create_task(asyncio.to_thread(operation, *args))
         try:
@@ -374,43 +528,71 @@ class Runtime:
         finally:
             self.changing = False
 
+    async def transition_agent(self, agent_id: str, operation, *args):
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        if agent_id in self._changing_agents:
+            raise RuntimeError("This explorer is already changing. Please wait.")
+        self.get_agent(agent_id).require_idle("change this explorer")
+        self._changing_agents.add(agent_id)
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+        finally:
+            self._changing_agents.discard(agent_id)
+
     def start_query(
-        self, text: str, model: str | None = None, effort: str | None = None
+        self,
+        text: str,
+        model: str | None = None,
+        effort: str | None = None,
+        agent_id: str | None = None,
     ):
         if self.changing:
             raise RuntimeError(
                 "The research environment is being prepared. Please wait."
             )
-        if self.session is None:
-            raise RuntimeError("Open a workspace folder before starting a query.")
-        if self.session.has_active_query():
+        if agent_id in self._changing_agents:
+            raise RuntimeError("This explorer is changing. Please wait.")
+        session = self.get_agent(agent_id)
+        if session.has_active_query():
             raise RuntimeError("The agent is already running a query.")
-        if model is None and self.session.model is None:
+        if model is None and session.model is None:
             raise ValueError("No model available.")
         if model is not None and model not in self.models:
             raise ValueError("Choose a model from the model selector.")
-        target_model = model or self.session.model
+        target_model = model or session.model
         supported_efforts = self.model_efforts.get(target_model or "", [])
         if effort is not None and effort not in supported_efforts:
             raise ValueError("Choose an effort supported by the selected model.")
 
         metadata = {}
         if model is not None:
-            self.session.model = model
-            self.model = model
+            session.model = model
+            if agent_id is None or agent_id == self.primary_agent_id:
+                self.model = model
             metadata["model"] = model
-            selected_effort = self._select_effort(model, effort or self.session.effort)
-            self.session.effort = selected_effort
-            self.effort = selected_effort
+            selected_effort = self._select_effort(model, effort or session.effort)
+            session.effort = selected_effort
+            if agent_id is None or agent_id == self.primary_agent_id:
+                self.effort = selected_effort
             metadata["effort"] = selected_effort
         elif effort is not None:
-            self.session.effort = effort
-            self.effort = effort
+            session.effort = effort
+            if agent_id is None or agent_id == self.primary_agent_id:
+                self.effort = effort
             metadata["effort"] = effort
         if metadata:
-            self.session.log_transcript("meta", **metadata)
-        task = asyncio.create_task(self._run_query(text))
-        self.session._current_task = task
+            session.log_transcript("meta", **metadata)
+        # An accepted first message allocates its session before the UI sees it.
+        session.activate_session()
+        task = asyncio.create_task(self._run_query(session, text, agent_id))
+        session._current_task = task
 
     @property
     def current_task(self) -> asyncio.Task | None:
@@ -423,28 +605,36 @@ class Runtime:
             await asyncio.gather(task, return_exceptions=True)
 
     async def drain(self):
-        """Interrupt the session and let its query and probe finish before shutdown."""
-        session = self.session
-        if session is None:
-            return
-        task = session._current_task
-        await session.interrupt()
-        if task:
-            await asyncio.gather(task, return_exceptions=True)
-        if session._probe_task:
-            await asyncio.gather(session._probe_task, return_exceptions=True)
+        """Interrupt every explorer and preserve any partial probe artifacts."""
+        sessions = list(self.agents.values())
+        await asyncio.gather(*(session.interrupt() for session in sessions))
+        await asyncio.gather(
+            *(
+                asyncio.gather(
+                    *(
+                        task
+                        for task in (session._current_task, session._probe_task)
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
+                for session in sessions
+            )
+        )
 
-    async def _run_query(self, text: str):
-        session = self.session
-        if session is None:
-            return
+    async def _run_query(
+        self, session: ExplorationSession, text: str, agent_id: str | None
+    ):
         try:
             await session.query(text)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             logger.exception("Query task failed")
-            await self.emit("error", {"message": str(exc)})
+            payload = {"message": str(exc)}
+            if agent_id is not None:
+                payload["agent_id"] = agent_id
+            await self.emit("error", payload)
         finally:
             if session._current_task is asyncio.current_task():
                 session._current_task = None

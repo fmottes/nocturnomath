@@ -7,6 +7,7 @@ from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from nocturnomath.session import ExplorationSession
 from nocturnomath.web import create_app
 
 
@@ -347,17 +348,23 @@ def test_websocket_event_contract(session):
         assert [
             r["text"] for r in init["workspace"]["records"] if r["kind"] == "user"
         ] == ["earlier question"]
-        websocket.send_json({"action": "query", "text": "question"})
-        assert websocket.receive_json() == {
-            "type": "user_message",
-            "text": "question",
-        }
+        agent_id = init["workspace"]["agents"][0]["agent_id"]
+        websocket.send_json(
+            {"action": "query", "agent_id": agent_id, "text": "question"}
+        )
+        user = websocket.receive_json()
+        assert (user["type"], user["agent_id"], user["text"]) == (
+            "user_message",
+            agent_id,
+            "question",
+        )
         first_delta = websocket.receive_json()
         second_delta = websocket.receive_json()
         assert (first_delta["type"], first_delta["text"]) == (
             "assistant_delta",
             "streamed ",
         )
+        assert first_delta["agent_id"] == agent_id
         assert (second_delta["type"], second_delta["text"]) == (
             "assistant_delta",
             "reply",
@@ -371,29 +378,44 @@ def test_websocket_event_contract(session):
         assert complete["full_text"] == "streamed reply"
 
 
-def test_new_session_restarts_kernel_and_broadcasts_reset(session):
-    with (
-        TestClient(create_app(session)) as client,
-        client.websocket_connect("/ws") as websocket,
-    ):
-        init = websocket.receive_json()["workspace"]
-        assert init["session_id"] == "S001"
-        assert init["records"] == []
-        session.log_transcript("user", text="question")
-        websocket.send_json({"action": "new_session"})
-        assert websocket.receive_json() == {
-            "type": "session_reset",
-            "session_id": "S002",
-            "model": "claude-opus-5",
-            "effort": "high",
-        }
-        assert session.kernel.restarts == 1
-        websocket.send_json({"action": "query", "text": "/new"})
-        assert websocket.receive_json()["type"] == "session_reset"
-        assert session.kernel.restarts == 2
-        assert client.post("/api/session/new").status_code == 200
-        assert websocket.receive_json()["type"] == "session_reset"
-        assert session.kernel.restarts == 3
+def test_explorers_are_independent_and_idle_tabs_can_close(session):
+    def factory(**kwargs):
+        with patch("nocturnomath.session.Kernel", FakeKernel):
+            return ExplorationSession(**kwargs)
+
+    with TestClient(create_app(session, session_factory=factory)) as client:
+        initial = client.get("/api/workspace").json()["agents"][0]
+        created = client.post("/api/agents")
+        assert created.status_code == 201
+        second = created.json()
+        assert second["agent_id"] != initial["agent_id"]
+        assert (
+            client.app.state.runtime.agents[initial["agent_id"]].kernel
+            is not client.app.state.runtime.agents[second["agent_id"]].kernel
+        )
+        client.app.state.runtime.agents[second["agent_id"]]._is_busy = True
+        assert client.delete(f"/api/agents/{second['agent_id']}").status_code == 409
+        client.app.state.runtime.agents[second["agent_id"]]._is_busy = False
+        assert client.delete(f"/api/agents/{second['agent_id']}").status_code == 200
+        assert client.delete(f"/api/agents/{initial['agent_id']}").status_code == 409
+
+
+def test_history_replaces_the_selected_idle_explorer(session):
+    session.log_transcript("user", text="first exploration")
+
+    def factory(**kwargs):
+        with patch("nocturnomath.session.Kernel", FakeKernel):
+            return ExplorationSession(**kwargs)
+
+    with TestClient(create_app(session, session_factory=factory)) as client:
+        agent_id = client.get("/api/workspace").json()["agents"][0]["agent_id"]
+        response = client.post(
+            f"/api/agents/{agent_id}/resume",
+            json={"id": "S001", "restore_kernel": False},
+        )
+    assert response.status_code == 200
+    assert response.json()["agent_id"] == agent_id
+    assert response.json()["session_id"] == "S001"
 
 
 def test_resume_session_can_restore_kernel(session):

@@ -120,13 +120,11 @@
     <main class="split-screen" id="split-screen">
       <!-- Left Half: Chat Dashboard -->
       <section class="pane pane-chat" id="pane-chat">
+        <div class="explorer-tabs" id="explorer-tabs" role="tablist" aria-label="Explorations">
+          <button class="btn btn-xs btn-ghost explorer-add" id="btn-new-explorer" type="button" title="Start another exploration" aria-label="Start another exploration">+</button>
+        </div>
         <div class="chat-header">
-          <div class="pane-title">
-            <span>Exploration log</span>
-            <span class="badge badge-sm" id="session-id-badge" title="Current session"></span>
-          </div>
           <div class="chat-header-actions">
-            <button class="btn btn-xs btn-ghost" id="btn-new-session" title="Start a new session with a fresh kernel" type="button">New session</button>
             <button class="btn btn-xs btn-ghost" id="btn-history" type="button">History</button>
             <span class="chat-status-separator" aria-hidden="true"></span>
             <button class="btn btn-xs btn-ghost" id="btn-download-notebook" type="button">Download .ipynb</button>
@@ -460,7 +458,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260913-1"></script>
+  <script type="module" src="/static/js/main.js?v=20260922-1"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

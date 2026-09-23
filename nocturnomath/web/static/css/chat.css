@@ -1,6 +1,38 @@
 /* --------------------------------------------------------------------------
    Left pane: exploration log
    -------------------------------------------------------------------------- */
+.explorer-tabs {
+  min-height: 42px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--rule-strong);
+  background: var(--sheet);
+}
+
+.explorer-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.explorer-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+.explorer-tab .pane-title { color: inherit; }
+.explorer-tab-status { width: 6px; height: 6px; border: 1px solid currentColor; }
+.explorer-tab.busy .explorer-tab-status { background: currentColor; }
+.explorer-close { padding: 1px 3px; line-height: 1; color: inherit; }
+.explorer-close:disabled { opacity: 0.35; cursor: not-allowed; }
+.explorer-add { align-self: center; margin-left: 2px; font-size: 1rem; }
+
 .chat-header,
 .viewer-header {
   height: 42px;

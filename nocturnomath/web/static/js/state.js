@@ -1,5 +1,7 @@
 export const state = {
   workspace: null,
+  agents: new Map(),
+  activeAgentId: null,
   activeDoc: null,
   followChat: true,
   exiting: false,
@@ -54,8 +56,9 @@ export const elements = {
   kernelText: document.getElementById("kernel-text"),
   chatStatusBadge: document.getElementById("chat-status-badge"),
   sessionIdBadge: document.getElementById("session-id-badge"),
+  explorerTabs: document.getElementById("explorer-tabs"),
+  btnNewExplorer: document.getElementById("btn-new-explorer"),
   contextToggle: document.getElementById("context-toggle"),
-  btnNewSession: document.getElementById("btn-new-session"),
   btnHistory: document.getElementById("btn-history"),
   btnDownloadNotebook: document.getElementById("btn-download-notebook"),
   btnSettings: document.getElementById("btn-settings"),

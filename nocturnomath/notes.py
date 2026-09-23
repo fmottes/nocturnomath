@@ -1,10 +1,20 @@
 """Numbered scientific records stored directly in two Markdown files."""
 
 import re
+import threading
 from pathlib import Path
 
 ENTRY = re.compile(r"^## ([ET]\d+)\n", re.MULTILINE)
 CITATION = re.compile(r"\[([ET]\d+)\](?!\()")
+_LOCKS: dict[Path, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(directory: Path) -> threading.RLock:
+    """Return the process-wide lock for one shared scientific record."""
+    directory = directory.resolve()
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(directory, threading.RLock())
 
 
 def write_text(path: Path, text: str):
@@ -16,6 +26,7 @@ def write_text(path: Path, text: str):
 
 class ResearchNotes:
     def __init__(self, directory: Path):
+        self._lock = _lock_for(directory)
         self.evidence_path = directory / "evidence.md"
         self.thoughts_path = directory / "thoughts.md"
         for path, title in (
@@ -55,28 +66,35 @@ class ResearchNotes:
         return anchor + "</a>\n\n<del>\n\n" + content.strip() + "\n\n</del>\n\n"
 
     def add_evidence(self, text: str, sources: list[str]) -> str:
-        text = text.strip()
-        if not text or len(text) > 250 or "\n" in text or "\r" in text:
-            raise ValueError(
-                "Evidence must be one non-empty line, at most 250 characters excluding sources."
+        with self._lock:
+            text = text.strip()
+            if not text or len(text) > 250 or "\n" in text or "\r" in text:
+                raise ValueError(
+                    "Evidence must be one non-empty line, at most 250 characters excluding sources."
+                )
+            if re.search(r"\b[ET]\d{3,}\b", text) or re.search(
+                r"\[[^\]]*\]\(|<[A-Za-z/!]|~~", text
+            ):
+                raise ValueError(
+                    "Evidence must be plain factual text without citations, HTML, or strike markup."
+                )
+            if not sources:
+                raise ValueError(
+                    "Evidence needs at least one saved probe output or plot."
+                )
+            entry_id = self.next_id(self.evidence_path, "E")
+            body = text + "\n\nSources: " + " · ".join(sources)
+            write_text(
+                self.evidence_path,
+                self.evidence_path.read_text() + self.block(entry_id, body),
             )
-        if re.search(r"\b[ET]\d{3,}\b", text) or re.search(
-            r"\[[^\]]*\]\(|<[A-Za-z/!]|~~", text
-        ):
-            raise ValueError(
-                "Evidence must be plain factual text without citations, HTML, or strike markup."
-            )
-        if not sources:
-            raise ValueError("Evidence needs at least one saved probe output or plot.")
-        entry_id = self.next_id(self.evidence_path, "E")
-        body = text + "\n\nSources: " + " · ".join(sources)
-        write_text(
-            self.evidence_path,
-            self.evidence_path.read_text() + self.block(entry_id, body),
-        )
-        return entry_id
+            return entry_id
 
     def add_thought(self, text: str, replaces: list[str]) -> str:
+        with self._lock:
+            return self._add_thought(text, replaces)
+
+    def _add_thought(self, text: str, replaces: list[str]) -> str:
         text = text.strip()
         if not text or ENTRY.search(text) or re.search(r"</?(?:del|a)\b|~~", text):
             raise ValueError(
@@ -113,20 +131,21 @@ class ResearchNotes:
         return entry_id
 
     def strike_evidence(self, entry_id: str):
-        if not entry_id.startswith("E"):
-            raise ValueError(
-                "Only evidence can be struck without a replacement thought."
+        with self._lock:
+            if not entry_id.startswith("E"):
+                raise ValueError(
+                    "Only evidence can be struck without a replacement thought."
+                )
+            body = self.entry(entry_id)
+            if "<del>" in body:
+                raise ValueError(f"{entry_id} is already struck.")
+            document = self.evidence_path.read_text()
+            write_text(
+                self.evidence_path,
+                document.replace(
+                    f"## {entry_id}\n{body}", f"## {entry_id}\n{self.strike(body)}", 1
+                ),
             )
-        body = self.entry(entry_id)
-        if "<del>" in body:
-            raise ValueError(f"{entry_id} is already struck.")
-        document = self.evidence_path.read_text()
-        write_text(
-            self.evidence_path,
-            document.replace(
-                f"## {entry_id}\n{body}", f"## {entry_id}\n{self.strike(body)}", 1
-            ),
-        )
 
     @staticmethod
     def link(entry_id: str) -> str:

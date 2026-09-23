@@ -40,7 +40,7 @@ export function renderSessions(sessions) {
 
   sessions.forEach((s) => {
     const item = document.createElement("div");
-    item.className = "session-item" + (s.is_current ? " current" : "");
+    item.className = "session-item" + (s.open_agent_id ? " current" : "");
 
     const info = document.createElement("div");
     info.className = "session-info";
@@ -74,9 +74,9 @@ export function renderSessions(sessions) {
       meta.appendChild(warn);
     }
 
-    if (s.is_current) {
+    if (s.open_agent_id) {
       const badge = document.createElement("span");
-      badge.textContent = "current";
+      badge.textContent = "open";
       meta.appendChild(badge);
     }
 
@@ -89,12 +89,12 @@ export function renderSessions(sessions) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn btn-sm btn-success-outline";
-    btn.textContent = s.is_current ? "Reload" : "Resume";
+    btn.textContent = s.open_agent_id ? "Focus" : "Resume";
     const mode = document.createElement("select");
     mode.className = "model-select-native session-resume-mode";
     mode.setAttribute("aria-label", `Resume mode for ${s.title}`);
     mode.innerHTML = `<option value="chat">Chat only</option><option value="kernel">With kernel</option>`;
-    btn.addEventListener("click", () => resumeSession(s.id, mode.value === "kernel"));
+    btn.addEventListener("click", () => resumeSession(s.id, mode.value === "kernel", s.open_agent_id));
 
     item.appendChild(info);
     controls.appendChild(btn);
@@ -104,14 +104,20 @@ export function renderSessions(sessions) {
   });
 }
 
-export async function resumeSession(sessionId, restoreKernel = false) {
+export async function resumeSession(sessionId, restoreKernel = false, openAgentId = null) {
   state.historyLoading = true;
   elements.historyLoading.classList.remove("hidden");
   elements.historyModal.querySelectorAll("button, select").forEach((control) => {
     control.disabled = true;
   });
   try {
-    const res = await fetch("/api/session/resume", {
+    if (!state.activeAgentId && !openAgentId) throw new Error("No explorer is selected");
+    if (openAgentId) {
+      window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
+      elements.historyModal.classList.add("hidden");
+      return;
+    }
+    const res = await fetch(`/api/agents/${encodeURIComponent(state.activeAgentId)}/resume`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: sessionId, restore_kernel: restoreKernel }),
@@ -149,10 +155,10 @@ export function clearChat(showWelcome = true) {
 
 // Rebuild the chat from the transcript the browser reconnected to, so a page
 // reload or a dropped socket shows the running session rather than a blank log.
-export function restoreChat(records = []) {
+export function restoreChat(records = [], isBusy = false) {
   clearChat(!records.length);
   if (!records.length) return;
-  renderRecords(records);
+  renderRecords(records, isBusy);
   scrollChatToBottom();
 }
 
@@ -180,11 +186,14 @@ export function replaySession(records, contextRestored, carryChatContext, kernel
   scrollChatToBottom();
 }
 
-function renderRecords(records) {
+function renderRecords(records, isBusy = false) {
   const outcomes = new Set(records.filter((rec) =>
     rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));
   const starts = new Map(records.filter((rec) => rec.kind === "probe_started")
     .map((rec) => [rec.probe_id, rec]));
+  const activeProbe = isBusy
+    ? [...starts.keys()].reverse().find((probeId) => !outcomes.has(probeId))
+    : null;
   records.forEach((rec) => {
     switch (rec.kind) {
       case "user":
@@ -198,8 +207,12 @@ function renderRecords(records) {
 
       case "probe_started":
         if (!outcomes.has(rec.probe_id)) {
-          appendProbeFinish(rec.expected, rec.code,
-            `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], []);
+          if (rec.probe_id === activeProbe) {
+            appendProbeStart(rec.expected, rec.code);
+          } else {
+            appendProbeFinish(rec.expected, rec.code,
+              `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], []);
+          }
         }
         break;
 

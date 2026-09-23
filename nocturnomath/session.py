@@ -81,6 +81,7 @@ class ExplorationSession:
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
+        self._record_dirty = False
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
         self._sent_documents: dict[str, str] = {}
@@ -150,6 +151,10 @@ class ExplorationSession:
 
     def opening_notes(self) -> str:
         return self.workspace.opening_notes()
+
+    def mark_record_dirty(self):
+        """Ensure a concurrent explorer sees the shared record on its next turn."""
+        self._record_dirty = True
 
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
@@ -400,6 +405,12 @@ class ExplorationSession:
                 elif not self.carry_chat_context or not self._session_initialized:
                     prefix = self.opening_notes()
                     initialize_session = True
+                elif self._record_dirty:
+                    prefix = (
+                        "The shared scientific record changed in another exploration. "
+                        "Treat this current copy as authoritative:\n\n"
+                        + self.opening_notes()
+                    )
 
                 prefix += document_prefix
                 kernel_notice = self._kernel_notice
@@ -411,6 +422,7 @@ class ExplorationSession:
                     self._session_initialized = True
                 if self._kernel_notice == kernel_notice:
                     self._kernel_notice = ""
+                self._record_dirty = False
                 self._sent_documents.update(sent_documents)
                 accumulated_text = []
                 async for message in client.receive_response():

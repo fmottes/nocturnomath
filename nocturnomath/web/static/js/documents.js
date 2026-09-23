@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260913-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20260913-1";
 
 // ============================================================================
@@ -9,6 +9,10 @@ import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v
 // ============================================================================
 
 let listSignature = null;
+
+function agentQuery() {
+  return state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
+}
 
 export function setDocuments(documents = [], documentsDefault = state.documentsDefault) {
   state.documents = documents;
@@ -25,7 +29,7 @@ export function setDocuments(documents = [], documentsDefault = state.documentsD
 }
 
 export async function fetchDocuments() {
-  const res = await fetch("/api/documents");
+  const res = await fetch(`/api/documents${agentQuery()}`);
   if (!res.ok) return;
   const data = await res.json();
   setDocuments(data.documents || [], data.documents_default);
@@ -109,7 +113,7 @@ const TRASH_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" 
 async function deleteDocument(name) {
   if (!window.confirm(`Delete ${name}? This removes the file from .nocturnomath/documents/.`)) return;
   try {
-    const res = await fetch(`/api/documents/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const res = await fetch(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     setDocuments(data.documents || [], data.documents_default);
@@ -121,7 +125,7 @@ async function deleteDocument(name) {
 
 async function toggleIncluded(name, included, box) {
   try {
-    const res = await fetch(`/api/documents/${encodeURIComponent(name)}/include`, {
+    const res = await fetch(`/api/documents/${encodeURIComponent(name)}/include${agentQuery()}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ included }),
     });
@@ -137,7 +141,7 @@ async function toggleIncluded(name, included, box) {
 
 export async function setDocumentsDefault(enabled) {
   try {
-    const res = await fetch("/api/documents/default", {
+    const res = await fetch(`/api/documents/default${agentQuery()}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
     });
@@ -151,7 +155,7 @@ export async function setDocumentsDefault(enabled) {
 }
 
 export async function openDocument(name, quiet = false) {
-  const res = await fetch(`/api/documents/${encodeURIComponent(name)}`);
+  const res = await fetch(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`);
   if (!res.ok) {
     if (!quiet) {
       const message = document.createElement("p");
@@ -208,7 +212,7 @@ function showDocumentError(message) {
 export async function saveEdit() {
   const text = elements.documentsEditorText.value;
   const creating = state.documentsView === "create";
-  const url = creating ? "/api/documents" : `/api/documents/${encodeURIComponent(state.openDocument)}`;
+  const url = creating ? `/api/documents${agentQuery()}` : `/api/documents/${encodeURIComponent(state.openDocument)}${agentQuery()}`;
   const body = creating ? { title: elements.documentsEditorTitle.value, text } : { text };
   elements.documentsSave.disabled = true;
   try {
