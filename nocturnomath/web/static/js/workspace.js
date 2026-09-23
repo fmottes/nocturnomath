@@ -49,6 +49,7 @@ export function applyWorkspace(ws) {
   updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
   updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
   setCarryContext(selected?.carry_chat_context);
+  setContextUsage(selected?.context_usage);
 
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
     state.activeDoc = ws.evidence_path;
@@ -65,6 +66,22 @@ export function applyWorkspace(ws) {
 export function setSessionId(id) {
   state.currentSession = id || null;
   if (elements.sessionIdBadge) elements.sessionIdBadge.textContent = id || "";
+}
+
+export function setContextUsage(usage) {
+  const indicator = elements.contextWindowIndicator;
+  if (!Number.isFinite(usage?.used_tokens)) {
+    indicator.textContent = "Ctx —";
+    indicator.title = "Context usage appears after the first response";
+    return;
+  }
+  const windowTokens = Number.isFinite(usage.window_tokens) ? usage.window_tokens : null;
+  indicator.textContent = windowTokens
+    ? `Ctx ${Math.min(100, Math.round((usage.used_tokens / windowTokens) * 100))}%`
+    : `Ctx ${usage.used_tokens.toLocaleString()}`;
+  indicator.title = `Last reported prompt: ${usage.used_tokens.toLocaleString()} input tokens`
+    + (windowTokens ? ` of a ${windowTokens.toLocaleString()}-token context window` : "; window size unavailable")
+    + (usage.model ? ` (${usage.model})` : "");
 }
 
 function workspaceName(path) {

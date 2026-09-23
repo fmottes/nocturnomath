@@ -3,7 +3,7 @@ from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock
 
 from nocturnomath.auth import ClaudeAuth
 
@@ -47,6 +47,61 @@ class FakeClient:
 class FailingClient(FakeClient):
     async def query(self, prompt):
         raise RuntimeError("send failed")
+
+
+class UsageClient(FakeClient):
+    async def receive_response(self):
+        yield AssistantMessage(
+            content=[TextBlock("answer")],
+            model="test",
+            session_id="sdk-session",
+            usage={
+                "input_tokens": 1000,
+                "cache_read_input_tokens": 12000,
+                "cache_creation_input_tokens": 500,
+                "output_tokens": 300,
+            },
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session",
+            model_usage={"test": {"contextWindow": 200000}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_usage_is_reported_and_restored_from_history(session):
+    events = []
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
+    with patch("nocturnomath.session.ClaudeSDKClient", UsageClient):
+        await session.query("question")
+
+    expected = {
+        "used_tokens": 13500,
+        "window_tokens": 200000,
+        "model": "test",
+    }
+    assert session.context_usage == expected
+    assert (
+        next(
+            payload["context_usage"]
+            for event_type, payload in events
+            if event_type == "context_usage_changed"
+        )
+        == expected
+    )
+    records = session.workspace.current_records()
+    assert records[-1]["context_usage"] == expected
+
+    session.start_new_transcript()
+    assert session.context_usage is None
+    resumed = session.resume_session("S001")
+    assert resumed["context_usage"] == expected
+    assert session.context_usage == expected
 
 
 @pytest.mark.asyncio

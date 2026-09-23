@@ -339,6 +339,11 @@ def test_websocket_event_contract(session):
         await session.emit("turn_complete", full_text="streamed reply")
 
     session.query = query
+    session.context_usage = {
+        "used_tokens": 13500,
+        "window_tokens": 200000,
+        "model": "test",
+    }
     app = create_app(session)
     session.log_transcript("user", text="earlier question")
     with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
@@ -349,6 +354,7 @@ def test_websocket_event_contract(session):
             r["text"] for r in init["workspace"]["records"] if r["kind"] == "user"
         ] == ["earlier question"]
         agent_id = init["workspace"]["agents"][0]["agent_id"]
+        assert init["workspace"]["agents"][0]["context_usage"] == session.context_usage
         websocket.send_json(
             {"action": "query", "agent_id": agent_id, "text": "question"}
         )

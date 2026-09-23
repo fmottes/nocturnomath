@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20260913-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20260913-1";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260923-1";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260923-2";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260922-2";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260922-2";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
@@ -99,6 +99,7 @@ function applyExplorer(agent, repaint = false) {
     setSessionId(agent.session_id);
     setActiveModelAndEffort(agent.draftModel || agent.model, agent.draftEffort || agent.effort);
     setCarryContext(agent.carry_chat_context);
+    setContextUsage(agent.context_usage);
     updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
     updateAgentStatus(agent.is_busy ? "thinking" : "idle");
     if (agent.documents) refreshDocuments();
@@ -139,6 +140,17 @@ function installExplorers(agents = [], preserveView = true) {
   if (!state.agents.has(state.activeAgentId)) state.activeAgentId = agents[0]?.agent_id || null;
   if (state.activeAgentId) applyExplorer(state.agents.get(state.activeAgentId), true);
   renderExplorerTabs();
+}
+
+async function refreshContextUsage(agentId) {
+  try {
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
+    if (!response.ok) return;
+    const agent = await response.json();
+    applyExplorer(agent);
+  } catch (error) {
+    // The next websocket snapshot will reconcile an unavailable local service.
+  }
 }
 
 async function createExplorer() {
@@ -187,6 +199,7 @@ function handleServerEvent(event) {
       current.kernel_busy = false;
     }
     if (event.type === "carry_context_changed") current.carry_chat_context = event.carry_chat_context;
+    if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
     if (event.agent_id !== state.activeAgentId && event.type !== "agent_focused") {
@@ -269,6 +282,7 @@ function handleServerEvent(event) {
     case "turn_complete":
       finalizeAssistantTurn();
       refreshDocuments();
+      refreshContextUsage(event.agent_id);
       break;
 
     case "status_change":
@@ -296,7 +310,13 @@ function handleServerEvent(event) {
       );
       break;
 
+    case "context_usage_changed":
+      setContextUsage(event.context_usage);
+      break;
+
     case "session_reset":
+      if (state.agents.has(event.agent_id)) state.agents.get(event.agent_id).context_usage = null;
+      setContextUsage(null);
       setSessionId(event.session_id);
       setActiveModelAndEffort(event.model, event.effort);
       clearChat();

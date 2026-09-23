@@ -338,6 +338,7 @@
   border-top: 1px solid var(--rule-strong);
 }
 .command-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.context-window-indicator { flex: 0 0 auto; white-space: nowrap; }
 .chips-hint {
   margin-left: auto;
   font-family: var(--font-mono);

@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ResultMessage,
     StreamEvent,
     TextBlock,
     create_sdk_mcp_server,
@@ -82,6 +83,7 @@ class ExplorationSession:
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
         self._record_dirty = False
+        self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
         self._sent_documents: dict[str, str] = {}
@@ -158,6 +160,7 @@ class ExplorationSession:
 
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
+        self.context_usage = None
 
     def set_workspace(self, new_dir: Path | str, python=None):
         self.require_idle("change workspace")
@@ -181,6 +184,7 @@ class ExplorationSession:
         self._resume_prefix = None
         self._results_since_note = 0
         self._pending_verdict = None
+        self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
 
@@ -291,6 +295,15 @@ class ExplorationSession:
         self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
+        self.context_usage = next(
+            (
+                record["context_usage"]
+                for record in reversed(records)
+                if record.get("kind") == "meta"
+                and isinstance(record.get("context_usage"), dict)
+            ),
+            None,
+        )
         if self.carry_chat_context:
             self._session_initialized = False
             self._resume_prefix = None if sdk_id else self.workspace.recap(records)
@@ -317,6 +330,7 @@ class ExplorationSession:
             "records": records,
             "carry_chat_context": self.carry_chat_context,
             "context_restored": self.carry_chat_context and sdk_id is not None,
+            "context_usage": self.context_usage,
         }
 
     def _replay_probe_code(self, records: list[dict[str, Any]]) -> int:
@@ -425,6 +439,8 @@ class ExplorationSession:
                 self._record_dirty = False
                 self._sent_documents.update(sent_documents)
                 accumulated_text = []
+                last_prompt_tokens = None
+                last_prompt_model = None
                 async for message in client.receive_response():
                     self._track_session_id(getattr(message, "session_id", None))
                     if isinstance(message, StreamEvent):
@@ -432,11 +448,63 @@ class ExplorationSession:
                         if delta:
                             await self.emit("assistant_delta", text=delta)
                     elif isinstance(message, AssistantMessage):
+                        usage = message.usage or {}
+                        prompt_counts = (
+                            usage.get("input_tokens", 0),
+                            usage.get("cache_read_input_tokens", 0),
+                            usage.get("cache_creation_input_tokens", 0),
+                        )
+                        if (
+                            message.parent_tool_use_id is None
+                            and any(
+                                key in usage
+                                for key in (
+                                    "input_tokens",
+                                    "cache_read_input_tokens",
+                                    "cache_creation_input_tokens",
+                                )
+                            )
+                            and all(
+                                isinstance(count, int) and count >= 0
+                                for count in prompt_counts
+                            )
+                        ):
+                            last_prompt_tokens = sum(prompt_counts)
+                            last_prompt_model = message.model
                         for block in message.content:
                             if isinstance(block, TextBlock):
                                 accumulated_text.append(block.text)
                                 self.log_transcript("agent", text=block.text)
                                 await self.emit("assistant_text", text=block.text)
+                    elif (
+                        isinstance(message, ResultMessage)
+                        and last_prompt_tokens is not None
+                    ):
+                        models = message.model_usage or {}
+                        model_usage = models.get(last_prompt_model or "")
+                        if model_usage is None:
+                            model_usage = next(
+                                (
+                                    value
+                                    for value in models.values()
+                                    if value.get("canonicalModel") == last_prompt_model
+                                ),
+                                None,
+                            )
+                        if model_usage is None and len(models) == 1:
+                            model_usage = next(iter(models.values()))
+                        window = (model_usage or {}).get("contextWindow")
+                        self.context_usage = {
+                            "used_tokens": last_prompt_tokens,
+                            "window_tokens": window
+                            if isinstance(window, int) and window > 0
+                            else None,
+                            "model": last_prompt_model,
+                        }
+                        self.log_transcript("meta", context_usage=self.context_usage)
+                        await self.emit(
+                            "context_usage_changed", context_usage=self.context_usage
+                        )
                 await self.emit(
                     "turn_complete", full_text="\n\n".join(accumulated_text)
                 )
@@ -472,6 +540,7 @@ class ExplorationSession:
         self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
+        self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort
 

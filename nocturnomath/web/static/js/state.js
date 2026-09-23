@@ -47,6 +47,7 @@ export const elements = {
   workspacePath: document.getElementById("workspace-path"),
   modelSelect: document.getElementById("model-select"),
   effortSelect: document.getElementById("effort-select"),
+  contextWindowIndicator: document.getElementById("context-window-indicator"),
   defaultModelSelect: document.getElementById("default-model-select"),
   defaultEffortSelect: document.getElementById("default-effort-select"),
   sessionDefaultsForm: document.getElementById("session-defaults-form"),
