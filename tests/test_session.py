@@ -1,9 +1,19 @@
 import asyncio
+import json
+import os
+import shlex
+import subprocess
 from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, TextBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    StreamEvent,
+    SystemMessage,
+    TextBlock,
+)
 
 from nocturnomath.auth import ClaudeAuth
 
@@ -71,6 +81,50 @@ class UsageClient(FakeClient):
             session_id="sdk-session",
             model_usage={"test": {"contextWindow": 200000}},
         )
+
+
+class CompactingClient(FakeClient):
+    async def receive_response(self):
+        yield SystemMessage(subtype="compact_boundary", data={"trigger": "auto"})
+        yield AssistantMessage(
+            content=[TextBlock("continued")], model="test", session_id="sdk-session"
+        )
+
+
+@pytest.mark.asyncio
+async def test_compaction_is_recorded_and_reloads_current_scientific_record(session):
+    events = []
+    session.subscribe(lambda event_type, payload: events.append(event_type))
+    with patch("nocturnomath.session.ClaudeSDKClient", CompactingClient):
+        await session.query("question")
+
+    assert "context_compacted" in events
+    assert any(
+        record["kind"] == "compaction" for record in session.workspace.current_records()
+    )
+    options = FakeClient.options_used[-1]
+    hook = json.loads(options.settings)["hooks"]["SessionStart"][0]
+    assert hook["matcher"] == "compact"
+    assert "nocturnomath.compaction" in hook["hooks"][0]["command"]
+    assert options.env["NOCTURNOMATH_WORKSPACE_PATH"] == str(session.workspace_path)
+
+    session.workspace.notes.evidence_path.write_text(
+        "# Evidence\n\n## E001\n\nNew result\n"
+    )
+    result = await asyncio.to_thread(
+        subprocess.run,
+        shlex.split(hook["hooks"][0]["command"]),
+        input='{"source":"compact"}',
+        text=True,
+        capture_output=True,
+        cwd=session.workspace_path,
+        env={**os.environ, **options.env},
+        check=True,
+    )
+    context = json.loads(result.stdout)["hookSpecificOutput"]
+    assert context["hookEventName"] == "SessionStart"
+    assert "New result" in context["additionalContext"]
+    assert "# Thoughts" in context["additionalContext"]
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ import { elements, state } from "./state.js?v=20260913-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20260913-1";
 import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260923-2";
 import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260922-2";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260922-2";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260923-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260923-1";
 import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20260923-1";
@@ -312,6 +312,10 @@ function handleServerEvent(event) {
 
     case "context_usage_changed":
       setContextUsage(event.context_usage);
+      break;
+
+    case "context_compacted":
+      appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
       break;
 
     case "session_reset":

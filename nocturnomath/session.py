@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import shlex
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -16,6 +18,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     create_sdk_mcp_server,
 )
@@ -386,6 +389,7 @@ class ExplorationSession:
             document_prefix, sent_documents = self.document_context()
             await self.emit("status_change", status="thinking")
             self.log_transcript("user", text=user_text)
+            compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
             options = ClaudeAgentOptions(
                 # The research MCP tools are the complete execution surface. Do not
                 # inherit Claude Code's built-ins or unrelated MCP configuration.
@@ -398,13 +402,30 @@ class ExplorationSession:
                 # Keep the user's authentication/provider settings, but do not load
                 # instructions or hooks from the selected research workspace.
                 setting_sources=["user"],
+                settings=json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "matcher": "compact",
+                                    "hooks": [
+                                        {"type": "command", "command": compact_hook}
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                ),
                 skills=[],
                 permission_mode="bypassPermissions",
                 model=self.model,
                 effort=self.effort,
                 max_buffer_size=20 * 1024 * 1024,
                 include_partial_messages=True,
-                env=self.auth.sdk_env(),
+                env={
+                    **self.auth.sdk_env(),
+                    "NOCTURNOMATH_WORKSPACE_PATH": str(self.workspace_path),
+                },
                 cwd=self.workspace_path,
                 resume=self._sdk_session_id if self.carry_chat_context else None,
             )
@@ -447,6 +468,12 @@ class ExplorationSession:
                         delta = _stream_delta_text(message)
                         if delta:
                             await self.emit("assistant_delta", text=delta)
+                    elif (
+                        isinstance(message, SystemMessage)
+                        and message.subtype == "compact_boundary"
+                    ):
+                        self.log_transcript("compaction")
+                        await self.emit("context_compacted")
                     elif isinstance(message, AssistantMessage):
                         usage = message.usage or {}
                         prompt_counts = (

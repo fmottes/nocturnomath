@@ -238,6 +238,10 @@ function renderRecords(records, isBusy = false) {
         appendProbeVerdict(rec.text || "");
         break;
 
+      case "compaction":
+        appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
+        break;
+
       case "evidence":
       case "thought":
       case "evidence_struck":
