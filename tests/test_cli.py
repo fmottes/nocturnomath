@@ -124,6 +124,7 @@ EVENT_PAYLOAD = {
     "status": "thinking",
     "id": "S001",
     "carry_chat_context": True,
+    "context_usage": {"used_tokens": 4200, "window_tokens": 200000},
     "context_restored": True,
     "kernel_restored": True,
     "kernel_reset": True,
@@ -153,6 +154,8 @@ EVENT_TYPES = [
     "session_resumed",
     "workspace_updated",
     "carry_context_changed",
+    "context_compacted",
+    "context_usage_changed",
 ]
 
 
@@ -419,6 +422,32 @@ async def test_context_toggles_and_refuses_while_busy(terminal):
     await terminal.run("/context off")
     assert terminal.session.carry_chat_context is True
     assert "while the agent is running a query." in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_uses_shared_runtime_and_renders_notice(terminal):
+    await terminal.run("/compact")
+    assert "no conversation context" in terminal.output()
+
+    async def compact():
+        await terminal.session.emit("status_change", status="compacting")
+        await terminal.session.emit("context_compacted")
+        await terminal.session.emit(
+            "context_usage_changed",
+            context_usage={"used_tokens": 4200, "window_tokens": 200000},
+        )
+        await terminal.session.emit("status_change", status="idle")
+
+    terminal.session.compact = compact
+    await terminal.run("/compact")
+    output = terminal.output()
+    assert "Claude compacted this chat" in output
+    assert "Context: 2%" in output
+    assert "[context_compacted]" not in output
+
+    terminal.session._is_busy = True
+    await terminal.run("/compact")
+    assert "while the agent is running a query" in terminal.output()
 
 
 @pytest.mark.asyncio

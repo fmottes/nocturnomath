@@ -99,6 +99,11 @@ class NoBoundaryClient(FakeClient):
         yield AssistantMessage(content=[], model="test", session_id="sdk-session")
 
 
+class SlowUsageClient(CompactingClient):
+    async def get_context_usage(self):
+        await asyncio.sleep(1)
+
+
 @pytest.mark.asyncio
 async def test_compaction_is_recorded_and_reloads_current_scientific_record(session):
     events = []
@@ -177,6 +182,23 @@ async def test_manual_compaction_requires_context_and_confirmation(session):
         await session.compact()
     assert not session.has_active_query()
     assert not any(
+        record["kind"] == "compaction" for record in session.workspace.current_records()
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_does_not_wait_for_slow_usage_refresh(session):
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("original question")
+    with (
+        patch("nocturnomath.session.ClaudeSDKClient", SlowUsageClient),
+        patch("nocturnomath.session.CONTEXT_USAGE_TIMEOUT_S", 0.01),
+    ):
+        await session.compact()
+
+    assert session.context_usage is None
+    assert not session.has_active_query()
+    assert any(
         record["kind"] == "compaction" for record in session.workspace.current_records()
     )
 

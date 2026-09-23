@@ -48,6 +48,7 @@ COMMANDS = [
         "show or change Claude login",
     ),
     ("/context", "[on|off]", "show or set whether the agent carries chat context"),
+    ("/compact", "", "compact the current chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
     ("/workspace", "<path>", "open a different workspace folder"),
     ("/docs", "[name]", "list the documents folder, or render one"),
@@ -347,6 +348,8 @@ class TerminalApp:
         self.status = payload.get("status", "idle")
         if self.status == "thinking":
             self.show_spinner("thinking…")
+        elif self.status == "compacting":
+            self.show_spinner("compacting…")
         else:
             self.close_stream()
             self.clear_spinner()
@@ -414,6 +417,18 @@ class TerminalApp:
                 "Discarding context. Every message starts fresh from the system prompt "
                 "plus evidence.md and thoughts.md."
             )
+
+    def _render_context_compacted(self, payload):
+        self.write(
+            "Claude compacted this chat. The current scientific record was reloaded."
+        )
+
+    def _render_context_usage_changed(self, payload):
+        usage = payload.get("context_usage") or {}
+        used = usage.get("used_tokens")
+        window = usage.get("window_tokens")
+        if isinstance(used, int) and isinstance(window, int) and window > 0:
+            self.write(f"Context: {round(100 * used / window)}%", style="dim")
 
     # ----------------------------------------------------------------- helpers
 
@@ -525,6 +540,13 @@ class TerminalApp:
         self.require_idle("start a new session")
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
+        return True
+
+    async def _command_compact(self, argument: str) -> bool:
+        try:
+            await self.runtime.compact_agent(self.runtime.primary_agent_id)
+        except Exception as exc:
+            self.error(f"Compaction failed: {exc}")
         return True
 
     async def _command_restart(self, argument: str) -> bool:

@@ -35,6 +35,7 @@ logger = logging.getLogger("nocturnomath")
 CARRY_CHAT_CONTEXT = True
 DEFAULT_EFFORT = "high"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+CONTEXT_USAGE_TIMEOUT_S = 10
 
 
 def _stream_delta_text(event: StreamEvent) -> str | None:
@@ -429,6 +430,7 @@ class ExplorationSession:
         if not self.carry_chat_context or not self._sdk_session_id:
             raise RuntimeError("This explorer has no conversation context to compact.")
         self._is_busy = True
+        started_at = time.monotonic()
         try:
             await self.emit("status_change", status="compacting")
             async with ClaudeSDKClient(self._client_options()) as client:
@@ -436,6 +438,7 @@ class ExplorationSession:
                 await client.query("/compact")
                 compacted = False
                 async for message in client.receive_response():
+                    self._track_session_id(getattr(message, "session_id", None))
                     if (
                         isinstance(message, SystemMessage)
                         and message.subtype == "compact_boundary"
@@ -446,9 +449,15 @@ class ExplorationSession:
                     raise RuntimeError(
                         "Claude did not confirm that compaction completed."
                     )
+                logger.info(
+                    "Claude compaction completed in %.1fs",
+                    time.monotonic() - started_at,
+                )
                 self.context_usage = None
                 try:
-                    usage = await client.get_context_usage()
+                    usage = await asyncio.wait_for(
+                        client.get_context_usage(), timeout=CONTEXT_USAGE_TIMEOUT_S
+                    )
                     used = usage.get("totalTokens")
                     window = usage.get("rawMaxTokens")
                     if isinstance(used, int) and used >= 0:
@@ -459,6 +468,11 @@ class ExplorationSession:
                             else None,
                             "model": usage.get("model"),
                         }
+                except TimeoutError:
+                    logger.warning(
+                        "Context usage refresh timed out after %ss",
+                        CONTEXT_USAGE_TIMEOUT_S,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Could not refresh context usage after compaction: %s", exc
