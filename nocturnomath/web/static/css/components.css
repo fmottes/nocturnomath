@@ -14,6 +14,7 @@
 }
 
 .header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.header-left #btn-history { flex: 0 0 auto; }
 
 .header-brand {
   grid-column: 2;
@@ -92,6 +93,7 @@
 
 .status-indicator {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 7px;
   padding: 4px 10px 4px 0;
@@ -99,6 +101,7 @@
   font-size: 0.75rem;
   color: var(--ink-soft);
   border-right: 1px solid var(--rule);
+  white-space: nowrap;
 }
 
 /* Static indicator: state is carried by fill and by the label, not by motion */

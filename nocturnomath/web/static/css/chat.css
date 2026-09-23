@@ -2,15 +2,14 @@
    Left pane: exploration log
    -------------------------------------------------------------------------- */
 .explorer-tabs {
-  min-height: 42px;
-  flex-shrink: 0;
+  height: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: stretch;
   gap: 2px;
   overflow-x: auto;
-  padding: 0 10px;
-  border-bottom: 1px solid var(--rule-strong);
-  background: var(--sheet);
+  scrollbar-width: thin;
 }
 
 .explorer-tab {
@@ -31,7 +30,7 @@
 .explorer-tab.busy .explorer-tab-status { background: currentColor; }
 .explorer-close { padding: 1px 3px; line-height: 1; color: inherit; }
 .explorer-close:disabled { opacity: 0.35; cursor: not-allowed; }
-.explorer-add { align-self: center; margin-left: 2px; font-size: 1rem; }
+.explorer-add { flex: 0 0 auto; align-self: center; margin-left: 2px; font-size: 1rem; }
 
 .chat-header,
 .viewer-header {
@@ -63,6 +62,7 @@
   display: flex;
   align-items: center;
   gap: 5px;
+  margin-left: auto;
 }
 
 .chat-status-separator {
@@ -71,6 +71,7 @@
   margin: 0 3px;
   background: var(--rule);
 }
+.chat-header-actions > .chat-status-separator:first-child { margin-right: 0; }
 
 #context-control {
   padding-right: 12px;

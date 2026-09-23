@@ -93,6 +93,11 @@
           <span class="workspace-path" id="workspace-path">Loading workspace...</span>
           <span aria-hidden="true">▾</span>
         </button>
+        <button class="btn btn-sm btn-ghost" id="btn-history" type="button">History</button>
+        <div class="status-indicator" id="kernel-status" title="Kernel status">
+          <span class="status-dot green" id="kernel-dot"></span>
+          <span class="status-text" id="kernel-text">Kernel ready</span>
+        </div>
       </div>
 
       <div class="brand header-brand">
@@ -102,10 +107,6 @@
 
       <!-- Controls & Status -->
       <div class="header-right">
-        <div class="status-indicator" id="kernel-status" title="Kernel status">
-          <span class="status-dot green" id="kernel-dot"></span>
-          <span class="status-text" id="kernel-text">Kernel ready</span>
-        </div>
         <button class="btn btn-sm btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
         <button class="btn btn-sm btn-ghost" id="btn-auth" type="button">Claude</button>
         <button class="btn btn-sm btn-ghost" id="btn-settings" type="button">Settings</button>
@@ -120,12 +121,11 @@
     <main class="split-screen" id="split-screen">
       <!-- Left Half: Chat Dashboard -->
       <section class="pane pane-chat" id="pane-chat">
-        <div class="explorer-tabs" id="explorer-tabs" role="tablist" aria-label="Explorations">
-          <button class="btn btn-xs btn-ghost explorer-add" id="btn-new-explorer" type="button" title="Start another exploration" aria-label="Start another exploration">+</button>
-        </div>
         <div class="chat-header">
+          <div class="explorer-tabs" id="explorer-tabs" role="tablist" aria-label="Explorations">
+            <button class="btn btn-xs btn-ghost explorer-add" id="btn-new-explorer" type="button" title="Start another exploration" aria-label="Start another exploration">+</button>
+          </div>
           <div class="chat-header-actions">
-            <button class="btn btn-xs btn-ghost" id="btn-history" type="button">History</button>
             <span class="chat-status-separator" aria-hidden="true"></span>
             <button class="btn btn-xs btn-ghost" id="btn-download-notebook" type="button">Download .ipynb</button>
             <span class="chat-status-separator" aria-hidden="true"></span>
