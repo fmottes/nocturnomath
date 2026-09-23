@@ -406,6 +406,38 @@ def test_explorers_are_independent_and_idle_tabs_can_close(session):
         assert client.delete(f"/api/agents/{initial['agent_id']}").status_code == 409
 
 
+def test_manual_compaction_route_is_scoped_and_refuses_busy_explorers(session):
+    session.log_transcript("user", text="original question")
+    session._sdk_session_id = "sdk-session"
+
+    async def compact():
+        await session.emit("status_change", status="compacting")
+        await session.emit("context_compacted")
+        await session.emit("status_change", status="idle")
+
+    session.compact = compact
+    with (
+        TestClient(create_app(session)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        agent_id = websocket.receive_json()["workspace"]["agents"][0]["agent_id"]
+        assert client.post("/api/agents/unknown/compact").status_code == 404
+        session._is_busy = True
+        assert client.post(f"/api/agents/{agent_id}/compact").status_code == 409
+        session._is_busy = False
+
+        response = client.post(f"/api/agents/{agent_id}/compact")
+        events = [websocket.receive_json() for _ in range(3)]
+
+    assert response.status_code == 200
+    assert [event["type"] for event in events] == [
+        "status_change",
+        "context_compacted",
+        "status_change",
+    ]
+    assert all(event["agent_id"] == agent_id for event in events)
+
+
 def test_history_replaces_the_selected_idle_explorer(session):
     session.log_transcript("user", text="first exploration")
 

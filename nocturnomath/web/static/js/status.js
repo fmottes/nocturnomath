@@ -30,10 +30,10 @@ export function refreshSendButton() {
 export function updateAgentStatus(status) {
   agentStatus = status;
   elements.chatStatusBadge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
-  if (status === "thinking" || status === "probing") {
+  if (status === "thinking" || status === "probing" || status === "compacting") {
     elements.chatStatusBadge.style.color = "var(--blue)";
     elements.btnSend.disabled = true;
-    elements.btnInterrupt.classList.remove("hidden");
+    elements.btnInterrupt.classList.toggle("hidden", status === "compacting");
   } else {
     elements.chatStatusBadge.style.color = "var(--ink-soft)";
     elements.btnSend.disabled = !elements.modelSelect.value;

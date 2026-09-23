@@ -280,6 +280,24 @@ def create_app(
         await runtime.broadcast(event, payload)
         return {"status": "ok", "focused_existing": focused, **payload}
 
+    @app.post("/api/agents/{agent_id}/compact")
+    async def compact_agent(agent_id: str):
+        try:
+            await runtime.compact_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Failed to compact explorer")
+            raise HTTPException(
+                status_code=502, detail=f"Compaction failed: {exc}"
+            ) from exc
+        return {
+            "status": "ok",
+            "context_usage": runtime.get_agent(agent_id).context_usage,
+        }
+
     def auth_payload():
         return {
             "auth": runtime.auth.public(),

@@ -374,10 +374,12 @@ class Runtime:
             "model": session.model,
             "effort": session.effort,
             "carry_chat_context": session.carry_chat_context,
+            "can_compact": session.can_compact,
             "context_usage": session.context_usage,
             "kernel_alive": session.kernel.is_alive(),
             "kernel_busy": session.kernel.busy,
             "is_busy": session.has_active_query() or agent_id in self._changing_agents,
+            "status": session.status,
             "documents": session.list_documents(),
             "documents_default": session.documents_default,
         }
@@ -540,6 +542,25 @@ class Runtime:
         self.get_agent(agent_id).require_idle("change this explorer")
         self._changing_agents.add(agent_id)
         task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+        finally:
+            self._changing_agents.discard(agent_id)
+
+    async def compact_agent(self, agent_id: str):
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        if agent_id in self._changing_agents:
+            raise RuntimeError("This explorer is already changing. Please wait.")
+        session = self.get_agent(agent_id)
+        session.require_idle("compact this explorer")
+        self._changing_agents.add(agent_id)
+        task = asyncio.create_task(session.compact())
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:

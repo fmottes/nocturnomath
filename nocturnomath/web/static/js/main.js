@@ -30,6 +30,11 @@ function explorerLabel(agent) {
   return agent.session_id || "New";
 }
 
+function updateCompactButton() {
+  const agent = state.agents.get(state.activeAgentId);
+  elements.btnCompact.disabled = !agent?.can_compact || agent.is_busy;
+}
+
 function renderExplorerTabs() {
   if (!elements.explorerTabs) return;
   elements.explorerTabs.querySelectorAll(".explorer-tab").forEach((node) => node.remove());
@@ -71,6 +76,7 @@ function renderExplorerTabs() {
     });
     elements.explorerTabs.insertBefore(tab, elements.btnNewExplorer);
   });
+  updateCompactButton();
 }
 
 function saveExplorerView() {
@@ -101,7 +107,8 @@ function applyExplorer(agent, repaint = false) {
     setCarryContext(agent.carry_chat_context);
     setContextUsage(agent.context_usage);
     updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
-    updateAgentStatus(agent.is_busy ? "thinking" : "idle");
+    updateAgentStatus(agent.is_busy && (!agent.status || agent.status === "idle")
+      ? "thinking" : (agent.status || "idle"));
     if (agent.documents) refreshDocuments();
     if (repaint) {
       restoreChat(agent.records || [], agent.kernel_busy);
@@ -178,6 +185,22 @@ async function closeExplorer(agentId) {
   }
 }
 
+async function compactExplorer() {
+  const agentId = state.activeAgentId;
+  if (!agentId || elements.btnCompact.disabled) return;
+  elements.btnCompact.disabled = true;
+  try {
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}/compact`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to compact explorer");
+    await refreshContextUsage(agentId);
+  } catch (error) {
+    if (state.activeAgentId === agentId) appendErrorMessage(error.message);
+  } finally {
+    updateCompactButton();
+  }
+}
+
 // ============================================================================
 // Server Event Dispatcher
 // ============================================================================
@@ -193,12 +216,18 @@ function handleServerEvent(event) {
   }
   if (event.agent_id && event.type !== "agent_removed") {
     const current = state.agents.get(event.agent_id) || { agent_id: event.agent_id };
-    if (event.type === "status_change") current.is_busy = !["idle", "cancelled"].includes(event.status);
+    if (event.type === "status_change") {
+      current.is_busy = !["idle", "cancelled"].includes(event.status);
+      current.status = event.status;
+    }
     if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
       current.kernel_alive = true;
       current.kernel_busy = false;
     }
-    if (event.type === "carry_context_changed") current.carry_chat_context = event.carry_chat_context;
+    if (event.type === "carry_context_changed") {
+      current.carry_chat_context = event.carry_chat_context;
+      current.can_compact = false;
+    }
     if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
@@ -319,9 +348,14 @@ function handleServerEvent(event) {
       break;
 
     case "session_reset":
-      if (state.agents.has(event.agent_id)) state.agents.get(event.agent_id).context_usage = null;
+      if (state.agents.has(event.agent_id)) {
+        state.agents.get(event.agent_id).context_usage = null;
+        state.agents.get(event.agent_id).session_id = event.session_id;
+        state.agents.get(event.agent_id).can_compact = false;
+      }
       setContextUsage(null);
       setSessionId(event.session_id);
+      renderExplorerTabs();
       setActiveModelAndEffort(event.model, event.effort);
       clearChat();
       updateKernelStatus(true, false);
@@ -379,6 +413,7 @@ function setupEventListeners() {
     }
   }, { passive: true });
   elements.btnSettings.addEventListener("click", () => elements.settingsModal.classList.remove("hidden"));
+  elements.btnCompact.addEventListener("click", compactExplorer);
   [elements.btnAuth, elements.btnAuthLanding, elements.btnAuthSettings].forEach((button) => {
     button.addEventListener("click", openAuthModal);
   });

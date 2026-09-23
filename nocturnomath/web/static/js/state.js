@@ -48,6 +48,7 @@ export const elements = {
   modelSelect: document.getElementById("model-select"),
   effortSelect: document.getElementById("effort-select"),
   contextWindowIndicator: document.getElementById("context-window-indicator"),
+  btnCompact: document.getElementById("btn-compact"),
   defaultModelSelect: document.getElementById("default-model-select"),
   defaultEffortSelect: document.getElementById("default-effort-select"),
   sessionDefaultsForm: document.getElementById("session-defaults-form"),

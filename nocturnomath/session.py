@@ -76,6 +76,7 @@ class ExplorationSession:
         self.auth = auth or ClaudeAuth()
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
+        self.status = "idle"
         self._current_client: ClaudeSDKClient | None = None
         self._current_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
@@ -112,6 +113,10 @@ class ExplorationSession:
     def transcript_path(self) -> Path:
         return self.workspace.transcript_path
 
+    @property
+    def can_compact(self) -> bool:
+        return self.carry_chat_context and self._sdk_session_id is not None
+
     def has_active_query(self) -> bool:
         return (
             self._is_busy
@@ -132,6 +137,8 @@ class ExplorationSession:
             self.event_subscribers.remove(callback)
 
     async def emit(self, event_type: str, **data):
+        if event_type == "status_change":
+            self.status = data["status"]
         payload = {"type": event_type, "timestamp": time.time(), **data}
         for subscriber in list(self.event_subscribers):
             try:
@@ -375,6 +382,96 @@ class ExplorationSession:
     def shutdown(self):
         self.kernel.shutdown()
 
+    def _client_options(self) -> ClaudeAgentOptions:
+        compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
+        return ClaudeAgentOptions(
+            # The research MCP tools are the complete execution surface. Do not
+            # inherit Claude Code's built-ins or unrelated MCP configuration.
+            tools=[],
+            system_prompt=build_system_prompt(),
+            mcp_servers={"explore": create_sdk_mcp_server("explore", tools=self.tools)},
+            strict_mcp_config=True,
+            # Keep the user's authentication/provider settings, but do not load
+            # instructions or hooks from the selected research workspace.
+            setting_sources=["user"],
+            settings=json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "matcher": "compact",
+                                "hooks": [{"type": "command", "command": compact_hook}],
+                            }
+                        ]
+                    }
+                }
+            ),
+            skills=[],
+            permission_mode="bypassPermissions",
+            model=self.model,
+            effort=self.effort,
+            max_buffer_size=20 * 1024 * 1024,
+            include_partial_messages=True,
+            env={
+                **self.auth.sdk_env(),
+                "NOCTURNOMATH_WORKSPACE_PATH": str(self.workspace_path),
+            },
+            cwd=self.workspace_path,
+            resume=self._sdk_session_id if self.carry_chat_context else None,
+        )
+
+    async def _record_compaction(self):
+        self.log_transcript("compaction")
+        await self.emit("context_compacted")
+
+    async def compact(self):
+        self.require_idle("compact this explorer")
+        if not self.carry_chat_context or not self._sdk_session_id:
+            raise RuntimeError("This explorer has no conversation context to compact.")
+        self._is_busy = True
+        try:
+            await self.emit("status_change", status="compacting")
+            async with ClaudeSDKClient(self._client_options()) as client:
+                self._current_client = client
+                await client.query("/compact")
+                compacted = False
+                async for message in client.receive_response():
+                    if (
+                        isinstance(message, SystemMessage)
+                        and message.subtype == "compact_boundary"
+                    ):
+                        compacted = True
+                        await self._record_compaction()
+                if not compacted:
+                    raise RuntimeError(
+                        "Claude did not confirm that compaction completed."
+                    )
+                self.context_usage = None
+                try:
+                    usage = await client.get_context_usage()
+                    used = usage.get("totalTokens")
+                    window = usage.get("rawMaxTokens")
+                    if isinstance(used, int) and used >= 0:
+                        self.context_usage = {
+                            "used_tokens": used,
+                            "window_tokens": window
+                            if isinstance(window, int) and window > 0
+                            else None,
+                            "model": usage.get("model"),
+                        }
+                except Exception as exc:
+                    logger.warning(
+                        "Could not refresh context usage after compaction: %s", exc
+                    )
+                self.log_transcript("meta", context_usage=self.context_usage)
+                await self.emit(
+                    "context_usage_changed", context_usage=self.context_usage
+                )
+        finally:
+            self._current_client = None
+            self._is_busy = False
+            await self.emit("status_change", status="idle")
+
     async def query(self, user_text: str):
         if self._is_busy:
             raise RuntimeError("Agent is already running a query.")
@@ -389,46 +486,7 @@ class ExplorationSession:
             document_prefix, sent_documents = self.document_context()
             await self.emit("status_change", status="thinking")
             self.log_transcript("user", text=user_text)
-            compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
-            options = ClaudeAgentOptions(
-                # The research MCP tools are the complete execution surface. Do not
-                # inherit Claude Code's built-ins or unrelated MCP configuration.
-                tools=[],
-                system_prompt=build_system_prompt(),
-                mcp_servers={
-                    "explore": create_sdk_mcp_server("explore", tools=self.tools)
-                },
-                strict_mcp_config=True,
-                # Keep the user's authentication/provider settings, but do not load
-                # instructions or hooks from the selected research workspace.
-                setting_sources=["user"],
-                settings=json.dumps(
-                    {
-                        "hooks": {
-                            "SessionStart": [
-                                {
-                                    "matcher": "compact",
-                                    "hooks": [
-                                        {"type": "command", "command": compact_hook}
-                                    ],
-                                }
-                            ]
-                        }
-                    }
-                ),
-                skills=[],
-                permission_mode="bypassPermissions",
-                model=self.model,
-                effort=self.effort,
-                max_buffer_size=20 * 1024 * 1024,
-                include_partial_messages=True,
-                env={
-                    **self.auth.sdk_env(),
-                    "NOCTURNOMATH_WORKSPACE_PATH": str(self.workspace_path),
-                },
-                cwd=self.workspace_path,
-                resume=self._sdk_session_id if self.carry_chat_context else None,
-            )
+            options = self._client_options()
             async with ClaudeSDKClient(options) as client:
                 self._current_client = client
                 prefix = ""
@@ -472,8 +530,7 @@ class ExplorationSession:
                         isinstance(message, SystemMessage)
                         and message.subtype == "compact_boundary"
                     ):
-                        self.log_transcript("compaction")
-                        await self.emit("context_compacted")
+                        await self._record_compaction()
                     elif isinstance(message, AssistantMessage):
                         usage = message.usage or {}
                         prompt_counts = (

@@ -90,6 +90,14 @@ class CompactingClient(FakeClient):
             content=[TextBlock("continued")], model="test", session_id="sdk-session"
         )
 
+    async def get_context_usage(self):
+        return {"totalTokens": 4200, "rawMaxTokens": 200000, "model": "test"}
+
+
+class NoBoundaryClient(FakeClient):
+    async def receive_response(self):
+        yield AssistantMessage(content=[], model="test", session_id="sdk-session")
+
 
 @pytest.mark.asyncio
 async def test_compaction_is_recorded_and_reloads_current_scientific_record(session):
@@ -125,6 +133,52 @@ async def test_compaction_is_recorded_and_reloads_current_scientific_record(sess
     assert context["hookEventName"] == "SessionStart"
     assert "New result" in context["additionalContext"]
     assert "# Thoughts" in context["additionalContext"]
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_keeps_transcript_and_kernel_and_refreshes_usage(
+    session,
+):
+    events = []
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("original question")
+    kernel = session.kernel
+    with patch("nocturnomath.session.ClaudeSDKClient", CompactingClient):
+        await session.compact()
+
+    assert FakeClient.prompts[-1] == "/compact"
+    assert session.kernel is kernel
+    assert session._sdk_session_id == "sdk-session"
+    assert session.context_usage == {
+        "used_tokens": 4200,
+        "window_tokens": 200000,
+        "model": "test",
+    }
+    records = session.workspace.current_records()
+    assert [record["text"] for record in records if record["kind"] == "user"] == [
+        "original question"
+    ]
+    assert any(record["kind"] == "compaction" for record in records)
+    assert any(kind == "context_compacted" for kind, _ in events)
+    assert events[-1][1]["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_requires_context_and_confirmation(session):
+    with pytest.raises(RuntimeError, match="no conversation context"):
+        await session.compact()
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("original question")
+    with (
+        patch("nocturnomath.session.ClaudeSDKClient", NoBoundaryClient),
+        pytest.raises(RuntimeError, match="did not confirm"),
+    ):
+        await session.compact()
+    assert not session.has_active_query()
+    assert not any(
+        record["kind"] == "compaction" for record in session.workspace.current_records()
+    )
 
 
 @pytest.mark.asyncio
