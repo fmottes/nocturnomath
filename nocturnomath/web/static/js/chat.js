@@ -96,7 +96,7 @@ export function closeAssistantBubble() {
   state.currentAssistantBubble = null;
 }
 
-export function appendProbeStart(expected, code) {
+export function appendProbeStart(expected, code, probeId) {
   closeAssistantBubble();
   const card = document.createElement("div");
   card.className = "probe-card";
@@ -107,6 +107,13 @@ export function appendProbeStart(expected, code) {
   const pill = document.createElement("span");
   pill.className = "probe-pill";
   pill.textContent = "Code probe";
+  const number = probeId?.split("/").pop();
+  if (/^P\d+$/.test(number || "")) {
+    const badge = document.createElement("span");
+    badge.className = "badge badge-sm";
+    badge.textContent = number;
+    pill.appendChild(badge);
+  }
 
   const status = document.createElement("span");
   status.className = "badge";
@@ -154,11 +161,11 @@ export function appendProbeStart(expected, code) {
   };
 }
 
-export function appendProbeFinish(expected, code, output, plotUrls, plotImages) {
+export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId) {
   let card = state.currentProbeCard ? state.currentProbeCard.card : null;
 
   if (!card) {
-    appendProbeStart(expected, code);
+    appendProbeStart(expected, code, probeId);
     card = state.currentProbeCard.card;
   }
 

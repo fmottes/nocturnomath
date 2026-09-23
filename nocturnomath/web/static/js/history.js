@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20260913-1";
-import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260921-1";
+import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20260922-2";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -208,10 +208,10 @@ function renderRecords(records, isBusy = false) {
       case "probe_started":
         if (!outcomes.has(rec.probe_id)) {
           if (rec.probe_id === activeProbe) {
-            appendProbeStart(rec.expected, rec.code);
+            appendProbeStart(rec.expected, rec.code, rec.probe_id);
           } else {
             appendProbeFinish(rec.expected, rec.code,
-              `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], []);
+              `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], [], rec.probe_id);
           }
         }
         break;
@@ -219,7 +219,7 @@ function renderRecords(records, isBusy = false) {
       case "probe_failed": {
         const start = starts.get(rec.probe_id) || {};
         appendProbeFinish(start.expected || "", start.code || "",
-          `${rec.probe_id}: failed. ${rec.text || ""}`, [], []);
+          `${rec.probe_id}: failed. ${rec.text || ""}`, [], [], rec.probe_id);
         break;
       }
 
@@ -229,7 +229,8 @@ function renderRecords(records, isBusy = false) {
           rec.code || "",
           [rec.probe_id, rec.output, rec.execution_note, rec.status].filter(Boolean).join("\n"),
           (rec.images || []).map((name) => `/api/asset?path=${encodeURIComponent(name)}`),
-          []
+          [],
+          rec.probe_id
         );
         break;
 

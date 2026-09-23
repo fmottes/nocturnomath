@@ -206,6 +206,9 @@
 
 .probe-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .probe-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 0.6875rem;
   font-weight: 600;
@@ -213,6 +216,7 @@
   letter-spacing: 0.1em;
   color: var(--blue);
 }
+.probe-pill .badge { letter-spacing: 0; text-transform: none; font-weight: 400; }
 
 .probe-expected {
   padding: 7px 10px;

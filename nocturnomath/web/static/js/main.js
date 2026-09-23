@@ -1,8 +1,8 @@
 import { elements, state } from "./state.js?v=20260913-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20260913-1";
 import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260922-1";
-import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260922-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260913-1";
+import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260922-2";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260922-2";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260913-1";
 import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20260922-1";
@@ -237,13 +237,13 @@ function handleServerEvent(event) {
       break;
 
     case "probe_start":
-      appendProbeStart(event.expected, event.code);
+      appendProbeStart(event.expected, event.code, event.probe_id);
       break;
 
     case "probe_finish":
       // Preserve the web app's existing probe card contract: `output` includes
       // source paths and any guidance emitted alongside the raw kernel text.
-      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images);
+      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images, event.probe_id);
       loadPlots();
       break;
 
