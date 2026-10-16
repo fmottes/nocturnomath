@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20261016-3";
-import { appendAssistantChunk, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261016-3";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261016-4";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -236,6 +236,10 @@ function renderRecords(records, isBusy = false) {
 
       case "packages_installed":
         if (rec.message) appendSystemMessage(rec.message);
+        break;
+
+      case "document_saved":
+        appendDocumentNotification(rec.name, rec.action);
         break;
 
       case "evidence":

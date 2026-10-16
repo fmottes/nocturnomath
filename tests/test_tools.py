@@ -75,6 +75,45 @@ async def test_document_tools_use_nested_paths_without_running_a_probe(session):
 
 
 @pytest.mark.asyncio
+async def test_agent_document_save_emits_and_records_chat_card_event(session):
+    session.log_transcript("user", text="Save a report")
+    events = []
+    session.subscribe(lambda kind, payload: events.append((kind, payload)))
+    save = tools_by_name(session)["save_document"].handler
+
+    await save(
+        {"path": "reports/result.md", "text": "# Result", "replace_existing": False}
+    )
+    await save(
+        {"path": "reports/result.md", "text": "# Updated", "replace_existing": True}
+    )
+    failed = await save(
+        {"path": "missing.md", "text": "No file", "replace_existing": True}
+    )
+
+    assert failed["is_error"] is True
+    assert [
+        (payload["name"], payload["action"])
+        for kind, payload in events
+        if kind == "document_saved"
+    ] == [
+        ("reports/result.md", "created"),
+        ("reports/result.md", "revised"),
+    ]
+    records = session.workspace.read_transcript(session.transcript_path)
+    assert [
+        (record["name"], record["action"])
+        for record in records
+        if record["kind"] == "document_saved"
+    ] == [
+        ("reports/result.md", "created"),
+        ("reports/result.md", "revised"),
+    ]
+    assert list(session.workspace.probes_path.iterdir()) == []
+    assert session.kernel.executed_codes == []
+
+
+@pytest.mark.asyncio
 async def test_run_verdict_and_evidence_contract(session, monkeypatch):
     monkeypatch.setattr("nocturnomath.tools.asyncio.to_thread", run_inline)
     events = []

@@ -327,6 +327,18 @@
 .note-notification.evidence .note-badge { color: var(--ok); }
 .note-notification.evidence_struck .note-badge { color: var(--warn); }
 .note-notification span:last-child { color: var(--ink); }
+.note-notification.document .note-badge { color: var(--blue); }
+.document-notification-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.document-notification-link:hover { text-decoration: underline; }
 
 /* Composer */
 .chat-input-container {

@@ -266,6 +266,30 @@ export function appendNoteNotification(kind, text) {
   scrollChatToBottom();
 }
 
+export function appendDocumentNotification(name, action) {
+  closeAssistantBubble();
+  const card = document.createElement("div");
+  card.className = "note-notification document";
+
+  const badge = document.createElement("span");
+  badge.className = "note-badge";
+  badge.textContent = "Document";
+
+  const content = document.createElement("span");
+  content.append(document.createTextNode(action === "revised" ? "Updated " : "Created "));
+  const link = document.createElement("button");
+  link.type = "button";
+  link.className = "document-notification-link";
+  link.dataset.documentPath = name;
+  link.textContent = name;
+  link.title = `Open ${name} in Documents`;
+  content.append(link);
+
+  card.append(badge, content);
+  elements.chatMessages.appendChild(card);
+  scrollChatToBottom();
+}
+
 export function appendSystemMessage(text) {
   closeAssistantBubble();
   const bubble = document.createElement("div");

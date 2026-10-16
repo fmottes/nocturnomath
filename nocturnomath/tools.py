@@ -541,10 +541,16 @@ def build_tools(session: "ExplorationSession"):
             session.workspace.save_document(path, args["text"], replace_existing)
         except (ValueError, OSError) as exc:
             return failure(str(exc))
-        action = "Revised" if replace_existing else "Created"
+        action = "revised" if replace_existing else "created"
+        if not session.workspace.session_pending:
+            session.log_transcript("document_saved", name=path, action=action)
+            await session.emit("document_saved", name=path, action=action)
         return {
             "content": [
-                {"type": "text", "text": f"{action} .nocturnomath/documents/{path}."}
+                {
+                    "type": "text",
+                    "text": f"{action.capitalize()} .nocturnomath/documents/{path}.",
+                }
             ]
         }
 
