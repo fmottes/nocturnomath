@@ -25,7 +25,6 @@ export const state = {
   lastProbeCard: null,
   probeCards: new Map(),
   activeTab: "evidence",
-  carryChatContext: true,
   explorationPrompt: "",
   explorationPromptIsCustom: false,
   navigatorRoot: null,

@@ -86,7 +86,8 @@ about runtime behavior or saved records, follow this contract.
   `.nocturnomath/scratch/`; otherwise keep the work in memory.
 - Call `verdict` once per probe, before the next `run`.
 - Use `submit_slurm` only for a self-contained Python probe that needs long or specialized
-  compute. It cannot use variables in the persistent kernel. Save its outputs under the
+  compute. Each probe runs one job; do not use job arrays or submit more jobs from its
+  script. It cannot use variables in the persistent kernel. Save its outputs under the
   probe directory named by `NOCTURNOMATH_PROBE_DIR`; save plots there as `plot-1.png`,
   `plot-2.png`, and so on. Print the observations needed for the verdict. Use
   `check_slurm_job` to inspect a submitted job; checking status is not a

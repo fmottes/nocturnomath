@@ -646,10 +646,7 @@ def create_app(
         sessions = session.list_sessions()
         for item in sessions:
             item["open_agent_id"] = open_agents.get(item["id"])
-        return {
-            "sessions": sessions,
-            "carry_chat_context": session.carry_chat_context,
-        }
+        return {"sessions": sessions}
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str):

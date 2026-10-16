@@ -123,7 +123,6 @@ EVENT_PAYLOAD = {
     "message": "something failed",
     "status": "thinking",
     "id": "S001",
-    "carry_chat_context": True,
     "context_usage": {"used_tokens": 4200, "window_tokens": 200000},
     "context_restored": True,
     "kernel_restored": True,
@@ -153,7 +152,6 @@ EVENT_TYPES = [
     "session_reset",
     "session_resumed",
     "workspace_updated",
-    "carry_context_changed",
     "context_compacted",
     "context_usage_changed",
 ]
@@ -403,9 +401,8 @@ async def test_auth_prompt_can_be_abandoned_with_eof(terminal):
 
 
 @pytest.mark.asyncio
-async def test_context_cannot_be_disabled(terminal):
+async def test_context_command_is_not_available(terminal):
     await terminal.run("/context off")
-    assert terminal.session.carry_chat_context is True
     assert "Unknown command /context." in terminal.output()
 
 
@@ -586,7 +583,6 @@ def test_bottom_toolbar_reports_the_live_state(terminal):
     resting = terminal.app.bottom_toolbar()
     assert "kernel ready" in resting
     assert f"model {terminal.session.model}" in resting
-    assert "context on" in resting
     assert "chat new" in resting
     assert resting.endswith("idle")
 
@@ -597,7 +593,6 @@ def test_bottom_toolbar_reports_the_live_state(terminal):
     busy = terminal.app.bottom_toolbar()
     assert "kernel busy" in busy
     assert "→ sonnet" in busy
-    assert "context on" in busy
     assert "chat S001" in busy
     assert busy.endswith("thinking")
 

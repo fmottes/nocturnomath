@@ -238,12 +238,11 @@ class TerminalApp:
         model = session.model or "No model available"
         if self.pending_model:
             model += f" → {self.pending_model}"
-        context = "on" if session.carry_chat_context else "off"
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
         return (
             f"kernel {kernel} · model {model} · effort {session.effort} · "
-            f"auth {self.runtime.auth.method} · context {context} · chat {chat} · {self.status}"
+            f"auth {self.runtime.auth.method} · chat {chat} · {self.status}"
         )
 
     def show_help(self):
@@ -371,13 +370,7 @@ class TerminalApp:
         self.write("New chat on a fresh kernel; previous variables are gone.")
 
     def _render_session_resumed(self, payload):
-        if not payload.get("carry_chat_context"):
-            note = (
-                "Reopened this chat. New replies are appended to it, but the agent "
-                "still starts every query fresh from its prompt and evidence.md and "
-                "thoughts.md."
-            )
-        elif payload.get("context_restored"):
+        if payload.get("context_restored"):
             note = "Resumed this chat. The agent still has its original conversation context."
         else:
             note = (
@@ -405,18 +398,6 @@ class TerminalApp:
                 f"research Python: {environment.get('python')} "
                 f"({environment.get('version')})",
                 style="dim",
-            )
-
-    def _render_carry_context_changed(self, payload):
-        if payload.get("carry_chat_context"):
-            self.write(
-                "Keeping context from here on. The agent sees this conversation as it "
-                "grows; earlier messages are not recovered."
-            )
-        else:
-            self.write(
-                "Discarding context. Every message starts fresh from the system prompt "
-                "plus evidence.md and thoughts.md."
             )
 
     def _render_context_compacted(self, payload):
@@ -577,7 +558,7 @@ class TerminalApp:
             flags = []
             if record["is_current"]:
                 flags.append("current")
-            if session.carry_chat_context and not record["context_restorable"]:
+            if not record["context_restorable"]:
                 flags.append("context rebuilt from transcript")
             table.add_row(
                 record["id"],

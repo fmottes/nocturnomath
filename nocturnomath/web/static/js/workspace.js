@@ -51,7 +51,6 @@ export function applyWorkspace(ws) {
 
   updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
   updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
-  setCarryContext(selected?.carry_chat_context);
   setContextUsage(selected?.context_usage);
 
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
@@ -249,10 +248,6 @@ async function openRecentWorkspace(path) {
     loading.classList.add("hidden");
     buttons.forEach(button => button.disabled = false);
   }
-}
-
-export function setCarryContext(enabled) {
-  state.carryChatContext = Boolean(enabled);
 }
 
 export function setExplorationPrompt(prompt, isCustom) {

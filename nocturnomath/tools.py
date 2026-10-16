@@ -571,6 +571,9 @@ def build_tools(session: "ExplorationSession"):
     @tool(
         "submit_slurm",
         "Submit a self-contained Python probe to Slurm for long or specialized compute. "
+        "Each probe must submit exactly one job on the current cluster: no job arrays "
+        "or additional submissions from the script. Scheduler defaults must also select "
+        "one job on the current cluster. "
         "The script cannot use the interactive kernel's variables. State a prediction, "
         "then use check_slurm_job with the returned probe ID to collect the result. "
         "The selected research Python must be available at the same path on compute nodes. "

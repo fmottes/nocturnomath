@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20261016-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261016-4";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261016-4";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
@@ -104,7 +104,6 @@ function applyExplorer(agent, repaint = false) {
   if (agent.agent_id === state.activeAgentId) {
     setSessionId(agent.session_id);
     setActiveModelAndEffort(agent.draftModel || agent.model, agent.draftEffort || agent.effort);
-    setCarryContext(agent.carry_chat_context);
     setContextUsage(agent.context_usage);
     updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
     updateAgentStatus(agent.is_busy && (!agent.status || agent.status === "idle")
@@ -370,11 +369,9 @@ function handleServerEvent(event) {
       applyExplorer(event);
       restoreExplorerView(state.agents.get(event.agent_id));
       setSessionId(event.id);
-      state.carryChatContext = Boolean(event.carry_chat_context);
       replaySession(
         event.records || [],
         event.context_restored,
-        event.carry_chat_context,
         event.kernel_reset,
         event.kernel_restored,
         event.probes_replayed

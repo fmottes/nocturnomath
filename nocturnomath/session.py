@@ -71,7 +71,6 @@ class ExplorationSession:
         self.default_effort: str | None = self.effort
         self.timeout_s = timeout_s
         self.image_cap = image_cap
-        self.carry_chat_context = True
         self.auth = auth or ClaudeAuth()
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
@@ -116,7 +115,7 @@ class ExplorationSession:
 
     @property
     def can_compact(self) -> bool:
-        return self.carry_chat_context and self._sdk_session_id is not None
+        return self._sdk_session_id is not None
 
     def has_active_query(self) -> bool:
         return (
@@ -284,10 +283,7 @@ class ExplorationSession:
             if not document["included"]:
                 continue
             content = self.workspace.read_document(document["name"])["content"]
-            if (
-                self.carry_chat_context
-                and self._sent_documents.get(document["name"]) == content
-            ):
+            if self._sent_documents.get(document["name"]) == content:
                 continue
             sent_documents[document["name"]] = content
             sections.append(f"### {document['name']}\n\n{content.rstrip()}\n")
@@ -370,12 +366,8 @@ class ExplorationSession:
             ),
             None,
         )
-        if self.carry_chat_context:
-            self._session_initialized = False
-            self._resume_prefix = None if sdk_id else self.workspace.recap(records)
-        else:
-            self._session_initialized = False
-            self._resume_prefix = None
+        self._session_initialized = False
+        self._resume_prefix = None if sdk_id else self.workspace.recap(records)
 
         if restore_kernel:
             probe_word = "probe" if replayed == 1 else "probes"
@@ -394,8 +386,7 @@ class ExplorationSession:
             "kernel_restored": restore_kernel,
             "probes_replayed": replayed,
             "records": records,
-            "carry_chat_context": self.carry_chat_context,
-            "context_restored": self.carry_chat_context and sdk_id is not None,
+            "context_restored": sdk_id is not None,
             "context_usage": self.context_usage,
         }
 
@@ -461,7 +452,7 @@ class ExplorationSession:
                 "NOCTURNOMATH_WORKSPACE_PATH": str(self.workspace_path),
             },
             cwd=self.workspace_path,
-            resume=self._sdk_session_id if self.carry_chat_context else None,
+            resume=self._sdk_session_id,
         )
 
     async def _record_compaction(self):
@@ -470,7 +461,7 @@ class ExplorationSession:
 
     async def compact(self):
         self.require_idle("compact this explorer")
-        if not self.carry_chat_context or not self._sdk_session_id:
+        if not self._sdk_session_id:
             raise RuntimeError("This explorer has no conversation context to compact.")
         self._is_busy = True
         started_at = time.monotonic()
@@ -548,10 +539,10 @@ class ExplorationSession:
                 prefix = ""
                 resume_prefix = self._resume_prefix
                 initialize_session = False
-                if self.carry_chat_context and resume_prefix:
+                if resume_prefix:
                     prefix = self.opening_notes() + resume_prefix
                     initialize_session = True
-                elif not self.carry_chat_context or not self._session_initialized:
+                elif not self._session_initialized:
                     prefix = self.opening_notes()
                     initialize_session = True
                 elif self._record_dirty:

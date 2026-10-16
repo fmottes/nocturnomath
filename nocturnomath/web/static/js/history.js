@@ -20,7 +20,6 @@ export async function loadSessions() {
     const res = await fetch("/api/sessions");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    state.carryChatContext = Boolean(data.carry_chat_context);
     renderSessions(data.sessions || []);
   } catch (e) {
     const message = document.createElement("div");
@@ -65,7 +64,7 @@ export function renderSessions(sessions) {
       meta.appendChild(span);
     });
 
-    if (state.carryChatContext && !s.context_restorable) {
+    if (!s.context_restorable) {
       const warn = document.createElement("span");
       warn.className = "warn";
       warn.textContent = "context rebuilt from transcript";
@@ -163,15 +162,12 @@ export function restoreChat(records = [], isBusy = false) {
   scrollChatToBottom();
 }
 
-export function replaySession(records, contextRestored, carryChatContext, kernelReset = false, kernelRestored = false, probesReplayed = 0) {
+export function replaySession(records, contextRestored, kernelReset = false, kernelRestored = false, probesReplayed = 0) {
   clearChat(false);
   renderRecords(records);
 
   let resumeNote;
-  if (!carryChatContext) {
-    resumeNote =
-      "Reopened this chat. New replies are appended to it, but the agent still starts every query fresh from its prompt and `evidence.md` and `thoughts.md` — it does not read the conversation above.";
-  } else if (contextRestored) {
+  if (contextRestored) {
     resumeNote =
       "Resumed this chat. The agent still has its original conversation context.";
   } else {
