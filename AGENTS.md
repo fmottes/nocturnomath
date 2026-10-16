@@ -59,7 +59,7 @@ The default research interpreter is the workspace-local `.nocturnomath/venv`, ev
 
 Keep the interface quiet and focused on the scientific record. Derive the model catalogue from the Claude SDK at startup and show resolved model IDs. Do not invent a default or fallback model entry; when discovery returns nothing, show `No model available`. A selected model applies to the next message while preserving the conversation. Keep context enabled by default and place experimental controls in Settings rather than the primary workflow.
 
-Do not use browser automation in this repository; follow `.agents/rules/no-browser-subagent.md`. Verify web behavior with backend/API checks, JavaScript syntax checks, and the user's manual browser feedback.
+Verify web behavior with backend/API checks and JavaScript syntax checks. Use browser checks only when they add real value.
 
 ## Change and Git Workflow
 
