@@ -189,10 +189,9 @@ export function replaySession(records, contextRestored, carryChatContext, kernel
 function renderRecords(records, isBusy = false) {
   const outcomes = new Set(records.filter((rec) =>
     rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));
-  const starts = new Map(records.filter((rec) => rec.kind === "probe_started")
-    .map((rec) => [rec.probe_id, rec]));
+  const starts = records.filter((rec) => rec.kind === "probe_started");
   const activeProbe = isBusy
-    ? [...starts.keys()].reverse().find((probeId) => !outcomes.has(probeId))
+    ? [...starts].reverse().find((rec) => !outcomes.has(rec.probe_id))?.probe_id
     : null;
   records.forEach((rec) => {
     switch (rec.kind) {
@@ -206,31 +205,24 @@ function renderRecords(records, isBusy = false) {
         break;
 
       case "probe_started":
-        if (!outcomes.has(rec.probe_id)) {
-          if (rec.probe_id === activeProbe) {
-            appendProbeStart(rec.expected, rec.code, rec.probe_id);
-          } else {
-            appendProbeFinish(rec.expected, rec.code,
-              `${rec.probe_id}: no recorded outcome. Inspect the saved probe before using it.`, [], [], rec.probe_id);
-          }
+        if (rec.probe_id === activeProbe) {
+          appendProbeStart(rec.expected, rec.code, rec.probe_id);
         }
         break;
 
-      case "probe_failed": {
-        const start = starts.get(rec.probe_id) || {};
-        appendProbeFinish(start.expected || "", start.code || "",
-          `${rec.probe_id}: failed. ${rec.text || ""}`, [], [], rec.probe_id);
+      case "probe_failed":
         break;
-      }
 
       case "run":
+        if (rec.status && rec.status !== "completed") break;
         appendProbeFinish(
           rec.expected || "",
           rec.code || "",
           [rec.probe_id, rec.output, rec.execution_note, rec.status].filter(Boolean).join("\n"),
           (rec.images || []).map((name) => `/api/asset?path=${encodeURIComponent(name)}`),
           [],
-          rec.probe_id
+          rec.probe_id,
+          rec.status
         );
         break;
 

@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+import json
 import re
 import threading
 from typing import TYPE_CHECKING
@@ -44,13 +45,25 @@ def build_tools(session: "ExplorationSession"):
     @tool(
         "run",
         "Run Python in the persistent Jupyter kernel. This is the only way to execute anything. "
-        "`expected` is your one-line prediction of what this will show; it is required. "
+        "`expected` is your one-line prediction of what this will show; it is required for a new probe. "
+        "After an error, set `retry_of` to the original probe ID (for example S001/P001) "
+        "and provide corrected code to rerun that probe while preserving each attempt. "
+        "A retry keeps the original prediction unless you supply a new `expected`. "
         "Use install_packages to install missing libraries into the selected research environment.",
-        {"code": str, "expected": str},
+        {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "expected": {"type": "string"},
+                "retry_of": {"type": "string"},
+            },
+            "required": ["code"],
+        },
     )
     async def run(args):
         code = args["code"]
         expected = args.get("expected", "").strip()
+        retry_of = args.get("retry_of")
 
         if session._pending_verdict is not None:
             return {
@@ -67,7 +80,7 @@ def build_tools(session: "ExplorationSession"):
                 "is_error": True,
             }
 
-        if not expected:
+        if not expected and not retry_of:
             return {
                 "content": [
                     {
@@ -113,18 +126,38 @@ def build_tools(session: "ExplorationSession"):
         session.activate_session()
         workspace = session.workspace
         transcript_path = session.transcript_path
-        probe_path = workspace.start_probe(
-            code,
-            expected,
-            session.model,
-            kernel_id=session.kernel_id,
-            environment=session.environment_record,
-        )
-        source_id = f"{workspace.session_id}/{probe_path.name}"
+        try:
+            probe_path = (
+                workspace.retry_probe(
+                    retry_of,
+                    code,
+                    expected,
+                    session.model,
+                    kernel_id=session.kernel_id,
+                    environment=session.environment_record,
+                )
+                if retry_of
+                else workspace.start_probe(
+                    code,
+                    expected,
+                    session.model,
+                    kernel_id=session.kernel_id,
+                    environment=session.environment_record,
+                )
+            )
+        except ValueError as exc:
+            return failure(str(exc))
+        if retry_of:
+            expected = json.loads((probe_path / "probe.json").read_text())["expected"]
+        source_id = f"{workspace.session_id}/{probe_path.relative_to(workspace.probes_path).as_posix()}"
         probe_dir = probe_path.relative_to(workspace.path).as_posix()
         code_path = f"{probe_dir}/code.py"
         session.log_transcript(
-            "probe_started", probe_id=source_id, expected=expected, code=code
+            "probe_started",
+            probe_id=source_id,
+            retry_of=retry_of,
+            expected=expected,
+            code=code,
         )
         cancelled = threading.Event()
 
@@ -180,12 +213,62 @@ def build_tools(session: "ExplorationSession"):
             )
         except asyncio.CancelledError:
             cancelled.set()
-            # Preserve the worker until its output is saved, even when its caller is cancelled.
+
+            async def finish_cancelled_probe():
+                # The worker owns artifact saving; report its outcome only after it finishes.
+                try:
+                    text, images, kernel_note, plot_paths, status = await execution
+                except Exception as exc:
+                    text, images, kernel_note, plot_paths, status = (
+                        str(exc),
+                        [],
+                        None,
+                        [],
+                        "failed",
+                    )
+                await session.emit(
+                    "probe_finish",
+                    probe_id=source_id,
+                    expected=expected,
+                    code=code,
+                    code_path=code_path,
+                    output=f"Probe {source_id}\nSource: {source_id}/output.txt\n{text}",
+                    text=text,
+                    status=status,
+                    execution_note=kernel_note,
+                    plot_paths=plot_paths,
+                    plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
+                    plot_images=[base64.b64encode(image).decode() for image in images],
+                )
+
+            finish_task = asyncio.create_task(finish_cancelled_probe())
+            # Keep waiting for saved output; a second cancellation leaves the notifier alive.
             try:
-                await asyncio.shield(execution)
+                await asyncio.shield(finish_task)
             except asyncio.CancelledError:
                 pass
             raise
+        except Exception as exc:
+            original = retry_of or source_id
+            message = (
+                f"Probe {source_id} failed: {exc}\n"
+                f'Correct the code and call `run` with `retry_of`: "{original}".'
+            )
+            await session.emit(
+                "probe_finish",
+                probe_id=source_id,
+                expected=expected,
+                code=code,
+                code_path=code_path,
+                output=message,
+                text=str(exc),
+                status="failed",
+                execution_note=None,
+                plot_paths=[],
+                plot_urls=[],
+                plot_images=[],
+            )
+            return failure(message)
 
         encoded_images = [base64.b64encode(image).decode() for image in images]
         shown = images[: session.image_cap]
@@ -224,6 +307,12 @@ def build_tools(session: "ExplorationSession"):
             )
         if kernel_note:
             body += "\n" + kernel_note
+        if status == "error":
+            original = retry_of or source_id
+            body += (
+                f"\nCorrect the code and call `run` with `retry_of`: "
+                f'"{original}" to retry this probe.'
+            )
         output = "\n".join(preface) + "\n\n" + body if preface else body
 
         await session.emit(

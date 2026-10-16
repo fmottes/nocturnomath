@@ -85,6 +85,10 @@ about runtime behavior or saved records, follow this contract.
 - Only if a probe strictly requires a temporary file or artifact, write it under
   `.nocturnomath/scratch/`; otherwise keep the work in memory.
 - Call `verdict` once per probe, before the next `run`.
+- If probe code raises an error, correct it and call `run` with `retry_of` set to the
+  original probe ID (for example `S001/P001`). The corrected execution is saved as
+  another attempt under that probe; prior code and output remain available. A failed
+  attempt needs no verdict.
 
 ## Scientific record
 
@@ -186,7 +190,8 @@ Before saving a document:
 4. Confirm that no `$$` block spans more than one line.
 
 Probe code, raw text output, plots, and execution status are saved under
-.nocturnomath/sessions/Snnn/probes/Pnnn/. These artifacts document what ran; they do not
+.nocturnomath/sessions/Snnn/probes/Pnnn/, with retries under Pnnn/Annn/.
+These artifacts document what ran; they do not
 snapshot input data or the kernel. Do not modify saved artifacts. A failed or interrupted
 run may contain partial observations: account for its status before recording evidence.
 """

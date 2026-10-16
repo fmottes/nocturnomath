@@ -95,6 +95,16 @@ async def test_cancelled_probe_keeps_output_and_blocks_workspace_switch(session)
 
     started = threading.Event()
     release = threading.Event()
+    events = []
+    session.subscribe(
+        lambda kind, payload: events.append(
+            (
+                kind,
+                payload,
+                (session.workspace.probes_path / "P001" / "output.txt").is_file(),
+            )
+        )
+    )
 
     def execute(code, timeout):
         started.set()
@@ -134,6 +144,10 @@ async def test_cancelled_probe_keeps_output_and_blocks_workspace_switch(session)
     ]
     assert records[-1]["probe_id"] == "S001/P001"
     assert records[-1]["status"] == "interrupted"
+    finishes = [event for event in events if event[0] == "probe_finish"]
+    assert len(finishes) == 1
+    assert finishes[0][1]["status"] == "interrupted"
+    assert finishes[0][2] is True
     assert not session.has_active_query()
 
 
@@ -145,14 +159,50 @@ async def test_probe_failure_is_preserved_without_becoming_success(session):
         raise RuntimeError("kernel connection lost")
 
     session.kernel.execute = execute
-    with pytest.raises(RuntimeError, match="connection lost"):
-        await tools_by_name(session)["run"].handler(
-            {"code": "probe()", "expected": "3"}
-        )
+    result = await tools_by_name(session)["run"].handler(
+        {"code": "probe()", "expected": "3"}
+    )
+    assert result["is_error"] is True
+    assert '"S001/P001"' in result["content"][0]["text"]
     probe = session.workspace.probes_path / "P001"
     assert json.loads((probe / "probe.json").read_text())["status"] == "failed"
     assert (probe / "output.txt").read_text() == "kernel connection lost"
     assert session._pending_verdict is None
+
+
+@pytest.mark.asyncio
+async def test_corrected_code_retries_error_in_same_probe(session, monkeypatch):
+    import json
+
+    monkeypatch.setattr("nocturnomath.tools.asyncio.to_thread", run_inline)
+
+    def execute(code, timeout):
+        session.kernel.errored = code == "print(missing)"
+        if session.kernel.errored:
+            return "NameError: missing", [], None
+        return "3\n", [b"plot"], None
+
+    session.kernel.execute = execute
+    run = tools_by_name(session)["run"].handler
+    first = await run({"code": "print(missing)", "expected": "3"})
+    assert "retry_of" in first["content"][0]["text"]
+    retry = await run({"code": "print(3)", "retry_of": "S001/P001"})
+    assert "S001/P001/A002/output.txt" in retry["content"][0]["text"]
+    original = session.workspace.probes_path / "P001"
+    attempt = original / "A002"
+    assert (original / "code.py").read_text() == "print(missing)"
+    assert (original / "output.txt").read_text() == "NameError: missing"
+    assert json.loads((original / "probe.json").read_text())["status"] == "error"
+    assert (attempt / "code.py").read_text() == "print(3)"
+    assert (attempt / "output.txt").read_text() == "3\n"
+    assert json.loads((attempt / "probe.json").read_text())["expected"] == "3"
+    assert session.workspace.evidence_sources(["S001/P001/A002/plot-1.png"])
+    assert session.workspace.list_plots()[0]["filename"] == "S001/P001/A002/plot-1.png"
+    assert len(list(session.workspace.probes_path.iterdir())) == 1
+    assert session._pending_verdict == "3"
+
+    blocked = await run({"code": "print(4)", "expected": "4", "retry_of": "S001/P001"})
+    assert blocked["is_error"] is True
 
 
 @pytest.mark.asyncio

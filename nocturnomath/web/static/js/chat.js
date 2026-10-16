@@ -107,7 +107,7 @@ export function appendProbeStart(expected, code, probeId) {
   const pill = document.createElement("span");
   pill.className = "probe-pill";
   pill.textContent = "Code probe";
-  const number = probeId?.split("/").pop();
+  const number = probeId?.split("/").find((part) => /^P\d+$/.test(part));
   if (/^P\d+$/.test(number || "")) {
     const badge = document.createElement("span");
     badge.className = "badge badge-sm";
@@ -161,8 +161,15 @@ export function appendProbeStart(expected, code, probeId) {
   };
 }
 
-export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId) {
+export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId, status = "completed") {
   let card = state.currentProbeCard ? state.currentProbeCard.card : null;
+
+  if (status !== "completed") {
+    card?.remove();
+    state.currentProbeCard = null;
+    state.lastProbeCard = null;
+    return;
+  }
 
   if (!card) {
     appendProbeStart(expected, code, probeId);

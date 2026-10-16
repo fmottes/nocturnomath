@@ -173,6 +173,53 @@ class Workspace:
         )
         return path
 
+    def retry_probe(
+        self, probe_id: str, code: str, expected: str | None, model: str, **context
+    ) -> Path:
+        """Save a corrected execution under the same probe without changing old artifacts."""
+        match = re.fullmatch(rf"{re.escape(self.session_id)}/(P\d{{3,}})", probe_id)
+        if not match:
+            raise ValueError(
+                "retry_of must name a probe in the current session, such as S001/P001."
+            )
+        probe = self.probes_path / match.group(1)
+        if not (probe / "probe.json").is_file():
+            raise ValueError(f"Probe {probe_id} does not exist.")
+        if not expected:
+            expected = json.loads((probe / "probe.json").read_text())["expected"]
+        attempts = sorted(
+            (path for path in probe.iterdir() if re.fullmatch(r"A\d{3,}", path.name)),
+            key=lambda path: int(path.name[1:]),
+        )
+        latest = attempts[-1] if attempts else probe
+        status = json.loads((latest / "probe.json").read_text())["status"]
+        if status not in ("error", "failed"):
+            raise ValueError(
+                f"Probe {probe_id} cannot be retried after status {status}."
+            )
+        number = int(attempts[-1].name[1:]) + 1 if attempts else 2
+        path = probe / f"A{number:03d}"
+        path.mkdir()
+        write_text(path / "code.py", code)
+        write_text(
+            path / "probe.json",
+            json.dumps(
+                {
+                    "id": path.name,
+                    "retry_of": probe_id,
+                    "expected": expected,
+                    **context,
+                    "model": model,
+                    "session": self.session_id,
+                    "started": time.time(),
+                    "status": "started",
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        return path
+
     @staticmethod
     def finish_probe(
         path: Path, output: str, images: list[bytes], status: str, note: str | None
@@ -190,13 +237,17 @@ class Workspace:
         links = []
         for source in dict.fromkeys(sources):
             if not re.fullmatch(
-                r"S\d{3,}/P\d{3,}/(?:output\.txt|plot-[1-9]\d*\.png)", source
+                r"S\d{3,}/P\d{3,}/(?:A\d{3,}/)?(?:output\.txt|plot-[1-9]\d*\.png)",
+                source,
             ):
                 raise ValueError(
-                    "Sources must look like S001/P001/output.txt or S001/P001/plot-1.png."
+                    "Sources must look like S001/P001/output.txt or S001/P001/A002/plot-1.png."
                 )
-            session_id, probe_id, filename = source.split("/")
-            artifact = self.sessions_path / session_id / "probes" / probe_id / filename
+            session_id, probe_id, *parts = source.split("/")
+            filename = parts[-1]
+            artifact = (
+                self.sessions_path / session_id / "probes" / probe_id / Path(*parts)
+            )
             if (
                 not artifact.resolve().is_relative_to(self.sessions_path.resolve())
                 or not artifact.is_file()
@@ -208,6 +259,8 @@ class Workspace:
                     f"Probe {artifact.parent.name} has no recorded outcome yet."
                 )
             relative = f"../sessions/{session_id}/probes/{probe_id}"
+            if len(parts) == 2:
+                relative += f"/{parts[0]}"
             links.append(
                 f"[{source}]({relative}/{filename}) "
                 f"([code]({relative}/code.py), [run]({relative}/probe.json))"
@@ -317,13 +370,14 @@ class Workspace:
 
     def list_plots(self) -> list[dict[str, Any]]:
         plots = []
-        for path in self.sessions_path.glob("S*/probes/P*/plot-*.png"):
+        for path in self.sessions_path.glob("S*/probes/P*/**/plot-*.png"):
             stat = path.stat()
             relative = path.relative_to(self.path).as_posix()
+            source = path.relative_to(self.sessions_path).parts
             plots.append(
                 {
-                    "filename": f"{path.parents[2].name}/{path.parent.name}/{path.name}",
-                    "session": path.parents[2].name,
+                    "filename": "/".join((source[0], *source[2:])),
+                    "session": source[0],
                     "url": f"/api/asset?path={relative}",
                     "modified": stat.st_mtime,
                     "size": stat.st_size,
@@ -393,7 +447,9 @@ class Workspace:
                     "modified": path.stat().st_mtime,
                     "turns": len(user_texts),
                     "probes": sum(
-                        1 for r in records if r.get("kind") == "probe_started"
+                        1
+                        for r in records
+                        if r.get("kind") == "probe_started" and not r.get("retry_of")
                     ),
                     "notes": sum(
                         1 for r in records if r.get("kind") in ("evidence", "thought")
@@ -469,11 +525,18 @@ class Workspace:
                     time=record.get("t"),
                 )
             elif kind == "probe_started":
-                probe += 1
+                retry_of = record.get("retry_of")
+                if not retry_of:
+                    probe += 1
                 probe_id = record.get("probe_id", f"probe-{probe}")
                 expected = record.get("expected", "")
+                heading = (
+                    f"### Probe {turn}.{probe}, attempt {probe_id.rsplit('/', 1)[-1][1:]}"
+                    if retry_of
+                    else f"### Probe {turn}.{probe}"
+                )
                 markdown(
-                    f"### Probe {turn}.{probe}\n\n**Prediction:** {expected}",
+                    f"{heading}\n\n**Prediction:** {expected}",
                     "probe",
                     probe_id=probe_id,
                 )
