@@ -68,11 +68,6 @@ class CommandCompleter(Completer):
                 (model, self.runtime.model_labels.get(model, ""))
                 for model in self.runtime.models
             ]
-        if name == "/context":
-            return [
-                ("on", "carry chat context"),
-                ("off", "start every message fresh"),
-            ]
         if name == "/auth":
             return [
                 ("status", "show the current authentication method"),

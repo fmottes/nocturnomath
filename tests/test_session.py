@@ -313,8 +313,6 @@ async def test_active_query_guards_state_and_interrupts(session):
         session.reset_client_session()
     with pytest.raises(RuntimeError):
         session.set_workspace(session.workspace_path / "other")
-    with pytest.raises(RuntimeError):
-        session.set_carry_chat_context(False)
 
     await session.interrupt()
     with pytest.raises(asyncio.CancelledError):
@@ -389,10 +387,30 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
         ]
 
         session.set_document_included("inputs.md", True)
-        session.set_carry_chat_context(False)
+        (documents / "inputs.md").write_text("# Inputs\n\nN = 30\n")
         await session.query("fifth")
+        assert "N = 30" in FakeClient.prompts[-1]
         await session.query("sixth")
-        assert "N = 20" in FakeClient.prompts[-1]
+        assert "inputs.md" not in FakeClient.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_project_prompt_applies_to_next_query_without_resetting_context(session):
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("first")
+        session_id = session._sdk_session_id
+        session.set_exploration_prompt("Explore this project's data carefully.")
+        await session.query("second")
+
+    options = FakeClient.options_used[-1]
+    assert options.resume == session_id
+    assert options.system_prompt.startswith(
+        "Explore this project's data carefully.\n\n"
+    )
+    assert "# Nocturnomath runtime contract" in options.system_prompt
+    assert session.workspace.read_config()["exploration_prompt"] == (
+        "Explore this project's data carefully."
+    )
 
 
 @pytest.mark.asyncio

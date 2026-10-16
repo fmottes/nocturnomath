@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20260913-1";
-import { initWebSocket, sendWs } from "./transport.js?v=20260913-1";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20260923-2";
-import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20260922-2";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20260923-1";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20260923-1";
-import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20260923-1";
+import { elements, state } from "./state.js?v=20261016-1";
+import { initWebSocket, sendWs } from "./transport.js?v=20261016-1";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-1";
+import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261016-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261016-1";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-1";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-1";
+import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20261016-1";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -224,10 +224,6 @@ function handleServerEvent(event) {
       current.kernel_alive = true;
       current.kernel_busy = false;
     }
-    if (event.type === "carry_context_changed") {
-      current.carry_chat_context = event.carry_chat_context;
-      current.can_compact = false;
-    }
     if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
@@ -330,15 +326,6 @@ function handleServerEvent(event) {
       updateKernelStatus(true, false);
       break;
 
-    case "carry_context_changed":
-      setCarryContext(event.carry_chat_context);
-      appendSystemMessage(
-        state.carryChatContext
-          ? "Keeping context from here on. The agent sees this conversation as it grows; earlier messages are not recovered."
-          : "Discarding context. Every message starts fresh from the system prompt, `evidence.md`, `thoughts.md`, and the checked documents."
-      );
-      break;
-
     case "context_usage_changed":
       setContextUsage(event.context_usage);
       break;
@@ -363,6 +350,10 @@ function handleServerEvent(event) {
 
     case "session_defaults_changed":
       setSessionDefaults(event.session_defaults);
+      break;
+
+    case "exploration_prompt_changed":
+      setExplorationPrompt(event.exploration_prompt, event.exploration_prompt_is_custom);
       break;
 
     case "session_resumed":
@@ -509,6 +500,11 @@ function setupEventListeners() {
     setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value);
   });
   elements.sessionDefaultsForm.addEventListener("submit", saveSessionDefaults);
+  elements.explorationPromptForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveExplorationPrompt(elements.explorationPromptInput.value);
+  });
+  elements.explorationPromptReset.addEventListener("click", () => saveExplorationPrompt(null));
 
   // Figures session filter
   elements.plotsFilterBtn.addEventListener("click", () => togglePlotsFilterMenu());
@@ -569,10 +565,6 @@ function setupEventListeners() {
   elements.historyModal.addEventListener("click", (e) => {
     if (e.target === elements.historyModal && !state.historyLoading) elements.historyModal.classList.add("hidden");
   });
-  elements.contextToggle.addEventListener("change", (e) => {
-    sendWs("set_carry_context", { agent_id: state.activeAgentId, enabled: e.target.checked });
-  });
-
   elements.btnInterrupt.addEventListener("click", () => sendWs("interrupt", { agent_id: state.activeAgentId }));
 
   // Workspace Switcher Modal
@@ -696,6 +688,28 @@ async function saveSessionDefaults(event) {
     elements.sessionDefaultsStatus.textContent = error.message;
   } finally {
     elements.sessionDefaultsSave.disabled = !state.models.length;
+  }
+}
+
+async function saveExplorationPrompt(prompt) {
+  elements.explorationPromptSave.disabled = true;
+  elements.explorationPromptReset.disabled = true;
+  elements.explorationPromptStatus.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/settings/exploration-prompt", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to save prompt");
+    setExplorationPrompt(data.exploration_prompt, data.exploration_prompt_is_custom);
+    elements.explorationPromptStatus.textContent = "Saved for this project.";
+  } catch (error) {
+    elements.explorationPromptStatus.textContent = error.message;
+  } finally {
+    elements.explorationPromptSave.disabled = false;
+    elements.explorationPromptReset.disabled = !state.explorationPromptIsCustom;
   }
 }
 

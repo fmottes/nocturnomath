@@ -1,8 +1,8 @@
-import { elements, state } from "./state.js?v=20260913-1";
+import { elements, state } from "./state.js?v=20261016-1";
 import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
-import { openLightbox } from "./ui.js?v=20260923-1";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20260913-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20260923-1";
+import { openLightbox } from "./ui.js?v=20261016-1";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -22,6 +22,7 @@ export function applyWorkspace(ws) {
     elements.modelSelect.value = "";
     elements.effortSelect.value = "";
     elements.sessionDefaultsStatus.textContent = "";
+    elements.explorationPromptStatus.textContent = "";
     showDocumentsView("list");
   }
   state.workspace = ws;
@@ -45,6 +46,7 @@ export function applyWorkspace(ws) {
     selected?.effort || ws.effort,
   );
   setSessionDefaults(ws.session_defaults);
+  setExplorationPrompt(ws.exploration_prompt, ws.exploration_prompt_is_custom);
 
   updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
   updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
@@ -250,7 +252,13 @@ async function openRecentWorkspace(path) {
 
 export function setCarryContext(enabled) {
   state.carryChatContext = Boolean(enabled);
-  elements.contextToggle.checked = state.carryChatContext;
+}
+
+export function setExplorationPrompt(prompt, isCustom) {
+  state.explorationPrompt = prompt || "";
+  state.explorationPromptIsCustom = Boolean(isCustom);
+  elements.explorationPromptInput.value = state.explorationPrompt;
+  elements.explorationPromptReset.disabled = !state.explorationPromptIsCustom;
 }
 
 export function selectViewerTab(tab) {

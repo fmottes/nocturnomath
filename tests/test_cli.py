@@ -403,25 +403,10 @@ async def test_auth_prompt_can_be_abandoned_with_eof(terminal):
 
 
 @pytest.mark.asyncio
-async def test_context_toggles_and_refuses_while_busy(terminal):
-    await terminal.run("/context")
-    assert "carry chat context: on" in terminal.output()
-
-    await terminal.run("/context maybe")
-    assert "/context on or /context off" in terminal.output()
-
-    await terminal.run("/context off")
-    assert terminal.session.carry_chat_context is False
-    assert "Discarding context." in terminal.output()
-
-    await terminal.run("/context on")
-    assert terminal.session.carry_chat_context is True
-    assert "Keeping context from here on." in terminal.output()
-
-    terminal.session._is_busy = True
+async def test_context_cannot_be_disabled(terminal):
     await terminal.run("/context off")
     assert terminal.session.carry_chat_context is True
-    assert "while the agent is running a query." in terminal.output()
+    assert "Unknown command /context." in terminal.output()
 
 
 @pytest.mark.asyncio
@@ -532,7 +517,6 @@ async def test_mutations_are_refused_while_a_query_runs(terminal):
         "/restart": "Cannot restart the kernel while the agent is running a query.",
         "/resume S001": "Cannot resume while the agent is running a query.",
         "/export": "Cannot download the current session while the agent is running a query.",
-        "/context off": "Cannot change context settings while the agent is running a query.",
     }
     for command, message in expected.items():
         await terminal.run(command)
@@ -607,14 +591,13 @@ def test_bottom_toolbar_reports_the_live_state(terminal):
     assert resting.endswith("idle")
 
     terminal.session.activate_session()
-    terminal.session.set_carry_chat_context(False)
     terminal.app.pending_model = "sonnet"
     terminal.session.kernel.busy = True
     terminal.app.render_event("status_change", {"status": "thinking"})
     busy = terminal.app.bottom_toolbar()
     assert "kernel busy" in busy
     assert "→ sonnet" in busy
-    assert "context off" in busy
+    assert "context on" in busy
     assert "chat S001" in busy
     assert busy.endswith("thinking")
 
@@ -648,8 +631,7 @@ def test_completer_suggests_commands_with_their_description(completer):
 
 
 def test_completer_suggests_command_arguments(completer, terminal):
-    assert [text for text, _ in complete(completer, "/context ")] == ["on", "off"]
-    assert [text for text, _ in complete(completer, "/context o")] == ["on", "off"]
+    assert complete(completer, "/context") == []
     assert [text for text, _ in complete(completer, "/auth ")] == [
         "status",
         "subscription",

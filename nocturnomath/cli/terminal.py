@@ -47,7 +47,6 @@ COMMANDS = [
         "[status|subscription|api-key|claude-code]",
         "show or change Claude login",
     ),
-    ("/context", "[on|off]", "show or set whether the agent carries chat context"),
     ("/compact", "", "compact the current chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
     ("/workspace", "<path>", "open a different workspace folder"),
@@ -691,21 +690,6 @@ class TerminalApp:
             )
             self.pending_model = None
         self.check_model(self.runtime.model)
-        return True
-
-    async def _command_context(self, argument: str) -> bool:
-        session = self.runtime.require_session()
-        if not argument:
-            state = "on" if session.carry_chat_context else "off"
-            self.write(f"carry chat context: {state}")
-            return True
-        if argument not in ("on", "off"):
-            self.error("Use /context on or /context off.")
-            return True
-        enabled = session.set_carry_chat_context(argument == "on")
-        await self.runtime.emit(
-            "carry_context_changed", {"carry_chat_context": enabled}
-        )
         return True
 
     async def _command_env(self, argument: str) -> bool:

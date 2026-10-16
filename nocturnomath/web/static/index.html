@@ -25,7 +25,7 @@
   <link rel="stylesheet" href="/static/css/layout.css">
   <link rel="stylesheet" href="/static/css/chat.css">
   <link rel="stylesheet" href="/static/css/viewer.css">
-  <link rel="stylesheet" href="/static/css/modals.css">
+  <link rel="stylesheet" href="/static/css/modals.css?v=20261016-2">
   <link rel="stylesheet" href="/static/css/lightbox.css">
   <link rel="stylesheet" href="/static/css/responsive.css">
 </head>
@@ -296,6 +296,17 @@
             </div>
             <p id="session-defaults-status" class="environment-status" role="status" aria-live="polite"></p>
           </form>
+          <h4>Scientific system prompt</h4>
+          <form id="exploration-prompt-form" class="settings-card exploration-prompt-form">
+            <label for="exploration-prompt-input">Instructions</label>
+            <textarea id="exploration-prompt-input" class="form-input exploration-prompt-input" spellcheck="false" aria-describedby="exploration-prompt-help"></textarea>
+            <p class="environment-note" id="exploration-prompt-help">Only the scientific guidance is editable. Saved for this project and applied to the next message. Runtime and scientific record rules remain fixed.</p>
+            <div class="environment-actions">
+              <button class="btn btn-primary" id="exploration-prompt-save" type="submit">Save prompt</button>
+              <button class="btn btn-outline" id="exploration-prompt-reset" type="button">Restore default</button>
+            </div>
+            <p id="exploration-prompt-status" class="environment-status" role="status" aria-live="polite"></p>
+          </form>
           <h4>Research environment</h4>
           <div class="settings-card environment-settings">
             <div class="environment-current">
@@ -327,12 +338,6 @@
             </form>
           </div>
           <h4>Experimental</h4>
-          <label class="toggle-label switch-label">
-            <span>Keep context</span>
-            <input type="checkbox" id="context-toggle" class="switch-input" checked>
-            <span class="switch" aria-hidden="true"></span>
-          </label>
-          <p class="modal-help">On by default. When off, each message starts from the scientific record without the earlier conversation.</p>
           <label class="toggle-label switch-label">
             <span>Include documents by default</span>
             <input type="checkbox" id="documents-default-toggle" class="switch-input" checked>
@@ -460,7 +465,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260923-6"></script>
+  <script type="module" src="/static/js/main.js?v=20261016-1"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

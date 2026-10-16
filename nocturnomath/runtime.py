@@ -475,6 +475,9 @@ class Runtime:
                 "model": session.default_model,
                 "effort": session.default_effort,
             },
+            "exploration_prompt": session.exploration_prompt,
+            "exploration_prompt_is_custom": session.exploration_prompt_override
+            is not None,
             "evidence_path": EVIDENCE_PATH,
             "thoughts_path": THOUGHTS_PATH,
             "kernel_alive": session.kernel.is_alive(),

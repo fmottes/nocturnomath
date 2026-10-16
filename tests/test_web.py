@@ -7,6 +7,7 @@ from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from nocturnomath.prompt import DEFAULT_EXPLORATION_PROMPT, RUNTIME_PROMPT
 from nocturnomath.session import ExplorationSession
 from nocturnomath.web import create_app
 
@@ -515,6 +516,56 @@ def test_model_and_effort_apply_to_next_query_without_resetting_context(session)
         )
         assert websocket.receive_json()["type"] == "error"
         assert seen_settings == [("claude-sonnet-5", "xhigh")]
+
+
+def test_scientific_prompt_is_saved_per_project_and_runtime_rules_stay_fixed(
+    session, tmp_path
+):
+    original = session.workspace_path
+    other = tmp_path / "other-project"
+    other.mkdir()
+    app = create_app(session, navigator_root=tmp_path)
+    with TestClient(app) as client:
+        initial = client.get("/api/workspace").json()
+        assert initial["exploration_prompt"] == DEFAULT_EXPLORATION_PROMPT
+        assert initial["exploration_prompt_is_custom"] is False
+
+        assert client.put(
+            "/api/settings/exploration-prompt", json={"prompt": "  Check the signal.  "}
+        ).json() == {
+            "exploration_prompt": "Check the signal.",
+            "exploration_prompt_is_custom": True,
+        }
+        assert session._client_options().system_prompt == (
+            "Check the signal.\n\n" + RUNTIME_PROMPT.strip() + "\n"
+        )
+        assert (
+            session.workspace.read_config()["exploration_prompt"] == "Check the signal."
+        )
+        assert (
+            client.put(
+                "/api/settings/exploration-prompt", json={"prompt": "   "}
+            ).status_code
+            == 400
+        )
+
+        with patch("nocturnomath.session.Kernel", FakeKernel):
+            response = client.post("/api/workspace", json={"path": str(other)})
+        assert response.status_code == 200
+        assert client.get("/api/workspace").json()["exploration_prompt"] == (
+            DEFAULT_EXPLORATION_PROMPT
+        )
+        with patch("nocturnomath.session.Kernel", FakeKernel):
+            response = client.post("/api/workspace", json={"path": str(original)})
+        assert response.status_code == 200
+        assert client.get("/api/workspace").json()["exploration_prompt"] == (
+            "Check the signal."
+        )
+        restored = client.put(
+            "/api/settings/exploration-prompt", json={"prompt": None}
+        ).json()
+        assert restored["exploration_prompt"] == DEFAULT_EXPLORATION_PROMPT
+        assert restored["exploration_prompt_is_custom"] is False
 
 
 def test_workspace_defaults_apply_only_when_a_new_session_starts(session):

@@ -80,6 +80,10 @@ class SessionDefaultsRequest(BaseModel):
     effort: str | None = None
 
 
+class ExplorationPromptRequest(BaseModel):
+    prompt: str | None
+
+
 class AuthRequest(BaseModel):
     method: Literal["claude_code", "subscription", "api_key"]
     credential: SecretStr | None = None
@@ -573,6 +577,21 @@ def create_app(
         await runtime.broadcast("session_defaults_changed", data)
         return data
 
+    @app.put("/api/settings/exploration-prompt")
+    async def set_exploration_prompt(request: ExplorationPromptRequest):
+        session = active_session()
+        try:
+            prompt = session.set_exploration_prompt(request.prompt)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        data = {
+            "exploration_prompt": prompt,
+            "exploration_prompt_is_custom": session.exploration_prompt_override
+            is not None,
+        }
+        await runtime.broadcast("exploration_prompt_changed", data)
+        return data
+
     @app.post("/api/session/new")
     async def new_session():
         try:
@@ -815,18 +834,6 @@ def create_app(
                     await runtime.broadcast(
                         "agent_added",
                         {"requested_by": agent_id, **runtime.agent_snapshot(new_id)},
-                    )
-                elif action == "set_carry_context":
-                    try:
-                        enabled = session.set_carry_chat_context(data.get("enabled"))
-                    except RuntimeError as exc:
-                        await runtime.broadcast(
-                            "error", {"agent_id": agent_id, "message": str(exc)}
-                        )
-                        continue
-                    await runtime.broadcast(
-                        "carry_context_changed",
-                        {"agent_id": agent_id, "carry_chat_context": enabled},
                     )
         except WebSocketDisconnect:
             runtime.websockets.discard(websocket)

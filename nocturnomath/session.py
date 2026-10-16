@@ -26,13 +26,12 @@ from claude_agent_sdk import (
 from .auth import ClaudeAuth
 from .environment import ResearchEnvironment
 from .kernel import Kernel
-from .prompt import build_system_prompt
+from .prompt import DEFAULT_EXPLORATION_PROMPT, build_system_prompt
 from .tools import build_tools
 from .workspace import Workspace
 
 logger = logging.getLogger("nocturnomath")
 
-CARRY_CHAT_CONTEXT = True
 DEFAULT_EFFORT = "high"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 CONTEXT_USAGE_TIMEOUT_S = 10
@@ -61,7 +60,6 @@ class ExplorationSession:
         effort: str | None = None,
         timeout_s: int = 600,
         image_cap: int = 2,
-        carry_chat_context: bool = CARRY_CHAT_CONTEXT,
         python: str | None = None,
         auth: ClaudeAuth | None = None,
     ):
@@ -73,7 +71,7 @@ class ExplorationSession:
         self.default_effort: str | None = self.effort
         self.timeout_s = timeout_s
         self.image_cap = image_cap
-        self.carry_chat_context = carry_chat_context
+        self.carry_chat_context = True
         self.auth = auth or ClaudeAuth()
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
@@ -241,6 +239,23 @@ class ExplorationSession:
         self.default_effort = effort
         self.workspace.update_config(default_model=model, default_effort=effort)
 
+    @property
+    def exploration_prompt_override(self) -> str | None:
+        prompt = self.workspace.read_config().get("exploration_prompt")
+        return prompt if isinstance(prompt, str) and prompt.strip() else None
+
+    @property
+    def exploration_prompt(self) -> str:
+        return self.exploration_prompt_override or DEFAULT_EXPLORATION_PROMPT
+
+    def set_exploration_prompt(self, prompt: str | None) -> str:
+        if prompt is not None:
+            prompt = prompt.strip()
+            if not prompt:
+                raise ValueError("Enter a scientific prompt, or restore the default.")
+        self.workspace.update_config(exploration_prompt=prompt)
+        return self.exploration_prompt
+
     def document_context(self) -> tuple[str, dict[str, str]]:
         """Build document context and the contents to mark sent after submission."""
         sections = []
@@ -357,21 +372,6 @@ class ExplorationSession:
             replayed += 1
         return replayed
 
-    def set_carry_chat_context(self, enabled: bool) -> bool:
-        self.require_idle("change context settings")
-        enabled = bool(enabled)
-        if enabled == self.carry_chat_context:
-            return enabled
-        self.carry_chat_context = enabled
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._sent_documents = {}
-        self._session_initialized = False
-        if not self.workspace.session_pending:
-            self.log_transcript("meta", carry_chat_context=enabled)
-        logger.info(f"carry_chat_context set to {enabled}")
-        return enabled
-
     async def interrupt(self):
         if self.kernel.busy:
             self.kernel.interrupt()
@@ -389,7 +389,7 @@ class ExplorationSession:
             # The research MCP tools are the complete execution surface. Do not
             # inherit Claude Code's built-ins or unrelated MCP configuration.
             tools=[],
-            system_prompt=build_system_prompt(),
+            system_prompt=build_system_prompt(self.exploration_prompt),
             mcp_servers={"explore": create_sdk_mcp_server("explore", tools=self.tools)},
             strict_mcp_config=True,
             # Keep the user's authentication/provider settings, but do not load

@@ -24,6 +24,10 @@
 .modal-dialog-wide { max-width: 700px; }
 .modal-dialog-history { width: 94%; max-width: 840px; }
 .modal-dialog-folder { max-width: 620px; }
+#settings-modal .modal-dialog { width: 80%; max-width: 1100px; }
+@media (max-width: 600px) {
+  #settings-modal .modal-dialog { width: calc(100% - 32px); }
+}
 
 .modal-header {
   display: flex;
@@ -84,6 +88,14 @@
   border: 1px solid var(--rule);
 }
 .session-defaults-form { gap: 12px; }
+.exploration-prompt-form { gap: 12px; }
+.exploration-prompt-input {
+  width: 100%;
+  min-height: 220px;
+  max-height: 50vh;
+  resize: vertical;
+  line-height: 1.5;
+}
 .session-default-fields {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(120px, 1fr);
