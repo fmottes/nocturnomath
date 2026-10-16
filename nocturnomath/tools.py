@@ -417,7 +417,7 @@ def build_tools(session: "ExplorationSession"):
         )
         session._probe_task = task
         try:
-            status, output = await asyncio.shield(task)
+            status, output, message = await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -425,10 +425,7 @@ def build_tools(session: "ExplorationSession"):
         finally:
             if task.done():
                 session._probe_task = None
-        await session.emit(
-            "system_message",
-            text=f"Package installation {status}. Installer output saved in this session’s environment_changes folder.",
-        )
+        await session.emit("system_message", text=message)
         return {
             "content": [
                 {

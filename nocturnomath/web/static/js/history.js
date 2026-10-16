@@ -242,6 +242,10 @@ function renderRecords(records, isBusy = false) {
         appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
         break;
 
+      case "packages_installed":
+        if (rec.message) appendSystemMessage(rec.message);
+        break;
+
       case "evidence":
       case "thought":
       case "evidence_struck":

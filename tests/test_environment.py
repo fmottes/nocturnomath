@@ -195,9 +195,12 @@ def test_installation_targets_selected_python_and_records_failure(session):
     session.activate_session()
     before = session.environment_record
     with patch("nocturnomath.session.subprocess.run", side_effect=fail):
-        status, output = session.install_packages(["nonexistent-science-package"])
+        status, output, message = session.install_packages(
+            ["nonexistent-science-package"]
+        )
     assert status == "failed"
     assert "could not be resolved" in output
+    assert "failed: nonexistent-science-package" in message
     changes = list(
         session.transcript_path.parent.glob("environment_changes/*/install.json")
     )
@@ -205,7 +208,38 @@ def test_installation_targets_selected_python_and_records_failure(session):
     assert record["before"] == before
     assert record["after"] == session.environment_record != before
     assert record["kernel_id"] == session.kernel_id
+    assert record["message"] == message
     assert not list(session.workspace.probes_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_package_installation_names_packages_in_chat_and_history(session):
+    from types import SimpleNamespace
+
+    session.environment.uv = lambda: "/bin/uv"
+    session.environment.process_env = dict
+    events = []
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
+
+    def succeed(command, **kwargs):
+        kwargs["stdout"].write("Installation complete")
+        return SimpleNamespace(returncode=0)
+
+    install_tool = next(
+        tool for tool in session.tools if tool.name == "install_packages"
+    )
+    with patch("nocturnomath.session.subprocess.run", side_effect=succeed):
+        result = await install_tool.handler({"packages": ["numpy>=2", "scipy"]})
+
+    assert result["is_error"] is False
+    message = next(
+        payload["text"] for kind, payload in events if kind == "system_message"
+    )
+    assert "completed: numpy>=2, scipy" in message
+    record = session.workspace.read_transcript(session.transcript_path)[-1]
+    assert record["kind"] == "packages_installed"
+    assert record["packages"] == ["numpy>=2", "scipy"]
+    assert record["message"] == message
 
 
 def test_uv_falls_back_to_the_bundled_binary(monkeypatch):

@@ -689,6 +689,7 @@ class ExplorationSession:
         ]
         metadata = {
             "command": command,
+            "packages": packages,
             "kernel_id": self.kernel_id,
             "before": self.environment_record,
             "started": time.time(),
@@ -714,6 +715,10 @@ class ExplorationSession:
                 output.write(str(exc))
         finally:
             metadata["finished"] = time.time()
+            metadata["message"] = (
+                f"Package installation {metadata['status']}: {', '.join(packages)}. "
+                "Installer output saved in this session's environment_changes folder."
+            )
             try:
                 self.record_environment()
                 metadata["after"] = self.environment_record
@@ -724,4 +729,8 @@ class ExplorationSession:
             **metadata,
             output=str((directory / "output.txt").relative_to(self.workspace.path)),
         )
-        return metadata["status"], (directory / "output.txt").read_text()
+        return (
+            metadata["status"],
+            (directory / "output.txt").read_text(),
+            metadata["message"],
+        )
