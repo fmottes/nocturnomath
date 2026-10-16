@@ -464,7 +464,7 @@ def create_app(
         session = active_session(agent_id)
         session.set_documents_default(request.enabled)
         for other in runtime.agents.values():
-            if other is not session:
+            if other is not session and other.workspace_path == session.workspace_path:
                 other.documents_default = session.documents_default
                 other.document_choices = {}
         return documents_payload(session)
@@ -498,7 +498,10 @@ def create_app(
         try:
             session.delete_document(name)
             for other in runtime.agents.values():
-                if other is not session:
+                if (
+                    other is not session
+                    and other.workspace_path == session.workspace_path
+                ):
                     other.document_choices.pop(name, None)
                     other._sent_documents.pop(name, None)
         except FileNotFoundError:

@@ -715,6 +715,9 @@ def test_documents_api_creates_edits_and_selects_documents(session):
         assert toggled.json() == {"name": "Inputs.md", "included": False}
         assert client.get("/api/documents").json()["documents"][0]["included"] is False
         assert client.get("/api/workspace").json()["documents"][0]["included"] is False
+        assert session.workspace.read_config()["document_choices"] == {
+            "Inputs.md": False
+        }
 
         assert client.delete("/api/documents/missing.md").status_code == 404
         session._sent_documents["Inputs.md"] = "# Inputs\n\nN = 20\n"

@@ -198,39 +198,55 @@ class ExplorationSession:
         logger.info(f"Switched workspace to: {new_path}")
 
     def load_document_settings(self):
-        self.documents_default = bool(
-            self.workspace.read_config().get("documents_default", True)
-        )
-        self.document_choices = {}
+        self.refresh_document_settings()
         self._sent_documents = {}
+
+    def refresh_document_settings(self):
+        """Read the document selections shared by this workspace's sessions."""
+        config = self.workspace.read_config()
+        self.documents_default = bool(config.get("documents_default", True))
+        choices = config.get("document_choices", {})
+        self.document_choices = (
+            {
+                name: included
+                for name, included in choices.items()
+                if isinstance(name, str) and isinstance(included, bool)
+            }
+            if isinstance(choices, dict)
+            else {}
+        )
 
     def list_documents(self) -> list[dict[str, Any]]:
         """Documents with their inclusion flag; unseen files take the default."""
+        self.refresh_document_settings()
         documents = self.workspace.list_documents()
-        names = {document["name"] for document in documents}
-        self.document_choices = {
-            name: self.document_choices.get(name, self.documents_default)
-            for name in names
-        }
         for document in documents:
-            document["included"] = self.document_choices[document["name"]]
+            document["included"] = self.document_choices.get(
+                document["name"], self.documents_default
+            )
         return documents
 
     def set_document_included(self, name: str, included: bool) -> bool:
         self.workspace.read_document(name)
+        self.refresh_document_settings()
         self.document_choices[name] = bool(included)
+        self.workspace.update_config(document_choices=self.document_choices)
         return self.document_choices[name]
 
     def delete_document(self, name: str):
         self.workspace.delete_document(name)
-        self.document_choices.pop(name, None)
+        self.refresh_document_settings()
+        if self.document_choices.pop(name, None) is not None:
+            self.workspace.update_config(document_choices=self.document_choices)
         self._sent_documents.pop(name, None)
 
     def set_documents_default(self, enabled: bool) -> bool:
         """Persist the default and reset the current selection to match it."""
         self.documents_default = bool(enabled)
-        self.workspace.update_config(documents_default=self.documents_default)
         self.document_choices = {}
+        self.workspace.update_config(
+            documents_default=self.documents_default, document_choices={}
+        )
         return self.documents_default
 
     def set_session_defaults(self, model: str, effort: str | None):

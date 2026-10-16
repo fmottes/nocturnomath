@@ -14,8 +14,10 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
 )
+from conftest import FakeEnvironment, FakeKernel
 
 from nocturnomath.auth import ClaudeAuth
+from nocturnomath.session import ExplorationSession
 
 
 def stream_event(delta, parent_tool_use_id=None):
@@ -391,6 +393,40 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
         assert "N = 30" in FakeClient.prompts[-1]
         await session.query("sixth")
         assert "inputs.md" not in FakeClient.prompts[-1]
+
+
+def test_document_selections_persist_per_workspace(session, tmp_path):
+    session.workspace.save_document("inputs.md", "# Inputs")
+    session.workspace.save_document("draft.md", "# Draft")
+    session.set_document_included("draft.md", False)
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        another_session = ExplorationSession(session.workspace_path, model="test")
+    assert {
+        item["name"]: item["included"] for item in another_session.list_documents()
+    } == {
+        "draft.md": False,
+        "inputs.md": True,
+    }
+
+    another_session.set_document_included("inputs.md", False)
+    assert all(not item["included"] for item in session.list_documents())
+
+    other_workspace = tmp_path / "other"
+    session.set_workspace(other_workspace)
+    session.workspace.save_document("draft.md", "# Other draft")
+    assert session.list_documents()[0]["included"] is True
+    session.set_workspace(another_session.workspace_path)
+    assert all(not item["included"] for item in session.list_documents())
+
+    session.delete_document("draft.md")
+    assert "draft.md" not in session.workspace.read_config()["document_choices"]
+    session.set_documents_default(True)
+    assert session.workspace.read_config()["document_choices"] == {}
+    assert session.list_documents()[0]["included"] is True
 
 
 @pytest.mark.asyncio
