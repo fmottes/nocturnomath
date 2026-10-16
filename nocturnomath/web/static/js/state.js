@@ -23,6 +23,7 @@ export const state = {
   currentAssistantBubble: null,
   currentProbeCard: null,
   lastProbeCard: null,
+  probeCards: new Map(),
   activeTab: "evidence",
   carryChatContext: true,
   explorationPrompt: "",

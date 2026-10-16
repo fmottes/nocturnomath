@@ -282,6 +282,28 @@ async def test_query_streams_text_tracks_context_and_logs(session):
 
 
 @pytest.mark.asyncio
+async def test_pending_probe_verdict_survives_next_message_and_resume(session):
+    tools = {tool.name: tool for tool in session.tools}
+    await tools["run"].handler({"code": "print(42)", "expected": "prints 42"})
+    assert session._pending_verdict_probe_id == "S001/P001"
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("Continue")
+    assert "S001/P001 still needs a verdict" in FakeClient.prompts[-1]
+    assert session._pending_verdict_probe_id == "S001/P001"
+    blocked = await tools["run"].handler({"code": "print(43)", "expected": "prints 43"})
+    assert blocked["is_error"]
+
+    session.start_new_transcript()
+    session.resume_session("S001")
+    assert session._pending_verdict_probe_id == "S001/P001"
+    await tools["verdict"].handler({"text": "The result matched."})
+    session.start_new_transcript()
+    session.resume_session("S001")
+    assert session._pending_verdict is None
+
+
+@pytest.mark.asyncio
 async def test_query_passes_selected_effort_to_the_sdk(session):
     session.effort = "xhigh"
 

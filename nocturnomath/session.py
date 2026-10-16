@@ -79,9 +79,11 @@ class ExplorationSession:
         self._current_client: ClaudeSDKClient | None = None
         self._current_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
+        self._probe_operation_lock = asyncio.Lock()
         self._session_initialized = False
         self._results_since_note = 0
         self._pending_verdict: str | None = None
+        self._pending_verdict_probe_id: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
@@ -120,6 +122,7 @@ class ExplorationSession:
         return (
             self._is_busy
             or self.kernel.busy
+            or self._probe_operation_lock.locked()
             or (self._probe_task is not None and not self._probe_task.done())
             or (self._current_task is not None and not self._current_task.done())
         )
@@ -193,6 +196,7 @@ class ExplorationSession:
         self._resume_prefix = None
         self._results_since_note = 0
         self._pending_verdict = None
+        self._pending_verdict_probe_id = None
         self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
@@ -307,6 +311,26 @@ class ExplorationSession:
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         return self.workspace.load_session(session_id)
 
+    def _restore_pending_verdict(self, records: list[dict[str, Any]]):
+        self._pending_verdict = None
+        self._pending_verdict_probe_id = None
+        reviewed = {
+            record.get("probe_id")
+            for record in records
+            if record.get("kind") == "verdict"
+        }
+        for record in reversed(records):
+            if record.get("kind") != "run":
+                continue
+            status = record.get("status", "completed")
+            if status in ("failed", "error") and record.get("backend") != "slurm":
+                continue
+            probe_id = record.get("probe_id")
+            if probe_id and probe_id not in reviewed and record.get("expected"):
+                self._pending_verdict = record["expected"]
+                self._pending_verdict_probe_id = probe_id
+                break
+
     def resume_session(
         self, session_id: str, restore_kernel: bool = False
     ) -> dict[str, Any]:
@@ -336,7 +360,7 @@ class ExplorationSession:
         self._sdk_session_id = sdk_id
         self._sent_documents = {}
         self._results_since_note = 0
-        self._pending_verdict = None
+        self._restore_pending_verdict(records)
         self.context_usage = next(
             (
                 record["context_usage"]
@@ -379,7 +403,10 @@ class ExplorationSession:
         """Rebuild kernel state from recorded probes without creating new artifacts."""
         replayed = 0
         for record in records:
-            if record.get("kind") != "probe_started":
+            if (
+                record.get("kind") != "probe_started"
+                or record.get("backend") == "slurm"
+            ):
                 continue
             code = record.get("code")
             if not isinstance(code, str) or not code.strip():
@@ -509,7 +536,6 @@ class ExplorationSession:
             raise RuntimeError("No model available.")
 
         self._is_busy = True
-        self._pending_verdict = None
         try:
             # Snapshot the selection before yielding so changes made while this turn runs
             # apply to the next message.
@@ -536,6 +562,12 @@ class ExplorationSession:
                     )
 
                 prefix += document_prefix
+                if self._pending_verdict is not None:
+                    prefix += (
+                        f"Probe {self._pending_verdict_probe_id} still needs a verdict "
+                        f"against its prediction: {self._pending_verdict}. "
+                        "Call verdict before starting another probe.\n\n"
+                    )
                 kernel_notice = self._kernel_notice
                 prefix += kernel_notice
                 prompt = prefix + user_text if prefix else user_text
@@ -654,6 +686,7 @@ class ExplorationSession:
         self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
+        self._pending_verdict_probe_id = None
         self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort

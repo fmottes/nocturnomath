@@ -98,6 +98,11 @@ export function closeAssistantBubble() {
 
 export function appendProbeStart(expected, code, probeId) {
   closeAssistantBubble();
+  const existing = state.probeCards.get(probeId);
+  if (existing) {
+    state.currentProbeCard = existing;
+    return;
+  }
   const card = document.createElement("div");
   card.className = "probe-card";
 
@@ -159,13 +164,16 @@ export function appendProbeStart(expected, code, probeId) {
     card,
     statusBadge: status,
   };
+  state.probeCards.set(probeId, state.currentProbeCard);
 }
 
 export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId, status = "completed") {
-  let card = state.currentProbeCard ? state.currentProbeCard.card : null;
+  let tracked = state.probeCards.get(probeId);
+  let card = tracked?.card || null;
 
-  if (status !== "completed") {
+  if (status !== "completed" && status !== "slurm-submitted" && status !== "slurm-error") {
     card?.remove();
+    state.probeCards.delete(probeId);
     state.currentProbeCard = null;
     state.lastProbeCard = null;
     return;
@@ -173,13 +181,17 @@ export function appendProbeFinish(expected, code, output, plotUrls, plotImages, 
 
   if (!card) {
     appendProbeStart(expected, code, probeId);
-    card = state.currentProbeCard.card;
+    tracked = state.currentProbeCard;
+    card = tracked.card;
   }
 
-  if (state.currentProbeCard && state.currentProbeCard.statusBadge) {
-    state.currentProbeCard.statusBadge.textContent = "Completed";
-    state.currentProbeCard.statusBadge.style.color = "var(--ok)";
+  if (tracked.statusBadge) {
+    tracked.statusBadge.textContent = status === "slurm-submitted" ? "Submitted" : status === "slurm-error" ? "Failed" : "Completed";
+    tracked.statusBadge.style.color = status === "slurm-error" ? "var(--danger)" : status === "slurm-submitted" ? "var(--ink-soft)" : "var(--ok)";
   }
+
+  card.querySelector(".probe-output-details")?.remove();
+  card.querySelector(".probe-images")?.remove();
 
   // Keep text output available without letting long probe logs dominate the chat.
   const outputDetails = document.createElement("details");

@@ -78,14 +78,22 @@ about runtime behavior or saved records, follow this contract.
 - The kernel is persistent. Reuse data and objects already loaded; do not reload. If the
   kernel's state is itself the problem — a shadowed name, a stale import, memory filling
   up — call `restart_kernel`, then reload only what the next run needs.
-- Plots are captured and saved for you: just build the figure. Do not write it out with
-  `savefig`, and never switch the matplotlib backend (`matplotlib.use`, `switch_backend`).
+- In kernel probes, plots are captured and saved for you: just build the figure. Do not
+  write it out with `savefig`, and never switch the matplotlib backend (`matplotlib.use`, `switch_backend`).
   Because the kernel is persistent, switching the backend silently stops plot capture for
   the rest of the session — you would stop seeing your own plots.
-- Only if a probe strictly requires a temporary file or artifact, write it under
+- Only if a kernel probe strictly requires a temporary file or artifact, write it under
   `.nocturnomath/scratch/`; otherwise keep the work in memory.
 - Call `verdict` once per probe, before the next `run`.
-- If probe code raises an error, correct it and call `run` with `retry_of` set to the
+- Use `submit_slurm` only for a self-contained Python probe that needs long or specialized
+  compute. It cannot use variables in the persistent kernel. Save its outputs under the
+  probe directory named by `NOCTURNOMATH_PROBE_DIR`; save plots there as `plot-1.png`,
+  `plot-2.png`, and so on. Print the observations needed for the verdict. Use
+  `check_slurm_job` to inspect a submitted job; checking status is not a
+  new probe. Give the verdict after the finished output is collected, including
+  failed jobs. Then correct a failed script and submit a new Slurm probe; keep
+  the failed output.
+- If kernel probe code raises an error, correct it and call `run` with `retry_of` set to the
   original probe ID (for example `S001/P001`). The corrected execution is saved as
   another attempt under that probe; prior code and output remain available. A failed
   attempt needs no verdict.
@@ -99,7 +107,8 @@ contents through Python or file-editing tools. IDs and links are managed for you
 - `evidence`: one strictly factual observation, at most 250 characters excluding sources.
   State relevant conditions and units. No interpretations, categories, or references to
   other evidence or thoughts. Cite one or more saved output/plot sources returned by `run`
-  (for example S001/P001/output.txt). Code and run metadata are linked automatically.
+  or `check_slurm_job` (for example S001/P001/output.txt). Code and run metadata are
+  linked automatically.
   Save observations worth retaining, including null or adverse results.
 - `thought`: one coherent interpretive step in plain language, usually a paragraph of
   80-150 words. Equations are welcome. Cite supporting evidence or earlier thoughts as

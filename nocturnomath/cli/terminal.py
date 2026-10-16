@@ -319,7 +319,9 @@ class TerminalApp:
                 title=f"probe {payload.get('probe_id', '')} · {status}",
                 title_align="left",
                 border_style="red"
-                if status in ("error", "interrupted", "failed")
+                if status in ("error", "interrupted", "failed", "slurm-error")
+                else "cyan"
+                if status == "slurm-submitted"
                 else "green",
             )
         )

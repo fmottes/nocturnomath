@@ -58,5 +58,8 @@ class FakeEnvironment:
     def save(self):
         pass
 
+    def process_env(self):
+        return {"VIRTUAL_ENV": str(self.python.parent.parent)}
+
     def snapshot(self):
         return {"python": str(self.python), "version": self.version, "packages": []}

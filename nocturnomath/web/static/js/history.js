@@ -151,6 +151,7 @@ export function clearChat(showWelcome = true) {
   state.currentAssistantBubble = null;
   state.currentProbeCard = null;
   state.lastProbeCard = null;
+  state.probeCards.clear();
 }
 
 // Rebuild the chat from the transcript the browser reconnected to, so a page
@@ -190,6 +191,7 @@ function renderRecords(records, isBusy = false) {
   const outcomes = new Set(records.filter((rec) =>
     rec.kind === "run" || rec.kind === "probe_failed").map((rec) => rec.probe_id));
   const starts = records.filter((rec) => rec.kind === "probe_started");
+  const startsById = new Map(starts.map((rec) => [rec.probe_id, rec]));
   const activeProbe = isBusy
     ? [...starts].reverse().find((rec) => !outcomes.has(rec.probe_id))?.probe_id
     : null;
@@ -211,10 +213,20 @@ function renderRecords(records, isBusy = false) {
         break;
 
       case "probe_failed":
+        if (startsById.get(rec.probe_id)?.backend === "slurm") {
+          const start = startsById.get(rec.probe_id);
+          appendProbeFinish(start.expected || "", start.code || "", rec.text || "Submission failed", [], [], rec.probe_id, "slurm-error");
+        }
         break;
 
+      case "slurm_submitted": {
+        const start = startsById.get(rec.probe_id);
+        appendProbeFinish(start?.expected || "", start?.code || "", `Slurm job ${rec.job_id} submitted. Probe ${rec.probe_id}.`, [], [], rec.probe_id, "slurm-submitted");
+        break;
+      }
+
       case "run":
-        if (rec.status && rec.status !== "completed") break;
+        if (rec.status && rec.status !== "completed" && rec.backend !== "slurm") break;
         appendProbeFinish(
           rec.expected || "",
           rec.code || "",
@@ -222,7 +234,7 @@ function renderRecords(records, isBusy = false) {
           (rec.images || []).map((name) => `/api/asset?path=${encodeURIComponent(name)}`),
           [],
           rec.probe_id,
-          rec.status
+          rec.backend === "slurm" && rec.status === "error" ? "slurm-error" : rec.status
         );
         break;
 

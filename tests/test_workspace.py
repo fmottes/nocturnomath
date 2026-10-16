@@ -1,4 +1,6 @@
+import ast
 import base64
+import json
 
 import pytest
 
@@ -70,6 +72,20 @@ def test_missing_and_non_probe_sources_are_rejected(tmp_path):
         workspace.evidence_sources(["S001/P001/output.txt"])
 
 
+def test_unfinished_slurm_plot_cannot_support_evidence(tmp_path):
+    workspace = Workspace(tmp_path)
+    probe = workspace.start_probe("print(1)", "1", "test", backend="slurm")
+    (probe / "plot-1.png").write_bytes(b"partial")
+    for status in ("submitted", "running"):
+        metadata = json.loads((probe / "probe.json").read_text())
+        metadata["status"] = status
+        (probe / "probe.json").write_text(json.dumps(metadata))
+        with pytest.raises(ValueError, match="no recorded outcome"):
+            workspace.evidence_sources(["S001/P001/plot-1.png"])
+    workspace.finish_probe(probe, "1\n", [], "completed", None)
+    assert workspace.evidence_sources(["S001/P001/plot-1.png"])
+
+
 def test_file_reader_rejects_sibling_with_workspace_name_prefix(tmp_path):
     workspace = Workspace(tmp_path / "work")
     sibling = tmp_path / "work-secret"
@@ -136,6 +152,66 @@ def test_notebook_export_structures_turns_and_embeds_probe_results(tmp_path):
         == base64.b64encode(b"png-data").decode()
     )
     assert notebook["cells"][4]["source"] == "**Verdict:** The prediction held."
+
+
+def test_notebook_export_comments_slurm_code_and_keeps_saved_result(tmp_path):
+    workspace = Workspace(tmp_path)
+    workspace.log_transcript("user", text="Run the batch probe")
+    code = "import os\nprint(os.environ['NOCTURNOMATH_PROBE_DIR'])"
+    probe = workspace.start_probe(
+        code, "prints the probe directory", "test", backend="slurm"
+    )
+    workspace.finish_probe(probe, "directory\n", [b"png-data"], "completed", None)
+    workspace.log_transcript(
+        "probe_started",
+        probe_id="S001/P001",
+        expected="prints the probe directory",
+        code=code,
+        backend="slurm",
+    )
+    workspace.log_transcript(
+        "run",
+        probe_id="S001/P001",
+        output="directory\n",
+        images=[".nocturnomath/sessions/S001/probes/P001/plot-1.png"],
+        status="completed",
+        backend="slurm",
+    )
+    workspace.log_transcript("probe_started", probe_id="S001/P002", code="print(3)")
+    workspace.log_transcript("run", probe_id="S001/P002", output="3\n")
+
+    notebook = workspace.export_notebook("S001")
+
+    slurm_code = notebook["cells"][2]
+    assert slurm_code["cell_type"] == "code"
+    assert slurm_code["execution_count"] is None
+    assert slurm_code["outputs"] == []
+    assert ast.parse(slurm_code["source"]).body == []
+    assert "# print(os.environ['NOCTURNOMATH_PROBE_DIR'])" in slurm_code["source"]
+    saved_result = notebook["cells"][3]
+    assert saved_result["cell_type"] == "markdown"
+    assert "directory" in saved_result["source"]
+    assert (
+        saved_result["attachments"]["plot-1.png"]["image/png"]
+        == base64.b64encode(b"png-data").decode()
+    )
+    local_code = notebook["cells"][5]
+    assert local_code["source"] == "print(3)"
+    assert local_code["execution_count"] == 1
+
+
+def test_notebook_export_identifies_uncollected_slurm_result(tmp_path):
+    workspace = Workspace(tmp_path)
+    workspace.log_transcript("user", text="Run the batch probe")
+    workspace.log_transcript(
+        "probe_started",
+        probe_id="S001/P001",
+        code="print('batch')",
+        backend="slurm",
+    )
+    notebook = workspace.export_notebook("S001")
+    assert notebook["cells"][2]["source"].endswith("# print('batch')")
+    assert notebook["cells"][3]["source"] == "Slurm result has not been collected."
 
 
 def test_documents_are_created_listed_and_edited(tmp_path):

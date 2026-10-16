@@ -6,9 +6,12 @@ import base64
 import json
 import re
 import threading
+from functools import wraps
 from typing import TYPE_CHECKING
 
 from claude_agent_sdk import tool
+
+from . import slurm
 
 if TYPE_CHECKING:
     from .session import ExplorationSession
@@ -42,11 +45,21 @@ def builds_machinery(code: str) -> bool:
 def build_tools(session: "ExplorationSession"):
     """Create the exploration and scientific record tools for a session."""
 
+    def serialize_probe_operation(handler):
+        @wraps(handler)
+        async def guarded(args):
+            if session._probe_operation_lock.locked():
+                return failure("Another probe operation is still running.")
+            async with session._probe_operation_lock:
+                return await handler(args)
+
+        return guarded
+
     @tool(
         "run",
-        "Run Python in the persistent Jupyter kernel. This is the only way to execute anything. "
+        "Run Python in the persistent Jupyter kernel. "
         "`expected` is your one-line prediction of what this will show; it is required for a new probe. "
-        "After an error, set `retry_of` to the original probe ID (for example S001/P001) "
+        "After a kernel probe error, set `retry_of` to the original probe ID (for example S001/P001) "
         "and provide corrected code to rerun that probe while preserving each attempt. "
         "A retry keeps the original prediction unless you supply a new `expected`. "
         "Use install_packages to install missing libraries into the selected research environment.",
@@ -60,6 +73,7 @@ def build_tools(session: "ExplorationSession"):
             "required": ["code"],
         },
     )
+    @serialize_probe_operation
     async def run(args):
         code = args["code"]
         expected = args.get("expected", "").strip()
@@ -281,6 +295,7 @@ def build_tools(session: "ExplorationSession"):
 
         if not session.kernel.errored:
             session._pending_verdict = expected
+            session._pending_verdict_probe_id = source_id
 
         if not session.kernel.errored and (images or text.strip()):
             session._results_since_note += 1
@@ -447,8 +462,35 @@ def build_tools(session: "ExplorationSession"):
             }
 
         expected = session._pending_verdict
-        session._pending_verdict = None
-        session.log_transcript("verdict", expected=expected, text=text)
+        probe_id = session._pending_verdict_probe_id
+        probe_path = (
+            session.workspace.sessions_path
+            / probe_id.split("/")[0]
+            / "probes"
+            / probe_id.split("/")[1]
+            / "probe.json"
+        )
+        is_slurm = json.loads(probe_path.read_text()).get("backend") == "slurm"
+        if is_slurm:
+            session.activate_session()
+            recorded = await asyncio.to_thread(
+                slurm.record_verdict,
+                session.workspace,
+                probe_id,
+                expected,
+                text,
+                session.transcript_path,
+            )
+            session._pending_verdict = None
+            session._pending_verdict_probe_id = None
+            if not recorded:
+                return failure(f"Probe {probe_id} already has a verdict.")
+        else:
+            session.log_transcript(
+                "verdict", expected=expected, text=text, probe_id=probe_id
+            )
+            session._pending_verdict = None
+            session._pending_verdict_probe_id = None
         await session.emit("probe_verdict", expected=expected, text=text)
         return {"content": [{"type": "text", "text": "Verdict recorded."}]}
 
@@ -524,6 +566,246 @@ def build_tools(session: "ExplorationSession"):
                 }
             ],
             "is_error": status != "completed",
+        }
+
+    @tool(
+        "submit_slurm",
+        "Submit a self-contained Python probe to Slurm for long or specialized compute. "
+        "The script cannot use the interactive kernel's variables. State a prediction, "
+        "then use check_slurm_job with the returned probe ID to collect the result. "
+        "The selected research Python must be available at the same path on compute nodes. "
+        "Write plots as plot-1.png, plot-2.png under NOCTURNOMATH_PROBE_DIR. "
+        "Optional result_files are simple filenames written there.",
+        {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "expected": {"type": "string"},
+                "time_minutes": {"type": "integer"},
+                "cpus": {"type": "integer"},
+                "memory_gb": {"type": "integer"},
+                "partition": {"type": "string"},
+                "gpus": {"type": "integer"},
+                "account": {"type": "string"},
+                "qos": {"type": "string"},
+                "result_files": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["code", "expected", "time_minutes", "cpus", "memory_gb"],
+        },
+    )
+    @serialize_probe_operation
+    async def submit_slurm(args):
+        if session._pending_verdict is not None:
+            return failure("Give the last probe its verdict before submitting another.")
+        if session.kernel.busy or (
+            session._probe_task and not session._probe_task.done()
+        ):
+            return failure("An operation is still running.")
+        session.activate_session()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                slurm.submit,
+                session,
+                args["code"],
+                args["expected"],
+                args["time_minutes"],
+                args["cpus"],
+                args["memory_gb"],
+                args.get("partition", ""),
+                args.get("gpus", 0),
+                args.get("account", ""),
+                args.get("qos", ""),
+                args.get("result_files", []),
+            )
+        )
+        session._probe_task = task
+        try:
+            probe_id, job_id = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, ValueError):
+                pass
+            raise
+        except slurm.SubmissionError as exc:
+            probe_id = exc.probe_id
+            probe_dir = f".nocturnomath/sessions/{probe_id.split('/')[0]}/probes/{probe_id.split('/')[1]}"
+            await session.emit(
+                "probe_start",
+                probe_id=probe_id,
+                expected=args["expected"],
+                code=args["code"],
+                code_path=f"{probe_dir}/code.py",
+            )
+            await session.emit(
+                "probe_finish",
+                probe_id=probe_id,
+                expected=args["expected"],
+                code=args["code"],
+                code_path=f"{probe_dir}/code.py",
+                output=str(exc),
+                text=str(exc),
+                status="slurm-error",
+                execution_note=None,
+                plot_paths=[],
+                plot_urls=[],
+                plot_images=[],
+            )
+            return failure(str(exc))
+        except ValueError as exc:
+            return failure(str(exc))
+        finally:
+            if task.done():
+                session._probe_task = None
+        probe_dir = f".nocturnomath/sessions/{probe_id.split('/')[0]}/probes/{probe_id.split('/')[1]}"
+        await session.emit(
+            "probe_start",
+            probe_id=probe_id,
+            expected=args["expected"],
+            code=args["code"],
+            code_path=f"{probe_dir}/code.py",
+        )
+        await session.emit(
+            "probe_finish",
+            probe_id=probe_id,
+            expected=args["expected"],
+            code=args["code"],
+            code_path=f"{probe_dir}/code.py",
+            output=f"Slurm job {job_id} submitted. Use check_slurm_job with {probe_id}.",
+            text=f"Slurm job {job_id} submitted.",
+            status="slurm-submitted",
+            execution_note=None,
+            plot_paths=[],
+            plot_urls=[],
+            plot_images=[],
+        )
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Probe {probe_id}: Slurm job {job_id} submitted. "
+                    f"Script: {probe_id}/code.py. Check with check_slurm_job. "
+                    "Do not give a verdict until its output is collected.",
+                }
+            ]
+        }
+
+    @tool(
+        "check_slurm_job",
+        "Check a saved Slurm probe by ID (for example S001/P001), or omit the ID "
+        "to list saved jobs. This does not use the Python kernel or start a new probe. "
+        "A finished job's stdout, stderr, and exit status are saved as probe output. "
+        "If final files are still appearing, check again after the finishing status.",
+        {
+            "type": "object",
+            "properties": {"probe_id": {"type": "string"}},
+        },
+    )
+    @serialize_probe_operation
+    async def check_slurm_job(args):
+        probe_id = args.get("probe_id")
+        if not probe_id:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(slurm.list_jobs(session.workspace)),
+                    }
+                ]
+            }
+        if (
+            session._pending_verdict is not None
+            and session._pending_verdict_probe_id != probe_id
+        ):
+            return failure(
+                "Give the pending probe "
+                f"{session._pending_verdict_probe_id} its verdict before checking "
+                f"{probe_id}."
+            )
+        session.activate_session()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                slurm.check, session.workspace, probe_id, session.transcript_path
+            )
+        )
+        try:
+            metadata, _ = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, ValueError):
+                pass
+            raise
+        except ValueError as exc:
+            return failure(str(exc))
+        status = metadata["status"]
+        state = metadata.get("slurm_state", "UNKNOWN")
+        probe = (
+            session.workspace.sessions_path
+            / probe_id.split("/")[0]
+            / "probes"
+            / probe_id.split("/")[1]
+        )
+        plot_files = sorted(probe.glob("plot-*.png"))
+        plot_paths = [
+            str(path.relative_to(session.workspace.path)) for path in plot_files
+        ]
+        terminal = status in ("completed", "error")
+        if terminal:
+            output = (probe / "output.txt").read_text()
+            await session.emit(
+                "probe_finish",
+                probe_id=probe_id,
+                expected=metadata["expected"],
+                code=(probe / "code.py").read_text(),
+                code_path=str((probe / "code.py").relative_to(session.workspace.path)),
+                output=f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}",
+                text=output,
+                status="slurm-error" if status == "error" else status,
+                execution_note=metadata.get("execution_note"),
+                plot_paths=plot_paths,
+                plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
+                plot_images=[
+                    base64.b64encode(path.read_bytes()).decode()
+                    for path in plot_files[: session.image_cap]
+                ],
+            )
+        if terminal:
+            records = session.workspace.read_transcript(
+                session.workspace.transcript_file(probe_id.split("/")[0])
+            )
+            reviewed = any(
+                record.get("kind") == "verdict" and record.get("probe_id") == probe_id
+                for record in records
+            )
+            if not reviewed and session._pending_verdict is None:
+                session._pending_verdict = metadata["expected"]
+                session._pending_verdict_probe_id = probe_id
+            output = (probe / "output.txt").read_text()
+            message = f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}"
+            if plot_paths:
+                message += "\n" + "\n".join(
+                    f"Source: {probe_id}/{path.name}" for path in plot_files
+                )
+            if not reviewed:
+                message += f"\nGive a verdict against: {metadata['expected']}"
+            content = [{"type": "text", "text": message}]
+            for path in plot_files[: session.image_cap]:
+                content.append(
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(path.read_bytes()).decode(),
+                        "mimeType": "image/png",
+                    }
+                )
+            return {"content": content}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Probe {probe_id}: {state} ({status}), Slurm job {metadata['job_id']}.",
+                }
+            ]
         }
 
     @tool(
@@ -611,6 +893,8 @@ def build_tools(session: "ExplorationSession"):
         verdict,
         restart_kernel,
         install_packages,
+        submit_slurm,
+        check_slurm_job,
         save_document,
         list_documents,
         read_document,

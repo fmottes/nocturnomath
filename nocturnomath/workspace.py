@@ -185,6 +185,11 @@ class Workspace:
         probe = self.probes_path / match.group(1)
         if not (probe / "probe.json").is_file():
             raise ValueError(f"Probe {probe_id} does not exist.")
+        if json.loads((probe / "probe.json").read_text()).get("backend") == "slurm":
+            raise ValueError(
+                "A Slurm probe cannot run in the persistent kernel. "
+                "Correct the script and call submit_slurm for a new probe."
+            )
         if not expected:
             expected = json.loads((probe / "probe.json").read_text())["expected"]
         attempts = sorted(
@@ -254,7 +259,13 @@ class Workspace:
             ):
                 raise ValueError(f"Source does not exist: {source}.")
             metadata = json.loads((artifact.parent / "probe.json").read_text())
-            if metadata["status"] == "started":
+            if metadata["status"] not in (
+                "completed",
+                "error",
+                "failed",
+                "incomplete",
+                "interrupted",
+            ):
                 raise ValueError(
                     f"Probe {artifact.parent.name} has no recorded outcome yet."
                 )
@@ -543,6 +554,11 @@ class Workspace:
             for record in records
             if record.get("kind") in ("run", "probe_failed")
         }
+        started_probes = {
+            record.get("probe_id")
+            for record in records
+            if record.get("kind") == "probe_started"
+        }
         cells: list[dict[str, Any]] = []
         turn = 0
         idea = 0
@@ -551,14 +567,14 @@ class Workspace:
         pending_agent: list[str] = []
 
         def markdown(source: str, kind: str, **metadata):
-            cells.append(
-                {
-                    "cell_type": "markdown",
-                    "id": f"cell-{len(cells) + 1}",
-                    "metadata": {"nocturnomath": {"kind": kind, **metadata}},
-                    "source": source,
-                }
-            )
+            cell = {
+                "cell_type": "markdown",
+                "id": f"cell-{len(cells) + 1}",
+                "metadata": {"nocturnomath": {"kind": kind, **metadata}},
+                "source": source,
+            }
+            cells.append(cell)
+            return cell
 
         def flush_agent():
             nonlocal idea
@@ -568,6 +584,52 @@ class Workspace:
             body = "\n\n".join(pending_agent)
             pending_agent.clear()
             markdown(f"## Idea {turn}.{idea}\n\n{body}", "agent", turn=turn)
+
+        def slurm_cells(probe_id: str, code: str, outcome: dict[str, Any]):
+            commented = "\n".join(f"# {line}" for line in code.splitlines())
+            cells.append(
+                {
+                    "cell_type": "code",
+                    "execution_count": None,
+                    "id": f"cell-{len(cells) + 1}",
+                    "metadata": {
+                        "nocturnomath": {
+                            "kind": "probe_code",
+                            "backend": "slurm",
+                            "probe_id": probe_id,
+                            "status": outcome.get("status", "no recorded outcome"),
+                        }
+                    },
+                    "outputs": [],
+                    "source": (
+                        "# Slurm probe saved for inspection; Run All does not rerun it.\n"
+                        + commented
+                    ),
+                }
+            )
+            if not outcome:
+                markdown(
+                    "Slurm result has not been collected.",
+                    "slurm_result",
+                    probe_id=probe_id,
+                )
+                return
+            result_lines = [f"**Saved Slurm result:** `{probe_id}/output.txt`"]
+            attachments = {}
+            for item in self._notebook_outputs(outcome):
+                if item["output_type"] == "stream":
+                    result_lines.append(
+                        "\n".join(f"    {line}" for line in item["text"].splitlines())
+                    )
+                elif item["output_type"] == "display_data":
+                    name = f"plot-{len(attachments) + 1}.png"
+                    attachments[name] = item["data"]
+                    result_lines.append(f"![{name}](attachment:{name})")
+            result = markdown(
+                "\n\n".join(result_lines), "slurm_result", probe_id=probe_id
+            )
+            if attachments:
+                result["attachments"] = attachments
 
         for record in records:
             kind = record.get("kind")
@@ -607,6 +669,9 @@ class Workspace:
                     probe_id=probe_id,
                 )
                 outcome = outcomes.get(probe_id, {})
+                if record.get("backend") == "slurm":
+                    slurm_cells(probe_id, record.get("code", ""), outcome)
+                    continue
                 outputs = self._notebook_outputs(outcome)
                 execution_count += 1
                 cells.append(
@@ -630,6 +695,19 @@ class Workspace:
                         "source": record.get("code", ""),
                     }
                 )
+            elif (
+                kind == "run"
+                and record.get("backend") == "slurm"
+                and record.get("probe_id") not in started_probes
+            ):
+                probe_id = record["probe_id"]
+                markdown(
+                    f"### Slurm probe {probe_id} checked in this session\n\n"
+                    f"**Prediction:** {record.get('expected', '')}",
+                    "probe",
+                    probe_id=probe_id,
+                )
+                slurm_cells(probe_id, record.get("code", ""), record)
             elif kind == "verdict":
                 markdown(
                     f"**Verdict:** {record.get('text', '')}",
