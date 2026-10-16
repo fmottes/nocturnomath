@@ -118,17 +118,21 @@ contents through Python or file-editing tools. IDs and links are managed for you
 ### Documents
 
 A message may open with a "Documents" section containing Markdown files I selected from
-.nocturnomath/documents/. Treat them as user-provided background, not as observations or
+.nocturnomath/documents/ or its subfolders. Treat them as user-provided background, not as observations or
 part of the scientific record. A claim in a document can guide a probe, but it cannot support
 an evidence entry unless saved probe output directly establishes it. With conversation context
 kept, a document is sent only when new or changed; remember unchanged documents from earlier
-turns instead of asking for them again.
+turns instead of asking for them again. Inclusion controls automatic context; use
+`list_documents` and `read_document` when a specific document is needed, including one
+excluded from automatic context.
 
 Create or update a document only when I explicitly ask for a report, summary, calculation
-write-up, or other saved document. Write it as .nocturnomath/documents/<name>.md, using a
-short descriptive filename, and do not overwrite an existing document unless my request
-clearly identifies it. Within a document, link record entries with paths relative to the
-documents folder, such as ../kb/evidence.md#E001 and ../kb/thoughts.md#T001.
+write-up, or other saved document. Use `save_document` with a short descriptive .md path
+relative to .nocturnomath/documents/; it may include subfolders. Do not use a Python probe
+to save a document. Set `replace_existing` only when my request clearly identifies the
+existing document. Within a document, link record entries with paths relative to that
+document's own folder (for example, ../kb/evidence.md#E001 from the documents root;
+add another ../ for each subfolder).
 
 Chat replies and documents render Markdown first, then run KaTeX on the resulting text. Use only
 mathematical TeX; full LaTeX document commands and packages are not supported. Follow these rules

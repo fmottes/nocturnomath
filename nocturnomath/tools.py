@@ -526,6 +526,77 @@ def build_tools(session: "ExplorationSession"):
             "is_error": status != "completed",
         }
 
+    @tool(
+        "save_document",
+        "Create or revise a Markdown document under .nocturnomath/documents/ without a probe. "
+        "Use a relative path ending in .md, such as reports/summary.md. "
+        "Set replace_existing to true only when the user clearly identifies an existing document; "
+        "false creates a new document and refuses to overwrite one.",
+        {"path": str, "text": str, "replace_existing": bool},
+    )
+    async def save_document(args):
+        path = args["path"]
+        replace_existing = args["replace_existing"]
+        try:
+            session.workspace.save_document(path, args["text"], replace_existing)
+        except (ValueError, OSError) as exc:
+            return failure(str(exc))
+        action = "Revised" if replace_existing else "Created"
+        return {
+            "content": [
+                {"type": "text", "text": f"{action} .nocturnomath/documents/{path}."}
+            ]
+        }
+
+    @tool(
+        "list_documents",
+        "List Markdown documents and folders under .nocturnomath/documents/, including "
+        "documents excluded from automatic message context. Paths are relative to that folder.",
+        {},
+    )
+    async def list_documents(args):
+        try:
+            documents = [
+                {"name": document["name"], "included": document["included"]}
+                for document in session.list_documents()
+            ]
+            folders = session.workspace.list_document_folders()
+        except (ValueError, OSError) as exc:
+            return failure(str(exc))
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "documents": documents,
+                            "folders": folders,
+                        }
+                    ),
+                }
+            ]
+        }
+
+    @tool(
+        "read_document",
+        "Read one Markdown document by its path relative to .nocturnomath/documents/, "
+        "including documents excluded from automatic message context.",
+        {"path": str},
+    )
+    async def read_document(args):
+        try:
+            document = session.workspace.read_document(args["path"])
+        except (ValueError, OSError) as exc:
+            return failure(str(exc))
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"{document['path']}\n\n{document['content']}",
+                }
+            ]
+        }
+
     return [
         run,
         evidence,
@@ -534,4 +605,7 @@ def build_tools(session: "ExplorationSession"):
         verdict,
         restart_kernel,
         install_packages,
+        save_document,
+        list_documents,
+        read_document,
     ]

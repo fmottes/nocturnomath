@@ -1,7 +1,9 @@
 """Numbered scientific records stored directly in two Markdown files."""
 
+import os
 import re
 import threading
+import uuid
 from pathlib import Path
 
 ENTRY = re.compile(r"^## ([ET]\d+)\n", re.MULTILINE)
@@ -19,9 +21,14 @@ def _lock_for(directory: Path) -> threading.RLock:
 
 def write_text(path: Path, text: str):
     """Publish a whole file without exposing a partially written record."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(text)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class ResearchNotes:

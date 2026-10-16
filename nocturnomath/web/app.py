@@ -61,6 +61,11 @@ class SessionResumeRequest(BaseModel):
 class DocumentCreateRequest(BaseModel):
     title: str
     text: str = ""
+    folder: str = ""
+
+
+class DocumentFolderCreateRequest(BaseModel):
+    path: str
 
 
 class DocumentWriteRequest(BaseModel):
@@ -414,6 +419,7 @@ def create_app(
     def documents_payload(session: ExplorationSession):
         return {
             "documents": session.list_documents(),
+            "folders": session.workspace.list_document_folders(),
             "documents_default": session.documents_default,
         }
 
@@ -427,12 +433,29 @@ def create_app(
     ):
         session = active_session(agent_id)
         try:
-            name = session.workspace.create_document(request.title, request.text)
+            name = session.workspace.create_document(
+                request.title, request.text, request.folder
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"name": name, **documents_payload(session)}
+
+    @app.post("/api/document-folders", status_code=201)
+    async def create_document_folder(
+        request: DocumentFolderCreateRequest, agent_id: str | None = None
+    ):
+        session = active_session(agent_id)
+        try:
+            path = session.workspace.create_document_folder(request.path)
         except FileExistsError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return {"name": name, **documents_payload(session)}
+        return {"path": path, **documents_payload(session)}
 
     @app.post("/api/documents/default")
     async def set_documents_default(
@@ -446,7 +469,7 @@ def create_app(
                 other.document_choices = {}
         return documents_payload(session)
 
-    @app.get("/api/documents/{name}")
+    @app.get("/api/documents/{name:path}")
     async def read_document(name: str, agent_id: str | None = None):
         session = active_session(agent_id)
         try:
@@ -456,7 +479,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-    @app.put("/api/documents/{name}")
+    @app.put("/api/documents/{name:path}")
     async def write_document(
         name: str, request: DocumentWriteRequest, agent_id: str | None = None
     ):
@@ -469,7 +492,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-    @app.delete("/api/documents/{name}")
+    @app.delete("/api/documents/{name:path}")
     async def delete_document(name: str, agent_id: str | None = None):
         session = active_session(agent_id)
         try:
@@ -484,7 +507,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
         return documents_payload(session)
 
-    @app.post("/api/documents/{name}/include")
+    @app.post("/api/documents/{name:path}/include")
     async def include_document(
         name: str, request: DocumentIncludeRequest, agent_id: str | None = None
     ):

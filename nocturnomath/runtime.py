@@ -381,6 +381,7 @@ class Runtime:
             "is_busy": session.has_active_query() or agent_id in self._changing_agents,
             "status": session.status,
             "documents": session.list_documents(),
+            "folders": session.workspace.list_document_folders(),
             "documents_default": session.documents_default,
         }
 
@@ -486,6 +487,7 @@ class Runtime:
             "carry_chat_context": session.carry_chat_context,
             "context_usage": session.context_usage,
             "documents": session.list_documents(),
+            "folders": session.workspace.list_document_folders(),
             "documents_default": session.documents_default,
             "plots": session.list_plots(),
             "agents": [self.agent_snapshot(agent_id) for agent_id in self.agents],

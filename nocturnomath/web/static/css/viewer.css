@@ -373,6 +373,24 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.documents-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: auto;
+  white-space: nowrap;
+  color: var(--ink-faint);
+}
+.documents-breadcrumbs button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  cursor: pointer;
+}
+.documents-breadcrumbs button:disabled { color: var(--ink); cursor: default; }
 .documents-toolbar-actions { display: flex; gap: 6px; margin-left: auto; flex-shrink: 0; }
 .documents-hint {
   margin: 0;
@@ -382,6 +400,8 @@
   color: var(--ink-faint);
 }
 .documents-list { display: flex; flex-direction: column; padding: 8px 22px 40px; }
+.documents-folder-form { display: flex; gap: 8px; padding: 10px 22px 0; }
+.documents-folder-form input { flex: 1; min-width: 0; }
 .document-row {
   display: flex;
   align-items: center;

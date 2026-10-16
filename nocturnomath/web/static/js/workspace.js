@@ -1,8 +1,8 @@
-import { elements, state } from "./state.js?v=20261016-1";
+import { elements, state } from "./state.js?v=20261016-3";
 import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
-import { openLightbox } from "./ui.js?v=20261016-1";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-1";
+import { openLightbox } from "./ui.js?v=20261016-3";
+import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-3";
 
 // ============================================================================
 // Workspace & Files Management
@@ -18,6 +18,7 @@ export function applyWorkspace(ws) {
     state.documentContent = null;
     state.documentPath = null;
     state.openDocumentContent = null;
+    state.documentsFolder = "";
     state.sessionDefaults = null;
     elements.modelSelect.value = "";
     elements.effortSelect.value = "";
@@ -56,7 +57,7 @@ export function applyWorkspace(ws) {
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
     state.activeDoc = ws.evidence_path;
   }
-  setDocuments(selected?.documents || [], selected?.documents_default);
+  setDocuments(selected?.documents || [], selected?.documents_default, selected?.folders || []);
 
   // Refresh the record view without pulling the user off the figures or documents tab.
   loadDocument(state.activeDoc, "", ["plots", "documents"].includes(state.activeTab));

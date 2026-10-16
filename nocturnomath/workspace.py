@@ -269,10 +269,12 @@ class Workspace:
 
     def list_documents(self) -> list[dict[str, Any]]:
         """Markdown documents kept as extra context under .nocturnomath/documents/."""
+        self.document_folder("")
         documents = []
-        for path in sorted(self.documents_path.iterdir(), key=lambda p: p.name.lower()):
+        for path in self.documents_path.rglob("*.md"):
+            name = path.relative_to(self.documents_path).as_posix()
             try:
-                path = self.document_file(path.name)
+                path = self.document_file(name)
             except ValueError:
                 continue
             if not path.is_file():
@@ -280,26 +282,73 @@ class Workspace:
             stat = path.stat()
             documents.append(
                 {
-                    "name": path.name,
+                    "name": name,
                     "path": str(path.relative_to(self.path)),
                     "size": stat.st_size,
                     "modified": stat.st_mtime,
                 }
             )
-        return documents
+        return sorted(documents, key=lambda document: document["name"].lower())
+
+    def list_document_folders(self) -> list[str]:
+        """Return valid subfolders, including empty ones."""
+        self.document_folder("")
+        folders = []
+        for path in self.documents_path.rglob("*"):
+            name = path.relative_to(self.documents_path).as_posix()
+            try:
+                self.document_folder(name)
+            except ValueError:
+                continue
+            if path.is_dir():
+                folders.append(name)
+        return sorted(folders, key=str.lower)
+
+    def document_folder(self, name: str) -> Path:
+        if not isinstance(name, str):
+            raise TypeError("Use a folder path under documents.")
+        if self.nocturnomath_path.is_symlink() or self.documents_path.is_symlink():
+            raise ValueError("Document symlinks are not supported.")
+        if not name:
+            return self.documents_path
+        parts = name.split("/")
+        if any(
+            not part
+            or part != part.strip()
+            or part.startswith(".")
+            or "\\" in part
+            or "\0" in part
+            for part in parts
+        ):
+            raise ValueError("Use a folder path under documents.")
+        path = self.documents_path
+        for part in parts:
+            path /= part
+            if path.is_symlink():
+                raise ValueError("Document symlinks are not supported.")
+            if path.exists() and not path.is_dir():
+                raise ValueError("A document path component is not a folder.")
+        return path
 
     def document_file(self, name: str) -> Path:
         if (
-            not name
+            not isinstance(name, str)
+            or not name
             or name != name.strip()
-            or name.startswith(".")
+            or name.startswith("/")
             or not name.endswith(".md")
-            or "/" in name
-            or "\\" in name
-            or "\0" in name
         ):
             raise ValueError("Use a document name such as report.md.")
-        path = self.documents_path / name
+        folder, _, filename = name.rpartition("/")
+        if (
+            not filename
+            or filename != filename.strip()
+            or filename.startswith(".")
+            or "\\" in filename
+            or "\0" in filename
+        ):
+            raise ValueError("Use a document name such as report.md.")
+        path = self.document_folder(folder) / filename
         if path.is_symlink():
             raise ValueError("Document symlinks are not supported.")
         return path
@@ -324,19 +373,36 @@ class Workspace:
             raise ValueError("Give the document a title.")
         return slug if slug.endswith(".md") else slug + ".md"
 
-    def create_document(self, title: str, text: str) -> str:
-        name = self.document_name(title)
-        path = self.document_file(name)
-        if path.exists():
-            raise FileExistsError(f"Document {name} already exists")
-        write_text(path, text if text.endswith("\n") else text + "\n")
+    def create_document(self, title: str, text: str, folder: str = "") -> str:
+        directory = self.document_folder(folder)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"Folder {folder} not found")
+        name = "/".join(part for part in (folder, self.document_name(title)) if part)
+        self.save_document(name, text)
         return name
 
-    def write_document(self, name: str, text: str):
+    def save_document(self, name: str, text: str, replace_existing: bool = False):
         path = self.document_file(name)
-        if not path.is_file():
-            raise FileNotFoundError(f"Document {name} not found")
+        if replace_existing:
+            if not path.is_file():
+                raise FileNotFoundError(f"Document {name} not found")
+        elif path.exists():
+            raise FileExistsError(f"Document {name} already exists")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
         write_text(path, text if text.endswith("\n") else text + "\n")
+
+    def write_document(self, name: str, text: str):
+        self.save_document(name, text, replace_existing=True)
+
+    def create_document_folder(self, name: str) -> str:
+        if not name:
+            raise ValueError("Give the folder a name.")
+        path = self.document_folder(name)
+        if path.exists():
+            raise FileExistsError(f"Folder {name} already exists")
+        path.mkdir(parents=True)
+        return name
 
     def delete_document(self, name: str):
         path = self.document_file(name)

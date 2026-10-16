@@ -165,7 +165,7 @@ def test_documents_are_created_listed_and_edited(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         workspace.read_document("missing.md")
-    for bad in ("../config.json", "kb/evidence.md", "notes.txt", ".hidden.md"):
+    for bad in ("../config.json", "notes.txt", ".hidden.md"):
         with pytest.raises(ValueError):
             workspace.document_file(bad)
 
@@ -177,3 +177,89 @@ def test_documents_are_created_listed_and_edited(tmp_path):
     with pytest.raises(ValueError, match="symlinks"):
         workspace.write_document("linked.md", "changed")
     assert outside.read_text() == "outside\n"
+
+
+def test_nested_documents_and_folders(tmp_path):
+    workspace = Workspace(tmp_path)
+    assert workspace.create_document_folder("reports") == "reports"
+    assert workspace.create_document_folder("reports/2026") == "reports/2026"
+    assert workspace.list_document_folders() == ["reports", "reports/2026"]
+
+    name = workspace.create_document("Field notes", "First", "reports/2026")
+    assert name == "reports/2026/Field-notes.md"
+    assert workspace.read_document(name)["content"] == "First\n"
+    assert [item["name"] for item in workspace.list_documents()] == [name]
+
+    workspace.save_document("drafts/topic/summary.md", "Draft")
+    assert workspace.list_document_folders() == [
+        "drafts",
+        "drafts/topic",
+        "reports",
+        "reports/2026",
+    ]
+    assert workspace.read_document("drafts/topic/summary.md")["content"] == "Draft\n"
+    with pytest.raises(FileExistsError):
+        workspace.save_document("drafts/topic/summary.md", "Accidental overwrite")
+    workspace.save_document("drafts/topic/summary.md", "Revised", replace_existing=True)
+    assert workspace.read_document("drafts/topic/summary.md")["content"] == "Revised\n"
+    with pytest.raises(FileNotFoundError):
+        workspace.save_document("missing.md", "No document", replace_existing=True)
+
+
+def test_document_paths_reject_traversal_hidden_paths_and_symlinks(tmp_path):
+    workspace = Workspace(tmp_path)
+    for bad in (
+        "/absolute.md",
+        "../escape.md",
+        "a/../escape.md",
+        "a//file.md",
+        ".hidden/file.md",
+        "a/.hidden.md",
+        "a\\file.md",
+        "a/ file.md",
+    ):
+        with pytest.raises(ValueError):
+            workspace.document_file(bad)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = workspace.documents_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinks"):
+        workspace.save_document("linked/file.md", "unsafe")
+    assert not (outside / "file.md").exists()
+    assert "linked" not in workspace.list_document_folders()
+
+    (workspace.documents_path / "regular.md").write_text("content")
+    with pytest.raises(ValueError, match="not a folder"):
+        workspace.create_document_folder("regular.md/child")
+
+
+def test_document_root_symlink_cannot_redirect_document_access(tmp_path):
+    workspace = Workspace(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    workspace.documents_path.rmdir()
+    workspace.documents_path.symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinks"):
+        workspace.save_document("report.md", "unsafe")
+    with pytest.raises(ValueError, match="symlinks"):
+        workspace.list_documents()
+    with pytest.raises(ValueError, match="symlinks"):
+        workspace.list_document_folders()
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_document_write_ignores_symlink_at_old_temporary_name(tmp_path):
+    workspace = Workspace(tmp_path)
+    evidence = workspace.notes.evidence_path
+    original_evidence = evidence.read_text()
+    temporary = workspace.documents_path / "report.md.tmp"
+    temporary.symlink_to(evidence)
+
+    workspace.save_document("report.md", "First")
+    workspace.save_document("report.md", "Revised", replace_existing=True)
+
+    assert workspace.read_document("report.md")["content"] == "Revised\n"
+    assert evidence.read_text() == original_evidence
+    assert temporary.is_symlink()

@@ -25,7 +25,7 @@
   <link rel="stylesheet" href="/static/css/layout.css">
   <link rel="stylesheet" href="/static/css/chat.css">
   <link rel="stylesheet" href="/static/css/viewer.css">
-  <link rel="stylesheet" href="/static/css/modals.css?v=20261016-2">
+  <link rel="stylesheet" href="/static/css/modals.css?v=20261016-3">
   <link rel="stylesheet" href="/static/css/lightbox.css">
   <link rel="stylesheet" href="/static/css/responsive.css">
 </head>
@@ -245,14 +245,21 @@
             <div class="documents-toolbar">
               <button class="btn btn-xs btn-ghost hidden" id="documents-back" type="button" title="Back to the document list" aria-label="Back to the document list">&larr;</button>
               <span class="documents-title" id="documents-title">Documents</span>
+              <nav class="documents-breadcrumbs" id="documents-breadcrumbs" aria-label="Document folder"></nav>
               <span class="doc-meta-label" id="documents-meta"></span>
               <div class="documents-toolbar-actions">
                 <button class="btn btn-xs btn-outline hidden" id="documents-modify" type="button">Modify</button>
+                <button class="btn btn-xs btn-outline" id="documents-new-folder" type="button">New folder</button>
                 <button class="btn btn-xs btn-outline" id="documents-new" type="button">New document</button>
               </div>
             </div>
             <p class="documents-hint" id="documents-hint">Checked documents are sent with the next message.</p>
             <p class="folder-picker-error hidden" id="documents-error" role="alert"></p>
+            <form class="documents-folder-form hidden" id="documents-folder-form">
+              <input id="documents-folder-name" class="form-input" type="text" placeholder="Folder name" aria-label="New folder name" spellcheck="false" autocomplete="off">
+              <button class="btn btn-xs btn-primary" type="submit">Create</button>
+              <button class="btn btn-xs btn-ghost" id="documents-folder-cancel" type="button">Cancel</button>
+            </form>
             <div class="documents-list" id="documents-list"></div>
             <article class="markdown-body hidden" id="documents-markdown"></article>
             <form class="documents-editor hidden" id="documents-editor">
@@ -465,7 +472,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261016-2"></script>
+  <script type="module" src="/static/js/main.js?v=20261016-3"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

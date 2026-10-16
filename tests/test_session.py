@@ -373,7 +373,6 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
 
         await session.query("second")
         assert "inputs.md" not in FakeClient.prompts[-1]
-
         (documents / "inputs.md").write_text("# Inputs\n\nN = 20\n")
         await session.query("third")
         third = FakeClient.prompts[-1]
@@ -392,6 +391,29 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
         assert "N = 30" in FakeClient.prompts[-1]
         await session.query("sixth")
         assert "inputs.md" not in FakeClient.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_nested_document_saved_by_tool_enters_next_message_context(session):
+    save = next(tool for tool in session.tools if tool.name == "save_document")
+    await save.handler(
+        {"path": "reports/summary.md", "text": "# Summary", "replace_existing": False}
+    )
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("Read the report")
+        assert "### reports/summary.md\n\n# Summary\n" in FakeClient.prompts[-1]
+        await session.query("Continue")
+        assert "### reports/summary.md" not in FakeClient.prompts[-1]
+
+        await save.handler(
+            {
+                "path": "reports/summary.md",
+                "text": "# Updated",
+                "replace_existing": True,
+            }
+        )
+        await session.query("Continue again")
+        assert "### reports/summary.md\n\n# Updated\n" in FakeClient.prompts[-1]
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from nocturnomath.tools import builds_machinery, switches_backend
@@ -16,6 +18,60 @@ def test_code_policy_checks():
     assert not switches_backend("%matplotlib inline")
     assert builds_machinery("class Model:\n    pass")
     assert not builds_machinery("def load(): pass\ndef plot(): pass")
+
+
+@pytest.mark.asyncio
+async def test_document_tools_use_nested_paths_without_running_a_probe(session):
+    tools = tools_by_name(session)
+    save = tools["save_document"].handler
+    result = await save(
+        {
+            "path": "reports/2026/result.md",
+            "text": "# Result",
+            "replace_existing": False,
+        }
+    )
+    assert (
+        "Created .nocturnomath/documents/reports/2026/result.md"
+        in result["content"][0]["text"]
+    )
+    assert not session.workspace.probes_path.exists()
+    assert session.kernel.executed_codes == []
+    assert session._pending_verdict is None
+
+    session.set_document_included("reports/2026/result.md", False)
+    listed = await tools["list_documents"].handler({})
+    data = json.loads(listed["content"][0]["text"])
+    assert data["folders"] == ["reports", "reports/2026"]
+    assert data["documents"][0]["name"] == "reports/2026/result.md"
+    assert data["documents"][0]["included"] is False
+    read = await tools["read_document"].handler({"path": "reports/2026/result.md"})
+    assert "# Result\n" in read["content"][0]["text"]
+
+    duplicate = await save(
+        {"path": "reports/2026/result.md", "text": "No", "replace_existing": False}
+    )
+    assert duplicate["is_error"] is True
+    revised = await save(
+        {
+            "path": "reports/2026/result.md",
+            "text": "# Revised",
+            "replace_existing": True,
+        }
+    )
+    assert "Revised" in revised["content"][0]["text"]
+    assert (
+        session.workspace.read_document("reports/2026/result.md")["content"]
+        == "# Revised\n"
+    )
+    missing = await tools["read_document"].handler({"path": "missing.md"})
+    assert missing["is_error"] is True
+    for path in ("../kb/evidence.md", ".nocturnomath/kb/evidence.md"):
+        assert (await tools["read_document"].handler({"path": path}))["is_error"]
+        assert (
+            await save({"path": path, "text": "unsafe", "replace_existing": False})
+        )["is_error"]
+    assert session.workspace.notes.evidence_path.read_text().startswith("# Evidence")
 
 
 @pytest.mark.asyncio

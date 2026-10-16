@@ -1,9 +1,9 @@
-import { elements, state } from "./state.js?v=20261016-1";
+import { elements, state } from "./state.js?v=20261016-3";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
-import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20261016-1";
+import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20261016-3";
 
 // ============================================================================
-// Documents tab: a list of .nocturnomath/documents/*.md with a checkbox that
+// Documents tab: a folder browser for .nocturnomath/documents/ with a checkbox that
 // decides whether each one travels with the next message, a reader, and a
 // minimal editor. Views: "list", "read", "edit" (existing), "create" (new).
 // ============================================================================
@@ -14,15 +14,24 @@ function agentQuery() {
   return state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
 }
 
-export function setDocuments(documents = [], documentsDefault = state.documentsDefault) {
+export function setDocuments(documents = [], documentsDefault = state.documentsDefault, folders = state.documentFolders) {
   state.documents = documents;
+  state.documentFolders = folders;
   state.documentsDefault = Boolean(documentsDefault);
   elements.documentsDefaultToggle.checked = state.documentsDefault;
-  const signature = JSON.stringify(documents.map((d) => [d.name, d.included, d.modified, d.size]));
+  while (state.documentsFolder && !folders.includes(state.documentsFolder)) {
+    state.documentsFolder = parentFolder(state.documentsFolder);
+  }
+  const signature = JSON.stringify({
+    documents: documents.map((d) => [d.name, d.included, d.modified, d.size]),
+    folders,
+    current: state.documentsFolder,
+  });
   if (signature !== listSignature) {
     listSignature = signature;
     renderDocumentsList();
   }
+  renderBreadcrumbs();
   if (state.openDocument && !documents.some((d) => d.name === state.openDocument)) {
     showDocumentsView("list");
   }
@@ -32,7 +41,45 @@ export async function fetchDocuments() {
   const res = await fetch(`/api/documents${agentQuery()}`);
   if (!res.ok) return;
   const data = await res.json();
-  setDocuments(data.documents || [], data.documents_default);
+  setDocuments(data.documents || [], data.documents_default, data.folders || []);
+}
+
+function parentFolder(path) {
+  return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+}
+
+function renderBreadcrumbs() {
+  const nav = elements.documentsBreadcrumbs;
+  nav.replaceChildren();
+  const crumbs = [{ path: "", label: "Documents" }];
+  let path = "";
+  for (const part of state.documentsFolder.split("/").filter(Boolean)) {
+    path = path ? `${path}/${part}` : part;
+    crumbs.push({ path, label: part });
+  }
+  crumbs.forEach((crumb, index) => {
+    if (index) {
+      const separator = document.createElement("span");
+      separator.textContent = "/";
+      separator.setAttribute("aria-hidden", "true");
+      nav.append(separator);
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = crumb.label;
+    button.disabled = crumb.path === state.documentsFolder && state.documentsView === "list";
+    button.addEventListener("click", () => navigateFolder(crumb.path));
+    nav.append(button);
+  });
+}
+
+export function navigateFolder(path) {
+  if (path && !state.documentFolders.includes(path)) return;
+  state.documentsFolder = path;
+  listSignature = null;
+  showDocumentsView("list");
+  renderDocumentsList();
+  renderBreadcrumbs();
 }
 
 export function showDocumentsView(view) {
@@ -47,11 +94,14 @@ export function showDocumentsView(view) {
   elements.documentsEditorTitle.classList.toggle("hidden", view !== "create");
   elements.documentsBack.classList.toggle("hidden", view === "list");
   elements.documentsNew.classList.toggle("hidden", view !== "list");
+  elements.documentsNewFolder.classList.toggle("hidden", view !== "list");
+  if (view !== "list") elements.documentsFolderForm.classList.add("hidden");
   elements.documentsModify.classList.toggle("hidden", !reading);
   elements.documentsError.classList.add("hidden");
-  elements.documentsTitle.textContent = view === "list" ? "Documents"
-    : view === "create" ? "New document" : state.openDocument || "";
+  elements.documentsTitle.textContent = view === "list" ? "Folder"
+    : view === "create" ? "New document" : state.openDocument?.split("/").at(-1) || "";
   if (!reading) elements.documentsMeta.textContent = "";
+  renderBreadcrumbs();
 }
 
 function formatMeta(document) {
@@ -64,14 +114,27 @@ function formatMeta(document) {
 function renderDocumentsList() {
   const list = elements.documentsList;
   list.replaceChildren();
-  if (!state.documents.length) {
+  const folders = state.documentFolders.filter((path) => parentFolder(path) === state.documentsFolder);
+  const documents = state.documents.filter((doc) => parentFolder(doc.name) === state.documentsFolder);
+  if (!folders.length && !documents.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No documents yet. Create one, or drop Markdown files in .nocturnomath/documents/.";
+    empty.textContent = "This folder is empty. Create a document or folder here.";
     list.appendChild(empty);
     return;
   }
-  state.documents.forEach((doc) => {
+  folders.forEach((path) => {
+    const row = document.createElement("div");
+    row.className = "document-row document-folder-row";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "document-row-title";
+    button.textContent = `📁 ${path.split("/").at(-1)}`;
+    button.addEventListener("click", () => navigateFolder(path));
+    row.append(button);
+    list.append(row);
+  });
+  documents.forEach((doc) => {
     const row = document.createElement("div");
     row.className = "document-row";
 
@@ -85,7 +148,7 @@ function renderDocumentsList() {
     const title = document.createElement("button");
     title.type = "button";
     title.className = "document-row-title";
-    title.textContent = doc.name.replace(/\.md$/, "");
+    title.textContent = doc.name.split("/").at(-1).replace(/\.md$/, "");
     title.title = doc.path;
     title.addEventListener("click", () => openDocument(doc.name));
 
@@ -116,7 +179,7 @@ async function deleteDocument(name) {
     const res = await fetch(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-    setDocuments(data.documents || [], data.documents_default);
+    setDocuments(data.documents || [], data.documents_default, data.folders || []);
   } catch (error) {
     console.error("Unable to delete document:", error);
     showDocumentError(error.message);
@@ -147,7 +210,7 @@ export async function setDocumentsDefault(enabled) {
     });
     if (!res.ok) throw new Error((await res.json()).detail || `HTTP ${res.status}`);
     const data = await res.json();
-    setDocuments(data.documents || [], data.documents_default);
+    setDocuments(data.documents || [], data.documents_default, data.folders || []);
   } catch (error) {
     console.error("Unable to change the documents default:", error);
     elements.documentsDefaultToggle.checked = state.documentsDefault;
@@ -170,6 +233,7 @@ export async function openDocument(name, quiet = false) {
   const data = await res.json();
   if (quiet && (state.openDocument !== name || window.getSelection()?.isCollapsed === false)) return;
   if (quiet && state.openDocumentContent === data.content) return;
+  state.documentsFolder = parentFolder(name);
   state.openDocument = name;
   state.openDocumentContent = data.content;
   elements.documentsMarkdown.innerHTML = renderMarkdown(data.content || "", { breaks: false });
@@ -193,6 +257,40 @@ export function startCreate() {
   elements.documentsEditorTitle.focus();
 }
 
+export function startCreateFolder() {
+  elements.documentsFolderName.value = "";
+  elements.documentsFolderForm.classList.remove("hidden");
+  elements.documentsError.classList.add("hidden");
+  elements.documentsFolderName.focus();
+}
+
+export function cancelCreateFolder() {
+  elements.documentsFolderForm.classList.add("hidden");
+}
+
+export async function saveFolder() {
+  const name = elements.documentsFolderName.value.trim();
+  if (!name || name.includes("/") || name.includes("\\")) {
+    showDocumentError("Enter one folder name without a slash.");
+    return;
+  }
+  const path = state.documentsFolder ? `${state.documentsFolder}/${name}` : name;
+  try {
+    const res = await fetch(`/api/document-folders${agentQuery()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    setDocuments(data.documents || [], data.documents_default, data.folders || []);
+    cancelCreateFolder();
+    navigateFolder(path);
+  } catch (error) {
+    showDocumentError(error.message);
+  }
+}
+
 export function startModify() {
   if (!state.openDocument) return;
   elements.documentsEditorText.value = state.openDocumentContent || "";
@@ -213,7 +311,9 @@ export async function saveEdit() {
   const text = elements.documentsEditorText.value;
   const creating = state.documentsView === "create";
   const url = creating ? `/api/documents${agentQuery()}` : `/api/documents/${encodeURIComponent(state.openDocument)}${agentQuery()}`;
-  const body = creating ? { title: elements.documentsEditorTitle.value, text } : { text };
+  const body = creating
+    ? { title: elements.documentsEditorTitle.value, text, folder: state.documentsFolder }
+    : { text };
   elements.documentsSave.disabled = true;
   try {
     const res = await fetch(url, {
@@ -223,7 +323,7 @@ export async function saveEdit() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-    if (creating) setDocuments(data.documents || [], data.documents_default);
+    if (creating) setDocuments(data.documents || [], data.documents_default, data.folders || []);
     else await fetchDocuments();
     await openDocument(creating ? data.name : state.openDocument);
   } catch (error) {

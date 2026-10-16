@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20261016-1";
-import { initWebSocket, sendWs } from "./transport.js?v=20261016-1";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-1";
-import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261016-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261016-2";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-1";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-1";
-import { cancelEdit, saveEdit, setDocumentsDefault, showDocumentsView, startCreate, startModify } from "./documents.js?v=20261016-1";
+import { elements, state } from "./state.js?v=20261016-3";
+import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setCarryContext, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
+import { appendAssistantChunk, appendAssistantDelta, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261016-3";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261016-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
+import { cancelCreateFolder, cancelEdit, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -616,6 +616,12 @@ function setupEventListeners() {
   // Documents tab: list, reader, and editor
   elements.documentsBack.addEventListener("click", () => showDocumentsView("list"));
   elements.documentsNew.addEventListener("click", startCreate);
+  elements.documentsNewFolder.addEventListener("click", startCreateFolder);
+  elements.documentsFolderCancel.addEventListener("click", cancelCreateFolder);
+  elements.documentsFolderForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveFolder();
+  });
   elements.documentsModify.addEventListener("click", startModify);
   elements.documentsCancel.addEventListener("click", cancelEdit);
   elements.documentsEditor.addEventListener("submit", (e) => {

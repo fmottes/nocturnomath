@@ -681,6 +681,7 @@ def test_documents_api_creates_edits_and_selects_documents(session):
     with TestClient(create_app(session)) as client:
         assert client.get("/api/documents").json() == {
             "documents": [],
+            "folders": [],
             "documents_default": True,
         }
 
@@ -737,3 +738,48 @@ def test_documents_api_creates_edits_and_selects_documents(session):
             (session.workspace_path / ".nocturnomath" / "config.json").read_text()
         )
         assert config["documents_default"] is False
+
+
+def test_documents_api_handles_nested_paths_and_empty_folders(session):
+    with TestClient(create_app(session)) as client:
+        created_folder = client.post(
+            "/api/document-folders", json={"path": "reports/2026"}
+        )
+        assert created_folder.status_code == 201
+        assert created_folder.json()["folders"] == ["reports", "reports/2026"]
+        assert created_folder.json()["documents"] == []
+
+        created = client.post(
+            "/api/documents",
+            json={"title": "First result", "text": "# First", "folder": "reports/2026"},
+        )
+        assert created.status_code == 201
+        name = "reports/2026/First-result.md"
+        assert created.json()["name"] == name
+        assert created.json()["documents"][0]["name"] == name
+
+        url = "/api/documents/reports%2F2026%2FFirst-result.md"
+        assert client.get(url).json()["content"] == "# First\n"
+        assert (
+            client.put(url, json={"text": "# Revised"}).json()["content"]
+            == "# Revised\n"
+        )
+        included = client.post(url + "/include", json={"included": False})
+        assert included.status_code == 200
+        assert included.json() == {"name": name, "included": False}
+        assert client.get("/api/documents").json()["documents"][0]["included"] is False
+        assert client.delete(url).status_code == 200
+        assert client.get(url).status_code == 404
+        assert client.get("/api/documents").json()["folders"] == [
+            "reports",
+            "reports/2026",
+        ]
+
+        for bad in ("../escape", ".hidden", "reports//bad"):
+            assert (
+                client.post("/api/document-folders", json={"path": bad}).status_code
+                == 400
+            )
+        outside = "/api/documents/..%2Fkb%2Fevidence.md"
+        assert client.get(outside).status_code in (400, 404)
+        assert client.put(outside, json={"text": "unsafe"}).status_code in (400, 404)
