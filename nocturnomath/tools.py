@@ -471,6 +471,7 @@ def build_tools(session: "ExplorationSession"):
             / "probe.json"
         )
         is_slurm = json.loads(probe_path.read_text()).get("backend") == "slurm"
+        recorded = True
         if is_slurm:
             session.activate_session()
             recorded = await asyncio.to_thread(
@@ -481,20 +482,29 @@ def build_tools(session: "ExplorationSession"):
                 text,
                 session.transcript_path,
             )
-            session._pending_verdict = None
-            session._pending_verdict_probe_id = None
-            if not recorded:
-                return failure(f"Probe {probe_id} already has a verdict.")
         else:
             session.log_transcript(
                 "verdict", expected=expected, text=text, probe_id=probe_id
             )
-            session._pending_verdict = None
-            session._pending_verdict_probe_id = None
+        # Batch results remain queued by the workspace monitor. Recover any kernel
+        # verdict that a newer batch result displaced when this chat was resumed.
+        session._restore_pending_verdict(
+            session.workspace.current_records(), include_slurm=False
+        )
+        if not recorded:
+            return failure(f"Probe {probe_id} already has a verdict.")
         await session.emit(
             "probe_verdict", probe_id=probe_id, expected=expected, text=text
         )
-        return {"content": [{"type": "text", "text": "Verdict recorded."}]}
+        message = "Verdict recorded."
+        if session._pending_verdict is not None:
+            pending_id = session._pending_verdict_probe_id
+            message += (
+                f" Probe {pending_id} still needs a verdict against: "
+                f"{session._pending_verdict}. Inspect {pending_id}/output.txt "
+                "before giving its verdict or starting another probe."
+            )
+        return {"content": [{"type": "text", "text": message}]}
 
     @tool(
         "restart_kernel",

@@ -307,7 +307,9 @@ class ExplorationSession:
     def load_session(self, session_id: str) -> list[dict[str, Any]]:
         return self.workspace.load_session(session_id)
 
-    def _restore_pending_verdict(self, records: list[dict[str, Any]]):
+    def _restore_pending_verdict(
+        self, records: list[dict[str, Any]], *, include_slurm: bool = True
+    ):
         self._pending_verdict = None
         self._pending_verdict_probe_id = None
         reviewed = {
@@ -317,6 +319,8 @@ class ExplorationSession:
         }
         for record in reversed(records):
             if record.get("kind") != "run":
+                continue
+            if not include_slurm and record.get("backend") == "slurm":
                 continue
             status = record.get("status", "completed")
             if status in ("failed", "error") and record.get("backend") != "slurm":

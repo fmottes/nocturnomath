@@ -358,6 +358,50 @@ async def test_reopening_recovers_collected_results_in_the_original_chat(
 
 
 @pytest.mark.asyncio
+async def test_batch_review_after_reopening_preserves_an_outstanding_kernel_verdict(
+    session, runtime, cluster, reviewer
+):
+    probe_id, job_id = await submit(session)
+    await tools(session)["run"].handler({"code": "print(1)", "expected": "prints 1"})
+    complete(session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    assert session._pending_verdict_probe_id == "S001/P002"
+    assert reviewer == []
+
+    runtime.open_workspace(session.workspace_path)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+    owner = reviewer[0][0]
+    assert reviewer[0][1] == probe_id
+    assert owner._pending_verdict_probe_id == "S001/P002"
+    assert owner._pending_verdict == "prints 1"
+    blocked = await tools(owner)["run"].handler(
+        {"code": "print(2)", "expected": "prints 2"}
+    )
+    assert blocked["is_error"]
+    assert owner.kernel.executed_codes == []
+
+    # The kernel verdict also survives another chat resume after the batch review.
+    owner.resume_session("S001")
+    assert owner._pending_verdict_probe_id == "S001/P002"
+    verdict = await tools(owner)["verdict"].handler(
+        {"text": "The local result matched."}
+    )
+    assert not verdict.get("is_error")
+    assert owner._pending_verdict is None
+    result = await tools(owner)["run"].handler(
+        {"code": "print(2)", "expected": "prints 2"}
+    )
+    assert not result.get("is_error")
+    assert owner.kernel.executed_codes == ["print(2)"]
+    assert [
+        record["probe_id"]
+        for record in owner.workspace.current_records()
+        if record["kind"] == "verdict"
+    ] == [probe_id, "S001/P002"]
+
+
+@pytest.mark.asyncio
 async def test_reopening_monitors_jobs_that_are_still_queued(
     session, runtime, cluster, reviewer
 ):
