@@ -91,6 +91,8 @@ def submit(
     account,
     qos,
     result_files,
+    *,
+    correction_of=None,
 ):
     """Persist a script before submission and return its probe and Slurm IDs."""
     if not code.strip() or not expected.strip():
@@ -123,6 +125,12 @@ def submit(
         )
 
     workspace = session.workspace
+    correction = {}
+    if correction_of is not None:
+        _, parent = _probe(workspace, correction_of)
+        if parent["status"] != "error" or not has_verdict(workspace, correction_of):
+            raise ValueError("A correction must follow a failed Slurm probe's verdict.")
+        correction["correction_of"] = correction_of
     probe = workspace.start_probe(
         code,
         expected,
@@ -140,6 +148,7 @@ def submit(
             "qos": qos,
         },
         result_files=result_files,
+        **correction,
     )
     probe_id = f"{workspace.session_id}/{probe.name}"
     session.log_transcript(
@@ -304,6 +313,22 @@ def has_verdict(workspace, probe_id):
     )
 
 
+def needs_review(workspace, probe_id):
+    """A verdict alone does not finish an interrupted automatic correction."""
+    if not has_verdict(workspace, probe_id):
+        return True
+    _, metadata = _probe(workspace, probe_id)
+    return metadata.get("review_pending", False) and not any(
+        job.get("correction_of") == probe_id for job in list_jobs(workspace)
+    )
+
+
+def set_review_pending(workspace, probe_id, pending):
+    with _locked_workspace(workspace):
+        probe, _ = _probe(workspace, probe_id)
+        _save_metadata(probe, review_pending=pending)
+
+
 @contextmanager
 def review_lock(workspace, probe_id):
     """Let only one running app automatically resume a session for review."""
@@ -328,6 +353,9 @@ def result_payload(workspace, probe_id, metadata, image_cap):
     plots = sorted(probe.glob("plot-*.png"))
     paths = [str(path.relative_to(workspace.path)) for path in plots]
     output = (probe / "output.txt").read_text()
+    note = metadata.get("execution_note")
+    if note == metadata.get("slurm_state"):
+        note = None  # The output already includes the scheduler state.
     return {
         "probe_id": probe_id,
         "backend": "slurm",
@@ -337,7 +365,7 @@ def result_payload(workspace, probe_id, metadata, image_cap):
         "output": f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}",
         "text": output,
         "status": "slurm-error" if metadata["status"] == "error" else "completed",
-        "execution_note": metadata.get("execution_note"),
+        "execution_note": note,
         "plot_paths": paths,
         "plot_urls": [f"/api/asset?path={path}" for path in paths],
         "plot_images": [
@@ -464,9 +492,18 @@ def _check_locked(workspace, probe_id):
         if state == "COMPLETED" and exit_code.startswith("0:") and not missing_required
         else "error"
     )
-    workspace.finish_probe(
-        probe, output, [], status, None if status == "completed" else state
-    )
+    problems = []
+    if state != "COMPLETED":
+        problems.append(f"Slurm job ended in {state} (exit code {exit_code}).")
+    elif not exit_code.startswith("0:"):
+        problems.append(f"Slurm job exited with code {exit_code}.")
+    if missing:
+        problems.append("Missing declared result files: " + ", ".join(missing) + ".")
+    if missing_output:
+        problems.append(
+            "Missing Slurm output files: " + ", ".join(missing_output) + "."
+        )
+    workspace.finish_probe(probe, output, [], status, " ".join(problems) or None)
     metadata = _save_metadata(
         probe,
         slurm_state=state,
@@ -489,6 +526,7 @@ def list_jobs(workspace):
                     "job_id": metadata["job_id"],
                     "status": metadata["status"],
                     "slurm_state": metadata.get("slurm_state"),
+                    "correction_of": metadata.get("correction_of"),
                 }
             )
     return jobs
@@ -500,5 +538,5 @@ def pending_jobs(workspace):
         return [
             job
             for job in list_jobs(workspace)
-            if not has_verdict(workspace, job["probe_id"])
+            if needs_review(workspace, job["probe_id"])
         ]

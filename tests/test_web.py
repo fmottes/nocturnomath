@@ -103,6 +103,7 @@ def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
         assert result["content"][1]["type"] == "image"
         await tools["verdict"].handler({"text": "It printed 42 as predicted."})
         reviewed.set()
+        return True
 
     monkeypatch.setattr(session, "review_slurm", review)
     with TestClient(create_app(session)) as client:

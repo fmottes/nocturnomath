@@ -810,7 +810,7 @@ async def input_loop(app: TerminalApp):
     prompt_session = build_prompt_session(app)
     while True:
         try:
-            with patch_stdout():
+            with patch_stdout(raw=True):
                 line = await prompt_session.prompt_async("\n> ")
         except KeyboardInterrupt:
             app.write("Type /exit to leave.", style="dim")

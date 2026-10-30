@@ -96,8 +96,16 @@ about runtime behavior or saved records, follow this contract.
   Continue other work while it runs; do not repeatedly poll through tools.
   `check_slurm_job` is also available for manual inspection; checking is not a
   new probe. Give the verdict after the finished output is collected, including
-  failed jobs. Then correct a failed script and submit a new Slurm probe; keep
-  the failed output. Monitoring resumes when the workspace is reopened after shutdown.
+  failed jobs. If the saved failure output supports a concrete correction, explain the
+  cause and correction, then use `submit_slurm` to submit a corrected script or resource
+  request as a new probe, keeping the original scientific question and prediction.
+  Set `correction_of` to the failed probe ID so the saved correction remains linked.
+  Preserve the failed output and let the monitor wait for the replacement job.
+  Continue this correction loop while the failure supports a justified next correction.
+  Stop and explain when no justified correction remains or user input is needed; do not
+  blindly resubmit unchanged jobs or restart a job the user deliberately cancelled.
+  A null or unexpected scientific result from successful execution needs a verdict,
+  not a failure retry. Monitoring resumes when the workspace is reopened after shutdown.
 - If kernel probe code raises an error, correct it and call `run` with `retry_of` set to the
   original probe ID (for example `S001/P001`). The corrected execution is saved as
   another attempt under that probe; prior code and output remain available. A failed

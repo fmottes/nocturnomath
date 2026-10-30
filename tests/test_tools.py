@@ -314,7 +314,24 @@ async def test_slurm_missing_files_eventually_save_an_error(session, monkeypatch
     monkeypatch.setattr(slurm, "FILE_SETTLE_SECONDS", 0)
     result = await tools["check_slurm_job"].handler({"probe_id": "S001/P001"})
     assert "Missing declared result files" in result["content"][0]["text"]
+    assert "Probe S001/P001: error" in result["content"][0]["text"]
     assert json.loads((probe / "probe.json").read_text())["status"] == "error"
+
+    metadata = json.loads((probe / "probe.json").read_text())
+    assert metadata["execution_note"] == "Missing declared result files: result.csv."
+    redundant = {**metadata, "execution_note": "COMPLETED"}
+    assert (
+        slurm.result_payload(session.workspace, "S001/P001", redundant, 2)[
+            "execution_note"
+        ]
+        is None
+    )
+    assert (
+        slurm.result_payload(session.workspace, "S001/P001", metadata, 2)[
+            "execution_note"
+        ]
+        == metadata["execution_note"]
+    )
 
 
 @pytest.mark.asyncio

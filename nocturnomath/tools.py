@@ -591,7 +591,8 @@ def build_tools(session: "ExplorationSession"):
         "Other work can continue while it runs. check_slurm_job is also available manually. "
         "The selected research Python must be available at the same path on compute nodes. "
         "Write plots as plot-1.png, plot-2.png under NOCTURNOMATH_PROBE_DIR. "
-        "Declare expected plots and other outputs in result_files so collection waits for them.",
+        "Declare expected plots and other outputs in result_files so collection waits for them. "
+        "For a correction, set correction_of to the failed probe ID; automatic reviews supply it.",
         {
             "type": "object",
             "properties": {
@@ -605,6 +606,7 @@ def build_tools(session: "ExplorationSession"):
                 "account": {"type": "string"},
                 "qos": {"type": "string"},
                 "result_files": {"type": "array", "items": {"type": "string"}},
+                "correction_of": {"type": "string"},
             },
             "required": ["code", "expected", "time_minutes", "cpus", "memory_gb"],
         },
@@ -632,6 +634,7 @@ def build_tools(session: "ExplorationSession"):
                 args.get("account", ""),
                 args.get("qos", ""),
                 args.get("result_files", []),
+                correction_of=args.get("correction_of", session._slurm_review_probe_id),
             )
         )
         session._probe_task = task
@@ -772,7 +775,7 @@ def build_tools(session: "ExplorationSession"):
             str(path.relative_to(session.workspace.path)) for path in plot_files
         ]
         terminal = status in ("completed", "error")
-        if terminal:
+        if terminal and session._slurm_review_probe_id != probe_id:
             await session.emit(
                 "probe_finish",
                 **slurm.result_payload(
@@ -783,21 +786,33 @@ def build_tools(session: "ExplorationSession"):
             records = session.workspace.read_transcript(
                 session.workspace.transcript_file(probe_id.split("/")[0])
             )
-            reviewed = any(
-                record.get("kind") == "verdict" and record.get("probe_id") == probe_id
-                for record in records
+            existing_verdict = next(
+                (
+                    record
+                    for record in records
+                    if record.get("kind") == "verdict"
+                    and record.get("probe_id") == probe_id
+                ),
+                None,
             )
+            reviewed = existing_verdict is not None
             if not reviewed and session._pending_verdict is None:
                 session._pending_verdict = metadata["expected"]
                 session._pending_verdict_probe_id = probe_id
             output = (probe / "output.txt").read_text()
-            message = f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}"
+            message = (
+                f"Probe {probe_id}: {status}\nSource: {probe_id}/output.txt\n{output}"
+            )
             if plot_paths:
                 message += "\n" + "\n".join(
                     f"Source: {probe_id}/{path.name}" for path in plot_files
                 )
             if not reviewed:
                 message += f"\nGive a verdict against: {metadata['expected']}"
+            else:
+                message += (
+                    f"\nExisting verdict (preserve it): {existing_verdict['text']}"
+                )
             content = [{"type": "text", "text": message}]
             for path in plot_files[: session.image_cap]:
                 content.append(

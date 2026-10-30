@@ -235,17 +235,31 @@ class Runtime:
     async def _review_slurm(self, session, probe_id, key):
         try:
             with slurm.review_lock(session.workspace, probe_id) as claimed:
-                if not claimed or slurm.has_verdict(session.workspace, probe_id):
+                if not claimed or not slurm.needs_review(session.workspace, probe_id):
                     return
                 # Do not repeatedly bill for a failed or interrupted review. The saved
                 # unresolved result is retried when the workspace is next opened.
                 self._slurm_review_attempts.add(key)
-                await session.review_slurm(probe_id)
-                if not slurm.has_verdict(session.workspace, probe_id):
+                await asyncio.to_thread(
+                    slurm.set_review_pending, session.workspace, probe_id, True
+                )
+                session._slurm_review_probe_id = probe_id
+                completed = await session.review_slurm(probe_id)
+                reviewed = slurm.has_verdict(session.workspace, probe_id)
+                if completed and reviewed:
+                    await asyncio.to_thread(
+                        slurm.set_review_pending, session.workspace, probe_id, False
+                    )
+                elif slurm.needs_review(session.workspace, probe_id):
+                    reason = (
+                        "did not record a verdict"
+                        if not reviewed
+                        else "did not finish its correction"
+                    )
                     await session.emit(
                         "error",
-                        message=f"Automatic review of {probe_id} did not record a verdict. "
-                        "The probe remains unresolved; continue this chat to review it, "
+                        message=f"Automatic review of {probe_id} {reason}. "
+                        "The review remains unresolved; continue this chat to finish it, "
                         "or it will be retried when the workspace is reopened.",
                     )
         except asyncio.CancelledError:
@@ -254,6 +268,7 @@ class Runtime:
             logger.exception("Slurm review failed for %s", probe_id)
             await session.emit("error", message=f"Review of {probe_id} failed: {exc}")
         finally:
+            session._slurm_review_probe_id = None
             if session._current_task is asyncio.current_task():
                 session._current_task = None
             if key in self._slurm_review_attempts:

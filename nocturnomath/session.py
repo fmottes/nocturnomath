@@ -83,6 +83,7 @@ class ExplorationSession:
         self._results_since_note = 0
         self._pending_verdict: str | None = None
         self._pending_verdict_probe_id: str | None = None
+        self._slurm_review_probe_id: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
@@ -525,12 +526,23 @@ class ExplorationSession:
             await self.emit("status_change", status="idle")
 
     async def review_slurm(self, probe_id: str):
-        await self.query(
+        return await self.query(
             f"Runtime event: Slurm probe {probe_id} has finished and its output is saved. "
             f"Call check_slurm_job for {probe_id} to inspect its output and plots, then "
-            "record its verdict against the original prediction, including if the job "
-            "failed or was cancelled. This is a continuation of the original probe. "
-            "Stop after reviewing it; do not launch further probes or jobs in this turn.",
+            "record its verdict against the original prediction if it has none, including "
+            "if the job failed or was cancelled. Preserve an already recorded verdict and "
+            "finish any interrupted correction. This continues the original probe. "
+            "If the probe failed (including missing required outputs) and the saved "
+            "output supports a concrete correction, "
+            "explain the cause and the correction, then use submit_slurm to submit a "
+            "corrected script or resource request as a new probe. Keep the original "
+            "scientific question and prediction, and preserve the failed output. "
+            "After resubmitting, stop this turn and let the monitor wait for the new job. "
+            "If the probe completed successfully, stop after its verdict. Do not retry a null or "
+            "unexpected scientific result as though it were an execution failure. "
+            "If no justified correction remains or user input is needed, explain why "
+            "and stop. Do not blindly resubmit an unchanged job, restart a job the "
+            "user deliberately cancelled, or launch an unrelated investigation.",
             slurm_probe_id=probe_id,
         )
 
@@ -595,6 +607,10 @@ class ExplorationSession:
                 last_prompt_model = None
                 async for message in client.receive_response():
                     self._track_session_id(getattr(message, "session_id", None))
+                    if isinstance(message, ResultMessage) and message.is_error:
+                        raise RuntimeError(
+                            message.result or "Claude could not finish this turn."
+                        )
                     if isinstance(message, StreamEvent):
                         delta = _stream_delta_text(message)
                         if delta:
@@ -665,12 +681,14 @@ class ExplorationSession:
                 await self.emit(
                     "turn_complete", full_text="\n\n".join(accumulated_text)
                 )
+                return True
         except asyncio.CancelledError:
             await self.emit("status_change", status="cancelled")
             raise
         except Exception as exc:
             logger.exception("Error during query execution")
             await self.emit("error", message=str(exc))
+            return False
         finally:
             self._is_busy = False
             self._current_client = None

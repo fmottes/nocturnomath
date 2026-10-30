@@ -166,6 +166,10 @@ Probe IDs are session-local. Code and predictions are saved before execution; te
 
 Slurm probes stay unresolved while their jobs are queued or running, and the explorer can continue other work. Nocturnomath checks saved jobs every 30 seconds, collects their output and plots, then automatically resumes the original chat to record a verdict when it is idle. If that chat is closed, it opens in a separate explorer for review. Monitoring resumes when the workspace is reopened after shutdown, including jobs whose output was collected but whose verdict is still missing. Failed or interrupted reviews remain unresolved and can be continued in their chat; reopening the workspace retries them. Batch scripts save plots as `plot-1.png`, `plot-2.png`, and so on under `NOCTURNOMATH_PROBE_DIR`; declare expected plots and other files in `result_files` so collection waits for them.
 
+When a batch probe fails, including when required output files are missing, the agent records its verdict and can automatically submit a corrected script or resource request if the saved output supports the change. Each correction is a new probe with the same scientific question and prediction; failed probes and their artifacts remain saved. The monitor follows the replacement job through the same review cycle. The agent stops when the probe succeeds, no justified correction remains, or user input is needed. It does not blindly resubmit unchanged jobs or restart jobs the user deliberately cancelled.
+
+Automatic review completion is saved separately from the verdict. If review is interrupted after recording a verdict, reopening the workspace resumes the unfinished correction while preserving that verdict. Replacement jobs save their source probe as `correction_of`, so a submitted replacement is monitored rather than submitted again after interruption. Set that field when continuing a correction manually too.
+
 Conversation context is kept within each chat. Select the model for the next message with the web model selector or `/model` in the terminal.
 
 ## Research environments
