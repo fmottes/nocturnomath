@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20261016-3";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261016-4";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261030-1";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -204,7 +204,7 @@ function renderRecords(records, isBusy = false) {
 
       case "probe_started":
         if (rec.probe_id === activeProbe) {
-          appendProbeStart(rec.expected, rec.code, rec.probe_id);
+          appendProbeStart(rec.expected, rec.code, rec.probe_id, rec.backend);
         }
         break;
 
@@ -217,7 +217,13 @@ function renderRecords(records, isBusy = false) {
 
       case "slurm_submitted": {
         const start = startsById.get(rec.probe_id);
-        appendProbeFinish(start?.expected || "", start?.code || "", `Slurm job ${rec.job_id} submitted. Probe ${rec.probe_id}.`, [], [], rec.probe_id, "slurm-submitted");
+        appendProbeFinish(start?.expected || "", start?.code || "", `Slurm job ${rec.job_id} submitted. Monitoring automatically.`, [], [], rec.probe_id, "submitted", "slurm");
+        break;
+      }
+
+      case "slurm_status": {
+        const start = startsById.get(rec.probe_id);
+        appendProbeFinish(start?.expected || "", start?.code || "", `Slurm job ${rec.job_id}: ${rec.slurm_state || rec.status}.`, [], [], rec.probe_id, rec.status, "slurm");
         break;
       }
 
@@ -230,12 +236,17 @@ function renderRecords(records, isBusy = false) {
           (rec.images || []).map((name) => `/api/asset?path=${encodeURIComponent(name)}`),
           [],
           rec.probe_id,
-          rec.backend === "slurm" && rec.status === "error" ? "slurm-error" : rec.status
+          rec.backend === "slurm" && rec.status === "error" ? "slurm-error" : rec.status,
+          rec.backend
         );
         break;
 
       case "verdict":
-        appendProbeVerdict(rec.text || "");
+        appendProbeVerdict(rec.text || "", rec.probe_id);
+        break;
+
+      case "slurm_review":
+        appendSystemMessage(`Reviewing finished Slurm probe ${rec.probe_id}.`);
         break;
 
       case "compaction":

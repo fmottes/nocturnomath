@@ -164,6 +164,8 @@ Evidence and thoughts span sessions. A new session starts an empty chat and fres
 
 Probe IDs are session-local. Code and predictions are saved before execution; text output and plots are saved afterward, including partial output from interruptions. `probe.json` records the model, timestamps, prediction, kernel, and outcome. These are execution artifacts, not input snapshots or a fully reproducible kernel state.
 
+Slurm probes stay unresolved while their jobs are queued or running, and the explorer can continue other work. Nocturnomath checks saved jobs every 30 seconds, collects their output and plots, then automatically resumes the original chat to record a verdict when it is idle. If that chat is closed, it opens in a separate explorer for review. Monitoring resumes when the workspace is reopened after shutdown, including jobs whose output was collected but whose verdict is still missing. Failed or interrupted reviews remain unresolved and can be continued in their chat; reopening the workspace retries them. Batch scripts save plots as `plot-1.png`, `plot-2.png`, and so on under `NOCTURNOMATH_PROBE_DIR`; declare expected plots and other files in `result_files` so collection waits for them.
+
 Conversation context is kept within each chat. Select the model for the next message with the web model selector or `/model` in the terminal.
 
 ## Research environments

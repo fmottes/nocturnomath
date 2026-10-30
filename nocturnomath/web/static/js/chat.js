@@ -96,7 +96,7 @@ export function closeAssistantBubble() {
   state.currentAssistantBubble = null;
 }
 
-export function appendProbeStart(expected, code, probeId) {
+export function appendProbeStart(expected, code, probeId, backend) {
   closeAssistantBubble();
   const existing = state.probeCards.get(probeId);
   if (existing) {
@@ -111,7 +111,7 @@ export function appendProbeStart(expected, code, probeId) {
 
   const pill = document.createElement("span");
   pill.className = "probe-pill";
-  pill.textContent = "Code probe";
+  pill.textContent = backend === "slurm" ? "Slurm probe" : "Code probe";
   const number = probeId?.split("/").find((part) => /^P\d+$/.test(part));
   if (/^P\d+$/.test(number || "")) {
     const badge = document.createElement("span");
@@ -163,15 +163,17 @@ export function appendProbeStart(expected, code, probeId) {
   state.currentProbeCard = {
     card,
     statusBadge: status,
+    backend,
   };
   state.probeCards.set(probeId, state.currentProbeCard);
 }
 
-export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId, status = "completed") {
+export function appendProbeFinish(expected, code, output, plotUrls, plotImages, probeId, status = "completed", backend) {
   let tracked = state.probeCards.get(probeId);
   let card = tracked?.card || null;
 
-  if (status !== "completed" && status !== "slurm-submitted" && status !== "slurm-error") {
+  const pending = ["submitted", "queued", "running", "finishing"].includes(status);
+  if (status !== "completed" && status !== "slurm-error" && !pending) {
     card?.remove();
     state.probeCards.delete(probeId);
     state.currentProbeCard = null;
@@ -180,15 +182,24 @@ export function appendProbeFinish(expected, code, output, plotUrls, plotImages, 
   }
 
   if (!card) {
-    appendProbeStart(expected, code, probeId);
+    appendProbeStart(expected, code, probeId, backend);
     tracked = state.currentProbeCard;
     card = tracked.card;
   }
 
-  if (tracked.statusBadge) {
-    tracked.statusBadge.textContent = status === "slurm-submitted" ? "Submitted" : status === "slurm-error" ? "Failed" : "Completed";
-    tracked.statusBadge.style.color = status === "slurm-error" ? "var(--danger)" : status === "slurm-submitted" ? "var(--ink-soft)" : "var(--ok)";
-  }
+  tracked.status = status;
+  tracked.backend = backend || tracked.backend;
+  const reviewed = !!card.querySelector(".probe-verdict");
+  const labels = {
+    submitted: "Submitted · unresolved", queued: "Queued · unresolved",
+    running: "Running · unresolved", finishing: "Collecting results",
+  };
+  tracked.statusBadge.textContent = labels[status] || (tracked.backend === "slurm"
+    ? (status === "slurm-error" ? (reviewed ? "Failed · reviewed" : "Failed · awaiting verdict")
+      : (reviewed ? "Resolved" : "Awaiting verdict"))
+    : (status === "slurm-error" ? "Submission failed" : "Completed"));
+  tracked.statusBadge.style.color = status === "slurm-error" ? "var(--danger)"
+    : pending || (tracked.backend === "slurm" && !reviewed) ? "var(--ink-soft)" : "var(--ok)";
 
   card.querySelector(".probe-output-details")?.remove();
   card.querySelector(".probe-images")?.remove();
@@ -237,14 +248,16 @@ export function appendProbeFinish(expected, code, output, plotUrls, plotImages, 
   scrollChatToBottom();
 }
 
-export function appendProbeVerdict(text) {
-  const card = state.lastProbeCard;
+export function appendProbeVerdict(text, probeId) {
+  const tracked = state.probeCards.get(probeId);
+  const card = probeId ? tracked?.card : state.lastProbeCard;
   if (!card) {
     // No probe to attach to (a stray verdict, or a replayed transcript whose
     // probe was trimmed): show it rather than dropping it.
     appendAssistantChunk(text);
     return;
   }
+  card.querySelector(".probe-verdict")?.remove();
   const box = document.createElement("div");
   box.className = "probe-verdict";
   const tag = document.createElement("strong");
@@ -254,6 +267,10 @@ export function appendProbeVerdict(text) {
   // anything, and it is shown verbatim rather than rendered.
   box.appendChild(document.createTextNode(" " + text));
   card.appendChild(box);
+  if (tracked?.backend === "slurm") {
+    tracked.statusBadge.textContent = tracked.status === "slurm-error" ? "Failed · reviewed" : "Resolved";
+    tracked.statusBadge.style.color = tracked.status === "slurm-error" ? "var(--danger)" : "var(--ok)";
+  }
   // One verdict per probe, so the next one cannot stack onto this card.
   state.lastProbeCard = null;
   scrollChatToBottom();

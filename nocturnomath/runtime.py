@@ -5,11 +5,13 @@ import logging
 import re
 import uuid
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from . import slurm
 from .auth import AuthMethod, ClaudeAuth
 from .session import DEFAULT_EFFORT, EFFORT_LEVELS, ExplorationSession
 
@@ -17,6 +19,7 @@ logger = logging.getLogger("nocturnomath.runtime")
 
 EVIDENCE_PATH = ".nocturnomath/kb/evidence.md"
 THOUGHTS_PATH = ".nocturnomath/kb/thoughts.md"
+SLURM_POLL_SECONDS = 30
 
 
 class Runtime:
@@ -60,6 +63,10 @@ class Runtime:
         self._changing_agents: set[str] = set()
         self._agent_subscribers: dict[str, Callable[[str, dict[str, Any]], Any]] = {}
         self._workspace_defaults_pending = session is not None
+        self._slurm_task: asyncio.Task | None = None
+        self._slurm_wakeup = asyncio.Event()
+        self._slurm_seen: dict[tuple[Path, str], tuple] = {}
+        self._slurm_review_attempts: set[tuple[Path, str]] = set()
         if session is not None:
             self.primary_agent_id = self._new_agent_id()
             self.agents[self.primary_agent_id] = session
@@ -83,6 +90,174 @@ class Runtime:
         self._started = True
         for agent_id, session in self.agents.items():
             self._subscribe_to_agent(agent_id, session)
+        self._wake_slurm_monitor()
+
+    def _wake_slurm_monitor(self):
+        if not self._started:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Workspace changes also run in worker threads.
+            if self._slurm_task is not None:
+                self._slurm_task.get_loop().call_soon_threadsafe(self._slurm_wakeup.set)
+            return
+        self._slurm_wakeup.set()
+        if self._slurm_task is None or self._slurm_task.done():
+            self._slurm_task = loop.create_task(self._monitor_slurm())
+
+    async def _monitor_slurm(self):
+        while self._started:
+            self._slurm_wakeup.clear()
+            try:
+                await self._poll_slurm_jobs()
+            except Exception:
+                logger.exception("Could not refresh saved Slurm jobs")
+                # Failed recovery may have woken us through transition cleanup.
+                # Wait for the next interval or a new external event before retrying.
+                self._slurm_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._slurm_wakeup.wait(), timeout=SLURM_POLL_SECONDS
+                )
+            except TimeoutError:
+                pass
+
+    def _monitoring_workspace(self, workspace):
+        return (
+            self._started
+            and not self.changing
+            and self.session is not None
+            and self.session.workspace is workspace
+        )
+
+    def _slurm_owner_is_current(self, workspace, agent_id, session, probe_id):
+        return (
+            self._monitoring_workspace(workspace)
+            and session is not None
+            and self.agents.get(agent_id) is session
+            and session.workspace.path == workspace.path
+            and not session.workspace.session_pending
+            and session.workspace.session_id == probe_id.split("/")[0]
+            and agent_id not in self._changing_agents
+        )
+
+    async def _poll_slurm_jobs(self):
+        if not self._started or self.changing or self.session is None:
+            return
+        workspace = self.session.workspace
+        jobs = await asyncio.to_thread(slurm.pending_jobs, workspace)
+        for job in jobs:
+            if not self._monitoring_workspace(workspace):
+                return
+            probe_id = job["probe_id"]
+            try:
+                metadata, _ = await asyncio.to_thread(slurm.check, workspace, probe_id)
+            except Exception as exc:
+                # A scheduler outage is not an outcome of the scientific probe.
+                logger.warning("Could not check %s: %s", probe_id, exc)
+                continue
+            if not self._monitoring_workspace(workspace):
+                return
+            terminal = metadata["status"] in ("completed", "error")
+            key = (workspace.path, probe_id)
+            agent_id = self.find_agent_for_session(probe_id.split("/")[0])
+            if (
+                terminal
+                and agent_id is None
+                and key not in self._slurm_review_attempts
+                and self.session.model is not None
+                and not self._changing_agents
+                and not any(agent.has_active_query() for agent in self.agents.values())
+            ):
+                # Resume the owning chat, never repurpose the user's current chat.
+                agent_id = await self.transition(
+                    partial(
+                        self.create_agent,
+                        workspace.path,
+                        session_id=probe_id.split("/")[0],
+                    )
+                )
+                await self.emit("agent_added", self.agent_snapshot(agent_id))
+            if agent_id is None:
+                continue
+            session = self.agents.get(agent_id)
+            if not self._slurm_owner_is_current(workspace, agent_id, session, probe_id):
+                continue
+            if session._probe_operation_lock.locked():
+                continue
+            state = (agent_id, metadata["status"], metadata.get("slurm_state"))
+            if self._slurm_seen.get(key) != state:
+                if terminal:
+                    await session.emit(
+                        "probe_finish",
+                        **slurm.result_payload(
+                            workspace, probe_id, metadata, session.image_cap
+                        ),
+                    )
+                else:
+                    probe = (
+                        workspace.sessions_path
+                        / probe_id.split("/")[0]
+                        / "probes"
+                        / probe_id.split("/")[1]
+                    )
+                    await session.emit(
+                        "probe_update",
+                        probe_id=probe_id,
+                        backend="slurm",
+                        expected=metadata["expected"],
+                        code=(probe / "code.py").read_text(),
+                        output=f"Slurm job {metadata['job_id']}: "
+                        f"{metadata.get('slurm_state', metadata['status'])}.",
+                        status=metadata["status"],
+                        slurm_state=metadata.get("slurm_state"),
+                    )
+                # Publishing can yield to a user changing the explorer or workspace.
+                # Reserve a review only if this is still the probe's original chat.
+                if not self._slurm_owner_is_current(
+                    workspace, agent_id, session, probe_id
+                ):
+                    continue
+                self._slurm_seen[key] = state
+            if (
+                terminal
+                and key not in self._slurm_review_attempts
+                and not session.has_active_query()
+                and agent_id not in self._changing_agents
+                and session.model is not None
+                and session._pending_verdict_probe_id in (None, probe_id)
+            ):
+                session._current_task = asyncio.create_task(
+                    self._review_slurm(session, probe_id, key)
+                )
+
+    async def _review_slurm(self, session, probe_id, key):
+        try:
+            with slurm.review_lock(session.workspace, probe_id) as claimed:
+                if not claimed or slurm.has_verdict(session.workspace, probe_id):
+                    return
+                # Do not repeatedly bill for a failed or interrupted review. The saved
+                # unresolved result is retried when the workspace is next opened.
+                self._slurm_review_attempts.add(key)
+                await session.review_slurm(probe_id)
+                if not slurm.has_verdict(session.workspace, probe_id):
+                    await session.emit(
+                        "error",
+                        message=f"Automatic review of {probe_id} did not record a verdict. "
+                        "The probe remains unresolved; continue this chat to review it, "
+                        "or it will be retried when the workspace is reopened.",
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.exception("Slurm review failed for %s", probe_id)
+            await session.emit("error", message=f"Review of {probe_id} failed: {exc}")
+        finally:
+            if session._current_task is asyncio.current_task():
+                session._current_task = None
+            if key in self._slurm_review_attempts:
+                self._wake_slurm_monitor()
 
     async def discover_models(self):
         """Read the CLI's model catalog without sending an inference request."""
@@ -153,6 +328,7 @@ class Runtime:
                     session.default_effort = self._select_effort(
                         session.default_model, session.default_effort
                     )
+        self._wake_slurm_monitor()
 
     def _select_model(self, preferred: str | None) -> str | None:
         if preferred in self.models:
@@ -252,6 +428,8 @@ class Runtime:
 
     def shutdown(self):
         self._started = False
+        if self._slurm_task is not None:
+            self._slurm_task.cancel()
         self.changing = False
         for agent_id in list(self.agents):
             self._unsubscribe_agent(agent_id)
@@ -264,6 +442,8 @@ class Runtime:
         target = Path(path).expanduser().resolve()
         if not target.is_dir():
             raise ValueError("Choose an existing folder for the workspace.")
+        self._slurm_seen.clear()
+        self._slurm_review_attempts.clear()
 
         # Keep the terminal's long-standing in-place session contract when it
         # is the only explorer. Multi-tab workspace changes intentionally tear
@@ -274,6 +454,7 @@ class Runtime:
             self._workspace_defaults_pending = True
             if self.models:
                 self._apply_workspace_defaults()
+            self._wake_slurm_monitor()
             return session
 
         for agent_id in list(self.agents):
@@ -287,6 +468,7 @@ class Runtime:
         self._workspace_defaults_pending = True
         if self.models:
             self._apply_workspace_defaults()
+        self._wake_slurm_monitor()
         return self.require_session()
 
     def _new_agent_id(self) -> str:
@@ -302,6 +484,15 @@ class Runtime:
                     if other_id != agent_id:
                         other.mark_record_dirty()
             await self.emit(event_type, {"agent_id": agent_id, **payload})
+            if (
+                event_type == "probe_verdict"
+                or (
+                    event_type == "probe_update"
+                    and payload.get("status") == "submitted"
+                )
+                or (event_type == "status_change" and payload.get("status") == "idle")
+            ):
+                self._wake_slurm_monitor()
 
         session.subscribe(forward)
         self._agent_subscribers[agent_id] = forward
@@ -330,7 +521,11 @@ class Runtime:
                 logger.error(f"Error in runtime subscriber: {exc}")
 
     def create_agent(
-        self, workspace_path: Path | str | None = None, *, python: str | None = None
+        self,
+        workspace_path: Path | str | None = None,
+        *,
+        python: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """Create an independent exploration in the current workspace."""
         if workspace_path is None:
@@ -344,6 +539,12 @@ class Runtime:
             image_cap=self.image_cap,
             auth=self._auth,
         )
+        if session_id is not None:
+            try:
+                session.resume_session(session_id)
+            except Exception:
+                session.shutdown()
+                raise
         agent_id = self._new_agent_id()
         self.agents[agent_id] = session
         if self.primary_agent_id is None:
@@ -534,6 +735,7 @@ class Runtime:
             raise
         finally:
             self.changing = False
+            self._wake_slurm_monitor()
 
     async def transition_agent(self, agent_id: str, operation, *args):
         if self.changing:
@@ -552,6 +754,7 @@ class Runtime:
             raise
         finally:
             self._changing_agents.discard(agent_id)
+            self._wake_slurm_monitor()
 
     async def compact_agent(self, agent_id: str):
         if self.changing:
@@ -571,6 +774,7 @@ class Runtime:
             raise
         finally:
             self._changing_agents.discard(agent_id)
+            self._wake_slurm_monitor()
 
     def start_query(
         self,
@@ -632,6 +836,10 @@ class Runtime:
 
     async def drain(self):
         """Interrupt every explorer and preserve any partial probe artifacts."""
+        self._started = False
+        if self._slurm_task is not None:
+            self._slurm_task.cancel()
+            await asyncio.gather(self._slurm_task, return_exceptions=True)
         sessions = list(self.agents.values())
         await asyncio.gather(*(session.interrupt() for session in sessions))
         await asyncio.gather(

@@ -136,6 +136,7 @@ def create_app(
         finally:
             if browser_task and not browser_task.done():
                 browser_task.cancel()
+            await runtime.drain()
             runtime.shutdown()
 
     app = FastAPI(title="Nocturnomath Web App", lifespan=lifespan)

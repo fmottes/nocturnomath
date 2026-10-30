@@ -257,6 +257,22 @@ class TerminalApp:
     # ------------------------------------------------------------------ events
 
     def render_event(self, event_type: str, payload: dict[str, Any]):
+        # Recovered batch jobs may belong to a different chat. Keep their final
+        # results visible without mixing their streaming text into the active chat.
+        agent_id = payload.get("agent_id")
+        if agent_id and agent_id != self.runtime.primary_agent_id:
+            if event_type in (
+                "assistant_delta",
+                "status_change",
+                "turn_complete",
+                "context_usage_changed",
+            ):
+                return
+            if event_type == "assistant_text":
+                self.show(
+                    Panel(Markdown(payload.get("text", "")), title="Batch review")
+                )
+                return
         handler = getattr(self, f"_render_{event_type}", None)
         if handler is None:
             self.write(f"[{event_type}] {payload}", style="dim")
@@ -320,7 +336,7 @@ class TerminalApp:
                 border_style="red"
                 if status in ("error", "interrupted", "failed", "slurm-error")
                 else "cyan"
-                if status == "slurm-submitted"
+                if status in ("submitted", "queued", "running", "finishing")
                 else "green",
             )
         )
@@ -333,7 +349,25 @@ class TerminalApp:
         )
 
     def _render_probe_verdict(self, payload):
-        self.write(f"verdict: {payload.get('text', '')}", style="magenta")
+        probe = payload.get("probe_id", "")
+        self.write(f"verdict {probe}: {payload.get('text', '')}", style="magenta")
+
+    def _render_probe_update(self, payload):
+        self.write(
+            f"probe {payload['probe_id']} · {payload['status']} · unresolved",
+            style="dim",
+        )
+
+    def _render_slurm_review(self, payload):
+        self.write(
+            f"Reviewing finished Slurm probe {payload['probe_id']}.", style="dim"
+        )
+
+    def _render_agent_added(self, payload):
+        self.write(
+            f"Opened chat {payload['session_id']} to review its batch results.",
+            style="dim",
+        )
 
     def _render_kernel_restarted(self, payload):
         self.write("Kernel restarted. In-memory variables and state cleared.")
@@ -463,7 +497,16 @@ class TerminalApp:
             return False
         task = self.runtime.current_task
         if not session.kernel.busy and (task is None or task.done()):
-            return False
+            session = next(
+                (
+                    agent
+                    for agent in self.runtime.agents.values()
+                    if agent.has_active_query()
+                ),
+                None,
+            )
+            if session is None:
+                return False
         self._interrupt_task = asyncio.create_task(session.interrupt())
         return True
 

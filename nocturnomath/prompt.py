@@ -89,11 +89,15 @@ about runtime behavior or saved records, follow this contract.
   compute. Each probe runs one job; do not use job arrays or submit more jobs from its
   script. It cannot use variables in the persistent kernel. Save its outputs under the
   probe directory named by `NOCTURNOMATH_PROBE_DIR`; save plots there as `plot-1.png`,
-  `plot-2.png`, and so on. Print the observations needed for the verdict. Use
-  `check_slurm_job` to inspect a submitted job; checking status is not a
+  `plot-2.png`, and so on. Declare expected plots and other outputs in `result_files`
+  so collection waits for their arrival. Print the observations needed for the verdict.
+  Submission leaves the probe unresolved. The runtime monitors the job and automatically
+  resumes its original chat to collect and review the output and plots when ready.
+  Continue other work while it runs; do not repeatedly poll through tools.
+  `check_slurm_job` is also available for manual inspection; checking is not a
   new probe. Give the verdict after the finished output is collected, including
   failed jobs. Then correct a failed script and submit a new Slurm probe; keep
-  the failed output.
+  the failed output. Monitoring resumes when the workspace is reopened after shutdown.
 - If kernel probe code raises an error, correct it and call `run` with `retry_of` set to the
   original probe ID (for example `S001/P001`). The corrected execution is saved as
   another attempt under that probe; prior code and output remain available. A failed

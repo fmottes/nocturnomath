@@ -1,8 +1,8 @@
 import { elements, state } from "./state.js?v=20261016-3";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
 import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261016-4";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261016-4";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261030-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261030-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
 import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
@@ -274,14 +274,15 @@ function handleServerEvent(event) {
       break;
 
     case "probe_start":
-      appendProbeStart(event.expected, event.code, event.probe_id);
+      appendProbeStart(event.expected, event.code, event.probe_id, event.backend);
       break;
 
+    case "probe_update":
     case "probe_finish":
       // Preserve the web app's existing probe card contract: `output` includes
       // source paths and any guidance emitted alongside the raw kernel text.
-      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images, event.probe_id, event.status);
-      loadPlots();
+      appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images, event.probe_id, event.status, event.backend);
+      if (event.type === "probe_finish") loadPlots();
       break;
 
     case "record_changed":
@@ -297,7 +298,11 @@ function handleServerEvent(event) {
       break;
 
     case "probe_verdict":
-      appendProbeVerdict(event.text);
+      appendProbeVerdict(event.text, event.probe_id);
+      break;
+
+    case "slurm_review":
+      appendSystemMessage(`Reviewing finished Slurm probe ${event.probe_id}.`);
       break;
 
     case "assistant_delta":

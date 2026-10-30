@@ -304,6 +304,40 @@ async def test_pending_probe_verdict_survives_next_message_and_resume(session):
 
 
 @pytest.mark.asyncio
+async def test_batch_review_is_an_internal_turn_and_preserves_next_message_documents(
+    session,
+):
+    session.log_transcript("user", text="Original question")
+    session._sdk_session_id = "original-sdk-session"
+    session.workspace.save_document("input.md", "Selected for the next message", False)
+    session.refresh_document_settings()
+    session.set_document_included("input.md", True)
+    events = []
+    session.subscribe(lambda kind, payload: events.append((kind, payload)))
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.review_slurm("S001/P001")
+
+    assert FakeClient.options_used[-1].resume == "original-sdk-session"
+    assert "S001/P001" in FakeClient.prompts[-1]
+    assert "Selected for the next message" not in FakeClient.prompts[-1]
+    assert session._sent_documents == {}
+    records = session.workspace.current_records()
+    assert [record["text"] for record in records if record["kind"] == "user"] == [
+        "Original question"
+    ]
+    assert any(
+        record["kind"] == "slurm_review" and record["probe_id"] == "S001/P001"
+        for record in records
+    )
+    assert any(kind == "slurm_review" for kind, _ in events)
+
+    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
+        await session.query("Next user message")
+    assert "Selected for the next message" in FakeClient.prompts[-1]
+
+
+@pytest.mark.asyncio
 async def test_query_passes_selected_effort_to_the_sdk(session):
     session.effort = "xhigh"
 

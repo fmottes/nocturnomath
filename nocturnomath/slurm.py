@@ -1,5 +1,6 @@
 """Submit and collect self-contained Python probes run by Slurm."""
 
+import base64
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import time
 from contextlib import contextmanager
 
 from .environment import PRIVATE_APP_ENV
+from .notes import write_text
 
 JOB_ID = re.compile(r"\d+")
 PROBE_ID = re.compile(r"(S\d{3,})/(P\d{3,})")
@@ -56,7 +58,7 @@ def _save_metadata(path, **fields):
     file = path / "probe.json"
     metadata = json.loads(file.read_text())
     metadata.update(fields)
-    file.write_text(json.dumps(metadata, indent=2) + "\n")
+    write_text(file, json.dumps(metadata, indent=2) + "\n")
     return metadata
 
 
@@ -114,7 +116,6 @@ def submit(
         not isinstance(name, str)
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
         or name in reserved
-        or re.fullmatch(r"plot-\d+\.png", name)
         for name in result_files
     ):
         raise ValueError(
@@ -223,8 +224,30 @@ def check(workspace, probe_id, current_transcript=None):
     """Collect one job under a workspace lock shared by all explorers."""
     with _locked_workspace(workspace):
         metadata, collected = _check_locked(workspace, probe_id)
+        original = workspace.transcript_file(probe_id.split("/")[0])
+        if metadata["status"] not in ("completed", "error", "failed"):
+            previous = next(
+                (
+                    record
+                    for record in reversed(workspace.read_transcript(original))
+                    if record.get("kind") == "slurm_status"
+                    and record.get("probe_id") == probe_id
+                ),
+                {},
+            )
+            if any(
+                previous.get(key) != metadata.get(key)
+                for key in ("status", "slurm_state")
+            ):
+                workspace.log_transcript(
+                    "slurm_status",
+                    transcript_path=original,
+                    probe_id=probe_id,
+                    job_id=metadata["job_id"],
+                    status=metadata["status"],
+                    slurm_state=metadata.get("slurm_state"),
+                )
         if metadata["status"] in ("completed", "error"):
-            original = workspace.transcript_file(probe_id.split("/")[0])
             transcripts = [original]
             if current_transcript is not None and current_transcript != original:
                 transcripts.append(current_transcript)
@@ -271,6 +294,58 @@ def record_verdict(workspace, probe_id, expected, text, current_transcript):
         return True
 
 
+def has_verdict(workspace, probe_id):
+    records = workspace.read_transcript(
+        workspace.transcript_file(probe_id.split("/")[0])
+    )
+    return any(
+        record.get("kind") == "verdict" and record.get("probe_id") == probe_id
+        for record in records
+    )
+
+
+@contextmanager
+def review_lock(workspace, probe_id):
+    """Let only one running app automatically resume a session for review."""
+    import fcntl
+
+    path = workspace.transcript_file(probe_id.split("/")[0]).parent
+    with (path / "slurm-review.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def result_payload(workspace, probe_id, metadata, image_cap):
+    """Read a collected result for either automatic or manual presentation."""
+    probe, _ = _probe(workspace, probe_id)
+    plots = sorted(probe.glob("plot-*.png"))
+    paths = [str(path.relative_to(workspace.path)) for path in plots]
+    output = (probe / "output.txt").read_text()
+    return {
+        "probe_id": probe_id,
+        "backend": "slurm",
+        "expected": metadata["expected"],
+        "code": (probe / "code.py").read_text(),
+        "code_path": str((probe / "code.py").relative_to(workspace.path)),
+        "output": f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}",
+        "text": output,
+        "status": "slurm-error" if metadata["status"] == "error" else "completed",
+        "execution_note": metadata.get("execution_note"),
+        "plot_paths": paths,
+        "plot_urls": [f"/api/asset?path={path}" for path in paths],
+        "plot_images": [
+            base64.b64encode(path.read_bytes()).decode() for path in plots[:image_cap]
+        ],
+    }
+
+
 def _check_locked(workspace, probe_id):
     """Refresh job state; save output after terminal files become visible."""
     probe, metadata = _probe(workspace, probe_id)
@@ -285,7 +360,7 @@ def _check_locked(workspace, probe_id):
         if state in ACTIVE_STATES:
             return _save_metadata(
                 probe,
-                status="running",
+                status="queued" if state == "PENDING" else "running",
                 slurm_state=state,
                 terminal_seen=None,
                 checked=time.time(),
@@ -338,7 +413,7 @@ def _check_locked(workspace, probe_id):
     if state in ACTIVE_STATES:
         return _save_metadata(
             probe,
-            status="running",
+            status="queued" if state == "PENDING" else "running",
             slurm_state=state,
             terminal_seen=None,
             checked=time.time(),
@@ -417,3 +492,13 @@ def list_jobs(workspace):
                 }
             )
     return jobs
+
+
+def pending_jobs(workspace):
+    """Reconstruct the monitor's work, including collected but unreviewed jobs."""
+    with _locked_workspace(workspace):
+        return [
+            job
+            for job in list_jobs(workspace)
+            if not has_verdict(workspace, job["probe_id"])
+        ]

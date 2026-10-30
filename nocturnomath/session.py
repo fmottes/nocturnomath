@@ -520,7 +520,17 @@ class ExplorationSession:
             self._is_busy = False
             await self.emit("status_change", status="idle")
 
-    async def query(self, user_text: str):
+    async def review_slurm(self, probe_id: str):
+        await self.query(
+            f"Runtime event: Slurm probe {probe_id} has finished and its output is saved. "
+            f"Call check_slurm_job for {probe_id} to inspect its output and plots, then "
+            "record its verdict against the original prediction, including if the job "
+            "failed or was cancelled. This is a continuation of the original probe. "
+            "Stop after reviewing it; do not launch further probes or jobs in this turn.",
+            slurm_probe_id=probe_id,
+        )
+
+    async def query(self, user_text: str, *, slurm_probe_id: str | None = None):
         if self._is_busy:
             raise RuntimeError("Agent is already running a query.")
         if self.model is None:
@@ -530,9 +540,15 @@ class ExplorationSession:
         try:
             # Snapshot the selection before yielding so changes made while this turn runs
             # apply to the next message.
-            document_prefix, sent_documents = self.document_context()
+            document_prefix, sent_documents = (
+                self.document_context() if slurm_probe_id is None else ("", {})
+            )
             await self.emit("status_change", status="thinking")
-            self.log_transcript("user", text=user_text)
+            if slurm_probe_id is None:
+                self.log_transcript("user", text=user_text)
+            else:
+                self.log_transcript("slurm_review", probe_id=slurm_probe_id)
+                await self.emit("slurm_review", probe_id=slurm_probe_id)
             options = self._client_options()
             async with ClaudeSDKClient(options) as client:
                 self._current_client = client

@@ -1,5 +1,8 @@
+import asyncio
 import json
 import re
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -59,6 +62,62 @@ def test_startup_discovers_models_without_querying(sdk_model_catalog):
         assert snapshot["effort"] == "high"
         assert snapshot["model_efforts"]["claude-opus-5"][-1] == "max"
         sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
+
+
+def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
+    session, monkeypatch
+):
+    def scheduler(argv, workspace, env=None):
+        output = (
+            "42"
+            if argv[0] == "sbatch"
+            else "42|COMPLETED|0:0\n"
+            if argv[0] == "sacct"
+            else ""
+        )
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr("nocturnomath.slurm._command", scheduler)
+    session.log_transcript("user", text="Run a batch probe.")
+    tools = {tool.name: tool for tool in session.tools}
+    asyncio.run(
+        tools["submit_slurm"].handler(
+            {
+                "code": "print(42)",
+                "expected": "42",
+                "time_minutes": 1,
+                "cpus": 1,
+                "memory_gb": 1,
+                "result_files": ["plot-1.png"],
+            }
+        )
+    )
+    probe = session.workspace.probes_path / "P001"
+    (probe / "stdout.txt").write_text("42\n")
+    (probe / "stderr.txt").write_text("")
+    (probe / "plot-1.png").write_bytes(b"saved plot")
+    reviewed = threading.Event()
+
+    async def review(probe_id):
+        result = await tools["check_slurm_job"].handler({"probe_id": probe_id})
+        assert result["content"][1]["type"] == "image"
+        await tools["verdict"].handler({"text": "It printed 42 as predicted."})
+        reviewed.set()
+
+    monkeypatch.setattr(session, "review_slurm", review)
+    with TestClient(create_app(session)) as client:
+        assert reviewed.wait(timeout=3)
+        snapshot = client.get("/api/workspace").json()
+        records = snapshot["agents"][0]["records"]
+        result = next(record for record in records if record["kind"] == "run")
+        verdict = next(record for record in records if record["kind"] == "verdict")
+        assert result["probe_id"] == verdict["probe_id"] == "S001/P001"
+        assert result["backend"] == "slurm"
+        assert (
+            client.get("/api/asset", params={"path": result["images"][0]}).content
+            == b"saved plot"
+        )
+        assert sum(record["kind"] == "user" for record in records) == 1
 
 
 def test_startup_uses_first_model_when_sdk_has_no_resolved_default(sdk_model_catalog):

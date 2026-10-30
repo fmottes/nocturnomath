@@ -491,7 +491,9 @@ def build_tools(session: "ExplorationSession"):
             )
             session._pending_verdict = None
             session._pending_verdict_probe_id = None
-        await session.emit("probe_verdict", expected=expected, text=text)
+        await session.emit(
+            "probe_verdict", probe_id=probe_id, expected=expected, text=text
+        )
         return {"content": [{"type": "text", "text": "Verdict recorded."}]}
 
     @tool(
@@ -575,10 +577,11 @@ def build_tools(session: "ExplorationSession"):
         "or additional submissions from the script. Scheduler defaults must also select "
         "one job on the current cluster. "
         "The script cannot use the interactive kernel's variables. State a prediction, "
-        "then use check_slurm_job with the returned probe ID to collect the result. "
+        "the runtime monitors it and automatically resumes this chat to review the result. "
+        "Other work can continue while it runs. check_slurm_job is also available manually. "
         "The selected research Python must be available at the same path on compute nodes. "
         "Write plots as plot-1.png, plot-2.png under NOCTURNOMATH_PROBE_DIR. "
-        "Optional result_files are simple filenames written there.",
+        "Declare expected plots and other outputs in result_files so collection waits for them.",
         {
             "type": "object",
             "properties": {
@@ -664,19 +667,22 @@ def build_tools(session: "ExplorationSession"):
         await session.emit(
             "probe_start",
             probe_id=probe_id,
+            backend="slurm",
             expected=args["expected"],
             code=args["code"],
             code_path=f"{probe_dir}/code.py",
         )
         await session.emit(
-            "probe_finish",
+            "probe_update",
             probe_id=probe_id,
+            backend="slurm",
+            job_id=job_id,
             expected=args["expected"],
             code=args["code"],
             code_path=f"{probe_dir}/code.py",
-            output=f"Slurm job {job_id} submitted. Use check_slurm_job with {probe_id}.",
+            output=f"Slurm job {job_id} submitted. Monitoring automatically; verdict pending.",
             text=f"Slurm job {job_id} submitted.",
-            status="slurm-submitted",
+            status="submitted",
             execution_note=None,
             plot_paths=[],
             plot_urls=[],
@@ -687,7 +693,9 @@ def build_tools(session: "ExplorationSession"):
                 {
                     "type": "text",
                     "text": f"Probe {probe_id}: Slurm job {job_id} submitted. "
-                    f"Script: {probe_id}/code.py. Check with check_slurm_job. "
+                    f"Script: {probe_id}/code.py. Monitoring is armed; this chat will "
+                    "automatically resume to inspect the output and plots when ready. "
+                    "You may continue other work while this probe remains unresolved. "
                     "Do not give a verdict until its output is collected.",
                 }
             ]
@@ -755,23 +763,11 @@ def build_tools(session: "ExplorationSession"):
         ]
         terminal = status in ("completed", "error")
         if terminal:
-            output = (probe / "output.txt").read_text()
             await session.emit(
                 "probe_finish",
-                probe_id=probe_id,
-                expected=metadata["expected"],
-                code=(probe / "code.py").read_text(),
-                code_path=str((probe / "code.py").relative_to(session.workspace.path)),
-                output=f"Probe {probe_id}\nSource: {probe_id}/output.txt\n{output}",
-                text=output,
-                status="slurm-error" if status == "error" else status,
-                execution_note=metadata.get("execution_note"),
-                plot_paths=plot_paths,
-                plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
-                plot_images=[
-                    base64.b64encode(path.read_bytes()).decode()
-                    for path in plot_files[: session.image_cap]
-                ],
+                **slurm.result_payload(
+                    session.workspace, probe_id, metadata, session.image_cap
+                ),
             )
         if terminal:
             records = session.workspace.read_transcript(

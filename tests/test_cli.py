@@ -1,3 +1,4 @@
+import asyncio
 import getpass
 import json
 import warnings
@@ -123,6 +124,7 @@ EVENT_PAYLOAD = {
     "message": "something failed",
     "status": "thinking",
     "id": "S001",
+    "session_id": "S001",
     "context_usage": {"used_tokens": 4200, "window_tokens": 200000},
     "context_restored": True,
     "kernel_restored": True,
@@ -139,6 +141,9 @@ EVENT_TYPES = [
     "assistant_text",
     "probe_start",
     "probe_finish",
+    "probe_update",
+    "slurm_review",
+    "agent_added",
     "record_changed",
     "probe_verdict",
     "kernel_restarted",
@@ -182,6 +187,18 @@ def test_every_renderer_is_exercised_by_the_event_contract():
         if name.startswith("_render_")
     }
     assert handlers == set(EVENT_TYPES)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_can_stop_a_recovered_batch_review(terminal):
+    agent_id = terminal.runtime.create_agent()
+    background = terminal.runtime.get_agent(agent_id)
+    background._current_task = asyncio.create_task(asyncio.Event().wait())
+    task = background._current_task
+    assert terminal.app.interrupt()
+    await terminal.app._interrupt_task
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_render_event_shows_the_details_a_reader_needs(terminal):
