@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import shlex
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import claude_agent_sdk
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -35,6 +37,32 @@ logger = logging.getLogger("nocturnomath")
 DEFAULT_EFFORT = "high"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 CONTEXT_USAGE_TIMEOUT_S = 10
+CLAUDE_CLI_NAME = "claude.exe" if sys.platform == "win32" else "claude"
+BUNDLED_CLAUDE_CLI = (
+    Path(claude_agent_sdk.__file__).with_name("_bundled") / CLAUDE_CLI_NAME
+)
+
+
+def claude_cli_candidates() -> list[Path]:
+    """Prefer an installed Claude CLI, then the executable shipped by the SDK."""
+    launch_dir = Path.cwd().resolve()
+    directories = [Path(entry) for entry in os.get_exec_path()]
+    home = Path(os.path.expanduser("~"))
+    if home.is_absolute():
+        directories.append(home / ".local" / "bin")
+    for directory in directories:
+        if not directory.is_absolute():
+            continue
+        candidate = directory / CLAUDE_CLI_NAME
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        resolved = candidate.resolve()
+        if launch_dir in (directory.resolve(), resolved.parent):
+            continue
+        if resolved != BUNDLED_CLAUDE_CLI.resolve():
+            return [candidate, BUNDLED_CLAUDE_CLI]
+        break
+    return [BUNDLED_CLAUDE_CLI]
 
 
 def _stream_delta_text(event: StreamEvent) -> str | None:
@@ -72,6 +100,7 @@ class ExplorationSession:
         self.timeout_s = timeout_s
         self.image_cap = image_cap
         self.auth = auth or ClaudeAuth()
+        self.cli_path = BUNDLED_CLAUDE_CLI
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
         self.status = "idle"
@@ -425,6 +454,7 @@ class ExplorationSession:
     def _client_options(self) -> ClaudeAgentOptions:
         compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
         return ClaudeAgentOptions(
+            cli_path=self.cli_path,
             # The research MCP tools are the complete execution surface. Do not
             # inherit Claude Code's built-ins or unrelated MCP configuration.
             tools=[],

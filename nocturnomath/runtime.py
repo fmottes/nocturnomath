@@ -13,7 +13,13 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from . import slurm
 from .auth import AuthMethod, ClaudeAuth
-from .session import DEFAULT_EFFORT, EFFORT_LEVELS, ExplorationSession
+from .session import (
+    BUNDLED_CLAUDE_CLI,
+    DEFAULT_EFFORT,
+    EFFORT_LEVELS,
+    ExplorationSession,
+    claude_cli_candidates,
+)
 
 logger = logging.getLogger("nocturnomath.runtime")
 
@@ -53,6 +59,7 @@ class Runtime:
         self.model_labels = {}
         self.model_efforts: dict[str, list[str]] = {}
         self.sdk_default_model: str | None = None
+        self._cli_path = BUNDLED_CLAUDE_CLI
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
         self.navigator_root = Path(navigator_root).expanduser().resolve()
@@ -276,54 +283,72 @@ class Runtime:
 
     async def discover_models(self):
         """Read the CLI's model catalog without sending an inference request."""
-        models: list[str] = []
-        labels: dict[str, str] = {}
         model_efforts: dict[str, list[str]] = {}
         sdk_default_model = None
         try:
-            async with asyncio.timeout(15):
-                async with ClaudeSDKClient(
-                    ClaudeAgentOptions(
-                        tools=[],
-                        mcp_servers={},
-                        strict_mcp_config=True,
-                        setting_sources=["user"],
-                        skills=[],
-                        env=self.auth.sdk_env(),
+            for cli_path in claude_cli_candidates():
+                options = ClaudeAgentOptions(
+                    cli_path=cli_path,
+                    tools=[],
+                    mcp_servers={},
+                    strict_mcp_config=True,
+                    setting_sources=["user"],
+                    skills=[],
+                    env=self.auth.sdk_env(),
+                )
+                try:
+                    async with asyncio.timeout(15), ClaudeSDKClient(options) as client:
+                        server_info = await client.get_server_info()
+                except Exception as exc:
+                    logger.warning(
+                        "Claude model discovery with %s failed: %s", cli_path, exc
                     )
-                ) as client:
-                    info = await client.get_server_info()
-            for model in (info or {}).get("models", []):
-                value = model.get("value")
-                resolved = model.get("resolvedModel")
-                if not isinstance(value, str) or not value:
                     continue
-                identifier = (
-                    resolved if isinstance(resolved, str) and resolved else None
+                entries = (
+                    server_info.get("models") if isinstance(server_info, dict) else None
                 )
-                if value == "default":
-                    sdk_default_model = identifier
-                if identifier is None and value != "default":
-                    identifier = value
-                if identifier is None:
+                if not isinstance(entries, list):
+                    entries = []
+                for model in entries:
+                    if not isinstance(model, dict):
+                        continue
+                    value = model.get("value")
+                    resolved = model.get("resolvedModel")
+                    if not isinstance(value, str) or not value:
+                        continue
+                    identifier = (
+                        resolved if isinstance(resolved, str) and resolved else None
+                    )
+                    if value == "default":
+                        sdk_default_model = identifier
+                    if identifier is None and value != "default":
+                        identifier = value
+                    if identifier is None:
+                        continue
+                    levels = model.get("supportedEffortLevels")
+                    supported = (
+                        [level for level in levels if level in EFFORT_LEVELS]
+                        if isinstance(levels, list)
+                        else list(EFFORT_LEVELS)
+                        if model.get("supportsEffort")
+                        else []
+                    )
+                    current = model_efforts.setdefault(identifier, [])
+                    current.extend(level for level in supported if level not in current)
+                if not model_efforts:
+                    logger.warning(
+                        "Claude CLI at %s reported no usable models", cli_path
+                    )
                     continue
-                if identifier not in models:
-                    models.append(identifier)
-                labels[identifier] = identifier
-                levels = model.get("supportedEffortLevels")
-                supported = (
-                    [level for level in levels if level in EFFORT_LEVELS]
-                    if isinstance(levels, list)
-                    else list(EFFORT_LEVELS)
-                    if model.get("supportsEffort")
-                    else []
-                )
-                current = model_efforts.setdefault(identifier, [])
-                current.extend(level for level in supported if level not in current)
+                self._cli_path = cli_path
+                for session in self.agents.values():
+                    session.cli_path = cli_path
+                break
         except Exception as exc:
             logger.warning("Could not discover Claude models: %s", exc)
+        models = list(model_efforts)
         self.models = models
-        self.model_labels = labels
+        self.model_labels = {model: model for model in models}
         self.model_efforts = model_efforts
         self.sdk_default_model = (
             sdk_default_model
@@ -343,6 +368,11 @@ class Runtime:
                     session.default_effort = self._select_effort(
                         session.default_model, session.default_effort
                     )
+                    if models:
+                        session.model = self._select_model(session.model)
+                        session.effort = self._select_effort(
+                            session.model, session.effort
+                        )
         self._wake_slurm_monitor()
 
     def _select_model(self, preferred: str | None) -> str | None:
@@ -554,6 +584,7 @@ class Runtime:
             image_cap=self.image_cap,
             auth=self._auth,
         )
+        session.cli_path = self._cli_path
         if session_id is not None:
             try:
                 session.resume_session(session_id)
@@ -638,6 +669,7 @@ class Runtime:
             image_cap=old.image_cap,
             auth=self._auth,
         )
+        replacement.cli_path = self._cli_path
         try:
             data = replacement.resume_session(session_id, restore_kernel)
         except Exception:

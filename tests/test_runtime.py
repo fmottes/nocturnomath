@@ -1,10 +1,12 @@
 import asyncio
+import os
 import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from nocturnomath.runtime import Runtime
+from nocturnomath.session import CLAUDE_CLI_NAME, claude_cli_candidates
 
 
 @pytest.mark.asyncio
@@ -149,6 +151,139 @@ def test_export_notebook_names_the_file_after_workspace_and_session(session):
 
     with pytest.raises(RuntimeError, match="Open a workspace"):
         Runtime().export_notebook()
+
+
+@pytest.mark.asyncio
+async def test_discovery_applies_startup_model_only_if_reported():
+    runtime = Runtime(model="unavailable-model")
+    with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
+        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
+            return_value={
+                "models": [{"value": "default", "resolvedModel": "claude-sonnet-5"}]
+            }
+        )
+        await runtime.discover_models()
+
+    assert sdk.call_args.args[0].model is None
+    assert runtime.model == "claude-sonnet-5"
+
+
+def test_cli_lookup_excludes_launch_directory_and_relative_path(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    relative_bin = workspace / "bin"
+    installed_bin = tmp_path / "installed"
+    for directory in (workspace, relative_bin, installed_bin):
+        directory.mkdir()
+        path = directory / CLAUDE_CLI_NAME
+        path.touch(mode=0o700)
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join(("", str(workspace), "bin", str(installed_bin)))
+    )
+
+    assert claude_cli_candidates()[0] == installed_bin / CLAUDE_CLI_NAME
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_discovery",
+    [
+        pytest.param(RuntimeError("CLI unavailable"), id="failed-handshake"),
+        pytest.param({"commands": []}, id="missing-catalogue"),
+        pytest.param({"models": []}, id="empty-catalogue"),
+        pytest.param({"models": [None, {"value": "default"}]}, id="unusable-models"),
+    ],
+)
+async def test_cli_fallback_is_used_for_existing_and_new_chats(
+    session, tmp_path, failed_discovery
+):
+    installed = tmp_path / "installed" / CLAUDE_CLI_NAME
+    bundled = tmp_path / "bundled" / CLAUDE_CLI_NAME
+    runtime = Runtime(session)
+
+    def catalog(identifier):
+        return {"models": [{"value": "default", "resolvedModel": identifier}]}
+
+    with (
+        patch(
+            "nocturnomath.runtime.claude_cli_candidates",
+            return_value=[installed, bundled],
+        ),
+        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
+    ):
+        info = sdk.return_value.__aenter__.return_value.get_server_info
+        info.side_effect = [
+            catalog("local-model"),
+            failed_discovery,
+            catalog("bundled-model"),
+        ]
+        await runtime.discover_models()
+        assert session._client_options().cli_path == installed
+        assert session.model == "local-model"
+
+        await runtime.authenticate("api_key", "unverified-key")
+
+    assert [args.args[0].cli_path for args in sdk.call_args_list] == [
+        installed,
+        installed,
+        bundled,
+    ]
+    assert runtime.models == ["bundled-model"]
+    assert session.model == "bundled-model"
+    assert session._client_options().cli_path == bundled
+    new_session = runtime.get_agent(runtime.create_agent())
+    assert new_session._client_options().cli_path == bundled
+
+
+@pytest.mark.asyncio
+async def test_catalogue_refresh_revalidates_chats_using_the_same_cli(
+    session, tmp_path
+):
+    installed = tmp_path / "installed" / CLAUDE_CLI_NAME
+    runtime = Runtime(session)
+    common_model = {"value": "shared-model", "supportedEffortLevels": ["high"]}
+
+    with (
+        patch("nocturnomath.runtime.claude_cli_candidates", return_value=[installed]),
+        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
+    ):
+        info = sdk.return_value.__aenter__.return_value.get_server_info
+        info.side_effect = [
+            {
+                "models": [
+                    {"value": "default", "resolvedModel": "old-model"},
+                    common_model,
+                ]
+            },
+            {
+                "models": [
+                    {
+                        "value": "default",
+                        "resolvedModel": "new-model",
+                        "supportedEffortLevels": ["medium"],
+                    },
+                    {**common_model, "supportedEffortLevels": ["low"]},
+                ]
+            },
+        ]
+        await runtime.discover_models()
+        assert session.model == "old-model"
+        other = runtime.get_agent(runtime.create_agent())
+        other.model = "shared-model"
+        other.effort = "high"
+        session._sdk_session_id = "resumed-session"
+
+        await runtime.authenticate("api_key", "unverified-key")
+
+    options = session._client_options()
+    assert (options.cli_path, options.model, options.effort, options.resume) == (
+        installed,
+        "new-model",
+        "medium",
+        "resumed-session",
+    )
+    assert (other.model, other.effort) == ("shared-model", "low")
 
 
 @pytest.mark.asyncio
