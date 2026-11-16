@@ -638,7 +638,7 @@ class Workspace:
                 if isinstance(text, str) and text.strip():
                     pending_agent.append(text)
                 continue
-            if kind in ("meta", "kernel_started", "resumed"):
+            if kind in ("meta", "kernel_started", "resumed", "message_usage", "usage"):
                 continue
             flush_agent()
 

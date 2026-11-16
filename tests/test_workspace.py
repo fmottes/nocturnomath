@@ -214,6 +214,27 @@ def test_notebook_export_identifies_uncollected_slurm_result(tmp_path):
     assert notebook["cells"][3]["source"] == "Slurm result has not been collected."
 
 
+def test_notebook_export_ignores_usage_records(tmp_path):
+    workspace = Workspace(tmp_path)
+    workspace.log_transcript("user", text="Question")
+    workspace.log_transcript("agent", text="First part")
+    workspace.log_transcript(
+        "message_usage", message_id="msg_2", model="m", usage={"output_tokens": 5}
+    )
+    workspace.log_transcript("agent", text="Second part")
+    workspace.log_transcript("usage", usage={"output_tokens": 5}, num_turns=1)
+
+    notebook = workspace.export_notebook("S001")
+
+    agent_cells = [
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("nocturnomath", {}).get("kind") == "agent"
+    ]
+    assert len(agent_cells) == 1
+    assert "First part\n\nSecond part" in "".join(agent_cells[0]["source"])
+
+
 def test_documents_are_created_listed_and_edited(tmp_path):
     workspace = Workspace(tmp_path)
     (tmp_path / "README.md").write_text("# Not a document\n")
