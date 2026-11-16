@@ -48,6 +48,7 @@ nocturnomath --path /path/to/project
 
 Both interfaces accept:
 
+- `--version`: print the installed Nocturnomath version and exit
 - `--path`, `-p`: starting folder; the terminal opens it immediately
 - `--python`: research Python executable, or `managed`
 - `--default-model`: exact Claude model identifier for new sessions; when omitted, uses the model reported as the SDK default

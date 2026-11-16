@@ -1,11 +1,18 @@
 """Arguments shared by the web and terminal commands."""
 
 import argparse
+from importlib.metadata import version
 
 from ..session import EFFORT_LEVELS
 
 
 def add_session_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {version('nocturnomath')}",
+        help="show the installed Nocturnomath version and exit",
+    )
     parser.add_argument(
         "--path",
         "-p",
