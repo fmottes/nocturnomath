@@ -1,6 +1,7 @@
 """Conversation orchestration for a scientific exploration session."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -641,6 +642,23 @@ class ExplorationSession:
                         raise RuntimeError(
                             message.result or "Claude could not finish this turn."
                         )
+                    if isinstance(message, ResultMessage):
+                        self.log_transcript(
+                            "usage",
+                            usage=message.usage,
+                            model_usage={
+                                name: dataclasses.asdict(value)
+                                if dataclasses.is_dataclass(value)
+                                else value
+                                for name, value in message.model_usage.items()
+                            }
+                            if message.model_usage is not None
+                            else None,
+                            total_cost_usd=message.total_cost_usd,
+                            duration_ms=message.duration_ms,
+                            duration_api_ms=message.duration_api_ms,
+                            num_turns=message.num_turns,
+                        )
                     if isinstance(message, StreamEvent):
                         delta = _stream_delta_text(message)
                         if delta:
@@ -652,6 +670,13 @@ class ExplorationSession:
                         await self._record_compaction()
                     elif isinstance(message, AssistantMessage):
                         usage = message.usage or {}
+                        if message.parent_tool_use_id is None and usage:
+                            self.log_transcript(
+                                "message_usage",
+                                message_id=message.message_id,
+                                model=message.model,
+                                usage=usage,
+                            )
                         prompt_counts = (
                             usage.get("input_tokens", 0),
                             usage.get("cache_read_input_tokens", 0),

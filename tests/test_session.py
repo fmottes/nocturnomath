@@ -85,6 +85,27 @@ class UsageClient(FakeClient):
         )
 
 
+class CostClient(FakeClient):
+    async def receive_response(self):
+        yield AssistantMessage(
+            content=[TextBlock("hi")],
+            model="m",
+            session_id="sdk-session",
+            usage={"input_tokens": 10, "output_tokens": 5},
+            message_id="msg_1",
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session",
+            total_cost_usd=0.01,
+            usage={"input_tokens": 10, "output_tokens": 5},
+        )
+
+
 class CompactingClient(FakeClient):
     async def receive_response(self):
         yield SystemMessage(subtype="compact_boundary", data={"trigger": "auto"})
@@ -539,3 +560,18 @@ async def test_document_context_is_retried_when_submission_fails(session):
         await session.query("second")
     assert "### inputs.md\n\n# Inputs\n" in FakeClient.prompts[-1]
     assert "# Evidence" in FakeClient.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_query_logs_usage_records(session):
+    with patch("nocturnomath.session.ClaudeSDKClient", CostClient):
+        await session.query("hello")
+    records = [
+        json.loads(line) for line in session.transcript_path.read_text().splitlines()
+    ]
+    msg = [r for r in records if r["kind"] == "message_usage"]
+    total = [r for r in records if r["kind"] == "usage"]
+    assert len(msg) == 1 and msg[0]["message_id"] == "msg_1"
+    assert msg[0]["usage"]["output_tokens"] == 5
+    assert len(total) == 1 and total[0]["total_cost_usd"] == 0.01
+    assert total[0]["num_turns"] == 1
