@@ -1,4 +1,4 @@
-"""Claude MCP tools bound to an exploration session."""
+"""Session-bound exploration and scientific record tool definitions."""
 
 import ast
 import asyncio
@@ -6,15 +6,68 @@ import base64
 import json
 import re
 import threading
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING
-
-from claude_agent_sdk import tool
+from typing import TYPE_CHECKING, Any
 
 from . import slurm
 
 if TYPE_CHECKING:
     from .session import ExplorationSession
+
+_PYTHON_TYPE_SCHEMA: dict[type[Any], str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+}
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Provider-neutral definition of a session-bound tool."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+    annotations: dict[str, Any] | None = None
+
+
+def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert shorthand Python-type mappings into JSON Schema objects."""
+    if schema.get("type") == "object" and "properties" in schema:
+        return dict(schema)
+    if not schema:
+        return {"type": "object", "properties": {}, "additionalProperties": False}
+    properties = {
+        key: {"type": _PYTHON_TYPE_SCHEMA.get(value, "string")}
+        for key, value in schema.items()
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(schema.keys()),
+    }
+
+
+def tool(name: str, description: str, schema: dict[str, Any]):
+    """Bind an async handler into a provider-neutral ``ToolSpec``."""
+    normalized = _normalize_schema(schema)
+
+    def decorator(
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> ToolSpec:
+        return ToolSpec(
+            name=name,
+            description=description,
+            input_schema=normalized,
+            handler=handler,
+        )
+
+    return decorator
+
 
 BACKEND_SWITCH = re.compile(
     r"matplotlib\.use\s*\(|switch_backend\s*\(|%matplotlib\s+(?!inline\b)\S"
