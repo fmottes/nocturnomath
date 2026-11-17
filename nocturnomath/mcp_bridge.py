@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sys
@@ -18,7 +19,7 @@ from .tools import ToolSpec
 
 logger = logging.getLogger("nocturnomath.mcp_bridge")
 
-_SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+_PROTOCOL_VERSION_RE = re.compile(r"^20\d\d-\d\d-\d\d$")
 _DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -178,7 +179,8 @@ class McpToolBridge:
             )
             version = (
                 requested
-                if requested in _SUPPORTED_PROTOCOL_VERSIONS
+                if isinstance(requested, str)
+                and _PROTOCOL_VERSION_RE.fullmatch(requested)
                 else _DEFAULT_PROTOCOL_VERSION
             )
             return _jsonrpc_result(
