@@ -1,99 +1,240 @@
-"""In-memory authentication configuration for Claude Agent SDK clients."""
+"""In-memory multi-provider authentication configuration."""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
-AuthMethod = Literal["claude_code", "subscription", "api_key"]
+ProviderId = Literal["anthropic", "openai", "google"]
+PROVIDERS: tuple[ProviderId, ...] = ("anthropic", "openai", "google")
 
-LABELS: dict[str, str] = {
-    "claude_code": "Claude Code (automatic)",
-    "subscription": "Claude subscription",
-    "api_key": "Claude API key",
+PROVIDER_TITLES: dict[ProviderId, str] = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
 }
 
-# Environment credentials the Claude CLI would prefer over one typed into
-# Nocturnomath. Empty values read as unset, so a manual credential wins.
-_CREDENTIAL_ENV = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-)
+PROVIDER_METHODS: dict[ProviderId, dict[str, str]] = {
+    "anthropic": {
+        "cli": "Claude CLI (automatic)",
+        "subscription": "Claude subscription",
+        "api_key": "Anthropic API key",
+    },
+    "openai": {
+        "cli": "Codex CLI (automatic)",
+        "api_key": "OpenAI API key",
+    },
+    "google": {
+        "cli": "Antigravity CLI (automatic)",
+        "api_key": "Google Gemini API key",
+    },
+}
 
-# Inherited settings that decide where automatic mode sends requests, roughly
-# in the order the CLI consults them. Reported to the user, never overridden.
-_INHERITED_ENV = (
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-)
+_CREDENTIAL_ENV: dict[ProviderId, tuple[str, ...]] = {
+    "anthropic": (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ),
+    "openai": (
+        "CODEX_API_KEY",
+        "OPENAI_API_KEY",
+    ),
+    "google": (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ),
+}
+
+_INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
+    "anthropic": (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ),
+    "openai": (
+        "CODEX_API_KEY",
+        "OPENAI_API_KEY",
+    ),
+    "google": (
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ),
+}
 
 
-def inherited_credential() -> str | None:
-    """Name the environment variable Claude Code will use instead of its saved login."""
-    for name in _INHERITED_ENV:
+def inherited_credential(provider: ProviderId = "anthropic") -> str | None:
+    """Name the environment variable a CLI uses instead of its saved login."""
+    for name in _INHERITED_ENV[provider]:
         if os.environ.get(name):
             return name
     return None
 
 
 @dataclass(frozen=True)
-class ClaudeAuth:
-    """One credential choice, kept only in the running process.
+class ProviderAuth:
+    """One provider credential choice, kept only in the running process."""
 
-    The default instance changes nothing: the SDK resolves Claude Code's saved
-    login and environment exactly as it would without Nocturnomath.
-    """
+    provider: ProviderId
+    method: str = "cli"
+    credential: str | None = field(default=None, repr=False)
+
+    @classmethod
+    def interactive(
+        cls, provider: str, method: str, credential: str | None
+    ) -> ProviderAuth:
+        """Validate a credential entered through one of Nocturnomath's UIs."""
+        if provider not in PROVIDERS:
+            raise ValueError("Choose Anthropic, OpenAI, or Google.")
+        methods = PROVIDER_METHODS[provider]
+        if method not in methods:
+            choices = ", ".join(methods)
+            raise ValueError(
+                f"Choose a valid {PROVIDER_TITLES[provider]} authentication method: {choices}."
+            )
+        if method == "cli":
+            if credential and credential.strip():
+                raise ValueError(f"{methods['cli']} does not take a credential.")
+            return cls(provider=provider, method="cli")
+        value = (credential or "").strip()
+        if not value:
+            noun = "subscription token" if method == "subscription" else "API key"
+            raise ValueError(f"Enter a {PROVIDER_TITLES[provider]} {noun}.")
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(
+                "The credential must not contain whitespace or control characters."
+            )
+        return cls(provider=provider, method=method, credential=value)
+
+    def sdk_env(self) -> dict[str, str]:
+        """Return the environment overlay passed directly to the provider CLI."""
+        if self.method == "cli":
+            return {}
+        env = dict.fromkeys(_CREDENTIAL_ENV[self.provider], "")
+        secret = self.credential or ""
+        if self.provider == "anthropic":
+            key = (
+                "CLAUDE_CODE_OAUTH_TOKEN"
+                if self.method == "subscription"
+                else "ANTHROPIC_API_KEY"
+            )
+            env[key] = secret
+        elif self.provider == "openai":
+            env["CODEX_API_KEY"] = secret
+            env["OPENAI_API_KEY"] = secret
+        elif self.provider == "google":
+            env["GEMINI_API_KEY"] = secret
+        return env
+
+    def public(self) -> dict[str, Any]:
+        """Describe the selection without exposing the secret."""
+        note = None
+        if self.method == "cli":
+            name = inherited_credential(self.provider)
+            if name:
+                note = (
+                    f"{name} is set in the environment and takes precedence "
+                    f"over {PROVIDER_TITLES[self.provider]}'s saved CLI login."
+                )
+        return {
+            "provider": self.provider,
+            "title": PROVIDER_TITLES[self.provider],
+            "method": self.method,
+            "label": PROVIDER_METHODS[self.provider][self.method],
+            "note": note,
+        }
+
+
+class AuthStore:
+    """In-memory credential configuration across all supported providers."""
+
+    def __init__(self, providers: Mapping[ProviderId, ProviderAuth] | None = None):
+        self._providers: dict[ProviderId, ProviderAuth] = {
+            provider: ProviderAuth(provider=provider, method="cli")
+            for provider in PROVIDERS
+        }
+        if providers:
+            for provider, auth in providers.items():
+                self._providers[provider] = auth
+
+    def get(self, provider: ProviderId) -> ProviderAuth:
+        return self._providers[provider]
+
+    def set(
+        self, provider: ProviderId, method: str, credential: str | None = None
+    ) -> ProviderAuth:
+        auth = ProviderAuth.interactive(provider, method, credential)
+        self._providers[auth.provider] = auth
+        return auth
+
+    def copy(self) -> AuthStore:
+        return AuthStore(self._providers)
+
+    def summary_label(self) -> str:
+        custom = [
+            f"{PROVIDER_TITLES[p]}: {PROVIDER_METHODS[p][self._providers[p].method]}"
+            for p in PROVIDERS
+            if self._providers[p].method != "cli"
+        ]
+        return ", ".join(custom) if custom else "CLI logins (automatic)"
+
+    def public(
+        self, provider_models: Mapping[ProviderId, Sequence[str]] | None = None
+    ) -> dict[str, Any]:
+        return {
+            "label": self.summary_label(),
+            "providers": {
+                provider: {
+                    **self._providers[provider].public(),
+                    "models_count": (
+                        len(provider_models.get(provider, ()))
+                        if provider_models is not None
+                        else None
+                    ),
+                }
+                for provider in PROVIDERS
+            },
+        }
+
+
+# Temporary compatibility bridge until Unit 4 updates session.py and runtime.py.
+AuthMethod = Literal["claude_code", "subscription", "api_key"]
+LABELS: dict[str, str] = {
+    "claude_code": "Claude Code (automatic)",
+    "subscription": "Claude subscription",
+    "api_key": "Claude API key",
+}
+
+
+@dataclass(frozen=True)
+class ClaudeAuth:
+    """Temporary Claude-only auth wrapper removed once Unit 4 wires AuthStore."""
 
     method: AuthMethod = "claude_code"
     credential: str | None = field(default=None, repr=False)
 
     @classmethod
     def interactive(cls, method: AuthMethod, credential: str | None) -> ClaudeAuth:
-        """Validate a credential entered through one of Nocturnomath's UIs."""
-        if method not in LABELS:
-            raise ValueError("Choose Claude Code, a subscription token, or an API key.")
-        if method == "claude_code":
-            if credential and credential.strip():
-                raise ValueError("Claude Code login does not take a credential.")
-            return cls()
-        value = (credential or "").strip()
-        if not value:
-            noun = "subscription token" if method == "subscription" else "API key"
-            raise ValueError(f"Enter a Claude {noun}.")
-        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
-            raise ValueError(
-                "The credential must not contain whitespace or control characters."
-            )
-        return cls(method, value)
+        mapped = "cli" if method == "claude_code" else method
+        auth = ProviderAuth.interactive("anthropic", mapped, credential)
+        return cls(method=method, credential=auth.credential)
 
     def sdk_env(self) -> dict[str, str]:
-        """Return the environment overlay passed directly to ClaudeAgentOptions."""
-        if self.method == "claude_code":
-            return {}
-        env = dict.fromkeys(_CREDENTIAL_ENV, "")
-        name = (
-            "CLAUDE_CODE_OAUTH_TOKEN"
-            if self.method == "subscription"
-            else "ANTHROPIC_API_KEY"
-        )
-        env[name] = self.credential or ""
-        return env
+        mapped = "cli" if self.method == "claude_code" else self.method
+        return ProviderAuth("anthropic", mapped, self.credential).sdk_env()
 
     def public(self) -> dict[str, str | None]:
-        """Describe the selection without exposing the secret."""
-        note = None
-        if self.method == "claude_code":
-            name = inherited_credential()
-            if name:
-                note = (
-                    f"{name} is set in the environment and takes precedence "
-                    "over Claude Code's saved login."
-                )
-        return {"method": self.method, "label": LABELS[self.method], "note": note}
+        mapped = "cli" if self.method == "claude_code" else self.method
+        data = ProviderAuth("anthropic", mapped, self.credential).public()
+        return {
+            "method": self.method,
+            "label": LABELS[self.method],
+            "note": data["note"],
+        }
