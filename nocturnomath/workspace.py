@@ -491,11 +491,17 @@ class Workspace:
         return records
 
     @staticmethod
-    def sdk_id(records: list[dict[str, Any]]) -> str | None:
+    def sdk_session_info(
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
         for record in reversed(records):
             if record.get("kind") == "meta" and record.get("sdk_session_id"):
-                return record["sdk_session_id"]
-        return None
+                return record.get("provider") or "anthropic", record["sdk_session_id"]
+        return None, None
+
+    @classmethod
+    def sdk_id(cls, records: list[dict[str, Any]]) -> str | None:
+        return cls.sdk_session_info(records)[1]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []

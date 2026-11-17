@@ -4,22 +4,15 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-
 from . import slurm
-from .auth import AuthMethod, ClaudeAuth
-from .session import (
-    BUNDLED_CLAUDE_CLI,
-    DEFAULT_EFFORT,
-    EFFORT_LEVELS,
-    ExplorationSession,
-    claude_cli_candidates,
-)
+from .auth import PROVIDERS, AuthStore, ProviderId
+from .backends import DEFAULT_EFFORT, AgentBackend, default_backends
+from .session import ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
 
@@ -41,25 +34,33 @@ class Runtime:
         image_cap: int = 2,
         navigator_root: Path | str = ".",
         session_factory: Callable[..., ExplorationSession] = ExplorationSession,
-        auth: ClaudeAuth | None = None,
+        auth: AuthStore | None = None,
+        backends: Mapping[ProviderId, AgentBackend] | None = None,
     ):
         # ``session`` remains the terminal client's single-explorer facade.
         # The web client uses the ordered registry below and always supplies an id.
         self.session = session
         self.agents: dict[str, ExplorationSession] = {}
         self.primary_agent_id: str | None = None
-        self._auth = auth or (session.auth if session else ClaudeAuth())
+        self.backends: dict[ProviderId, AgentBackend] = (
+            dict(backends) if backends is not None else default_backends()
+        )
+        self._auth = auth or (session.auth if session else AuthStore())
         if session:
             session.auth = self._auth
+            if backends is not None:
+                session.backends = dict(self.backends)
         self.startup_default_model = model
         self.startup_default_effort = effort
         self.model = session.model if session else None
         self.effort = session.effort if session else (effort or DEFAULT_EFFORT)
-        self.models = []
-        self.model_labels = {}
+        self.models: list[str] = []
+        self.model_labels: dict[str, str] = {}
+        self.model_providers: dict[str, ProviderId] = {}
+        self.model_raw_ids: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
+        self._provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
         self.sdk_default_model: str | None = None
-        self._cli_path = BUNDLED_CLAUDE_CLI
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
         self.navigator_root = Path(navigator_root).expanduser().resolve()
@@ -83,12 +84,12 @@ class Runtime:
         return bool(self.agents)
 
     @property
-    def auth(self) -> ClaudeAuth:
-        """The credential the next SDK client uses; the session owns it once open."""
+    def auth(self) -> AuthStore:
+        """Credential store shared across all open explorers."""
         return self.session.auth if self.session else self._auth
 
     @auth.setter
-    def auth(self, auth: ClaudeAuth):
+    def auth(self, auth: AuthStore):
         self._auth = auth
         for session in self.agents.values():
             session.auth = auth
@@ -282,84 +283,58 @@ class Runtime:
                 self._wake_slurm_monitor()
 
     async def discover_models(self):
-        """Read the CLI's model catalog without sending an inference request."""
+        """Read model catalogues concurrently across all available provider CLIs."""
+        results = await asyncio.gather(
+            *(
+                self.backends[provider].discover_models(self.auth.get(provider))
+                for provider in PROVIDERS
+            ),
+            return_exceptions=True,
+        )
+        models: list[str] = []
+        model_labels: dict[str, str] = {}
+        model_providers: dict[str, ProviderId] = {}
+        model_raw_ids: dict[str, str] = {}
         model_efforts: dict[str, list[str]] = {}
-        sdk_default_model = None
-        try:
-            for cli_path in claude_cli_candidates():
-                options = ClaudeAgentOptions(
-                    cli_path=cli_path,
-                    tools=[],
-                    mcp_servers={},
-                    strict_mcp_config=True,
-                    setting_sources=["user"],
-                    skills=[],
-                    env=self.auth.sdk_env(),
-                )
-                try:
-                    async with asyncio.timeout(15), ClaudeSDKClient(options) as client:
-                        server_info = await client.get_server_info()
-                except Exception as exc:
-                    logger.warning(
-                        "Claude model discovery with %s failed: %s", cli_path, exc
-                    )
+        provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+        provider_defaults: list[str] = []
+        seen: set[str] = set()
+
+        for provider, result in zip(PROVIDERS, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning("Could not discover %s models: %s", provider, result)
+                continue
+            for spec in result:
+                spec_id = spec.id
+                if spec_id in seen:
+                    spec_id = f"{spec.provider}/{spec.raw_id}"
+                if spec_id in seen:
                     continue
-                entries = (
-                    server_info.get("models") if isinstance(server_info, dict) else None
-                )
-                if not isinstance(entries, list):
-                    entries = []
-                for model in entries:
-                    if not isinstance(model, dict):
-                        continue
-                    value = model.get("value")
-                    resolved = model.get("resolvedModel")
-                    if not isinstance(value, str) or not value:
-                        continue
-                    identifier = (
-                        resolved if isinstance(resolved, str) and resolved else None
-                    )
-                    if value == "default":
-                        sdk_default_model = identifier
-                    if identifier is None and value != "default":
-                        identifier = value
-                    if identifier is None:
-                        continue
-                    levels = model.get("supportedEffortLevels")
-                    supported = (
-                        [level for level in levels if level in EFFORT_LEVELS]
-                        if isinstance(levels, list)
-                        else list(EFFORT_LEVELS)
-                        if model.get("supportsEffort")
-                        else []
-                    )
-                    current = model_efforts.setdefault(identifier, [])
-                    current.extend(level for level in supported if level not in current)
-                if not model_efforts:
-                    logger.warning(
-                        "Claude CLI at %s reported no usable models", cli_path
-                    )
-                    continue
-                self._cli_path = cli_path
-                for session in self.agents.values():
-                    session.cli_path = cli_path
-                break
-        except Exception as exc:
-            logger.warning("Could not discover Claude models: %s", exc)
-        models = list(model_efforts)
+                seen.add(spec_id)
+                models.append(spec_id)
+                model_labels[spec_id] = spec.label
+                model_providers[spec_id] = spec.provider
+                model_raw_ids[spec_id] = spec.raw_id
+                model_efforts[spec_id] = list(spec.efforts)
+                provider_models[spec.provider].append(spec_id)
+                if spec.is_default:
+                    provider_defaults.append(spec_id)
+
         self.models = models
-        self.model_labels = {model: model for model in models}
+        self.model_labels = model_labels
+        self.model_providers = model_providers
+        self.model_raw_ids = model_raw_ids
         self.model_efforts = model_efforts
+        self._provider_models = provider_models
         self.sdk_default_model = (
-            sdk_default_model
-            if sdk_default_model in models
-            else models[0]
-            if models
-            else None
+            provider_defaults[0] if provider_defaults else models[0] if models else None
         )
         self.model = self._select_model(self.model or self.startup_default_model)
         self.effort = self._select_effort(self.model, self.effort)
         if self.agents:
+            for session in self.agents.values():
+                session.model_providers = dict(self.model_providers)
+                session.model_raw_ids = dict(self.model_raw_ids)
             if self._workspace_defaults_pending:
                 self._apply_workspace_defaults()
             else:
@@ -378,6 +353,14 @@ class Runtime:
     def _select_model(self, preferred: str | None) -> str | None:
         if preferred in self.models:
             return preferred
+        if isinstance(preferred, str) and "/" in preferred:
+            provider, _, raw = preferred.partition("/")
+            for spec_id in self.models:
+                if (
+                    self.model_providers.get(spec_id) == provider
+                    and self.model_raw_ids.get(spec_id) == raw
+                ):
+                    return spec_id
         return self.sdk_default_model
 
     def _select_effort(self, model: str | None, preferred: str | None) -> str | None:
@@ -459,17 +442,17 @@ class Runtime:
         self.effort = session.effort
 
     async def authenticate(
-        self, method: AuthMethod, credential: str | None = None
-    ) -> dict[str, str | None]:
-        """Select the credential for the next SDK client.
+        self, provider: ProviderId, method: str, credential: str | None = None
+    ) -> dict[str, Any]:
+        """Select the credential for one provider backend.
 
-        Nothing is verified here: the CLI reports a bad credential on the next
-        message. The model catalogue is refreshed as a courtesy and may be empty.
+        Nothing is verified here: the provider CLI reports a bad credential on
+        the next message. The model catalogue is refreshed as a courtesy.
         """
-        self.require_all_idle("change Claude authentication")
-        self.auth = ClaudeAuth.interactive(method, credential)
+        self.require_all_idle("change authentication")
+        self.auth.set(provider, method, credential)
         await self.discover_models()
-        return self.auth.public()
+        return self.auth.public(self._provider_models)
 
     def shutdown(self):
         self._started = False
@@ -583,8 +566,10 @@ class Runtime:
             timeout_s=self.timeout_s,
             image_cap=self.image_cap,
             auth=self._auth,
+            backends=self.backends,
+            model_providers=self.model_providers,
+            model_raw_ids=self.model_raw_ids,
         )
-        session.cli_path = self._cli_path
         if session_id is not None:
             try:
                 session.resume_session(session_id)
@@ -668,8 +653,10 @@ class Runtime:
             timeout_s=old.timeout_s,
             image_cap=old.image_cap,
             auth=self._auth,
+            backends=self.backends,
+            model_providers=self.model_providers,
+            model_raw_ids=self.model_raw_ids,
         )
-        replacement.cli_path = self._cli_path
         try:
             data = replacement.resume_session(session_id, restore_kernel)
         except Exception:
@@ -686,6 +673,7 @@ class Runtime:
     def workspace_snapshot(self) -> dict[str, Any]:
         """Describe the current workspace for a client that just connected."""
         session = self.session
+        auth_public = self.auth.public(self._provider_models)
         if session is None:
             return {
                 "is_open": False,
@@ -694,6 +682,7 @@ class Runtime:
                 "effort": self.effort,
                 "models": self.models,
                 "model_labels": self.model_labels,
+                "model_providers": self.model_providers,
                 "model_efforts": self.model_efforts,
                 "session_defaults": None,
                 "evidence_path": EVIDENCE_PATH,
@@ -701,7 +690,7 @@ class Runtime:
                 "plots": [],
                 "agents": [],
                 "navigator_root": str(self.navigator_root),
-                "auth": self.auth.public(),
+                "auth": auth_public,
             }
         return {
             "is_open": True,
@@ -718,6 +707,7 @@ class Runtime:
             "effort": session.effort,
             "models": self.models,
             "model_labels": self.model_labels,
+            "model_providers": self.model_providers,
             "model_efforts": self.model_efforts,
             "session_defaults": {
                 "model": session.default_model,
@@ -737,7 +727,7 @@ class Runtime:
             "documents_default": session.documents_default,
             "plots": session.list_plots(),
             "agents": [self.agent_snapshot(agent_id) for agent_id in self.agents],
-            "auth": self.auth.public(),
+            "auth": auth_public,
         }
 
     def export_notebook(

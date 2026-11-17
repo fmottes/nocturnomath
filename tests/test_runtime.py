@@ -1,17 +1,51 @@
 import asyncio
 import os
 import threading
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
+from nocturnomath.auth import AuthStore
+from nocturnomath.backends import ModelSpec, find_cli_executables
+from nocturnomath.backends.anthropic import CLAUDE_CLI_NAME, claude_cli_candidates
 from nocturnomath.runtime import Runtime
-from nocturnomath.session import CLAUDE_CLI_NAME, claude_cli_candidates
+
+
+class StubBackend:
+    def __init__(self, provider, responses=None, error=None):
+        self.provider = provider
+        self.uses_compact_hook = provider == "anthropic"
+        self.responses = list(responses or [[]])
+        self.error = error
+        self.auth_seen = []
+
+    async def discover_models(self, auth):
+        self.auth_seen.append(auth)
+        if self.error is not None:
+            raise self.error
+        if len(self.responses) > 1:
+            return self.responses.pop(0)
+        return self.responses[0]
+
+    async def run_turn(self, *args, **kwargs):
+        if False:
+            yield None
+
+    async def compact(self, *args, **kwargs):
+        return None
+
+
+def stub_backends(anthropic=None, openai=None, google=None):
+    return {
+        "anthropic": anthropic or StubBackend("anthropic"),
+        "openai": openai or StubBackend("openai"),
+        "google": google or StubBackend("google"),
+    }
 
 
 @pytest.mark.asyncio
 async def test_subscribers_receive_session_events(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
     runtime.start()
     events = []
     failures = []
@@ -38,7 +72,7 @@ async def test_subscribers_receive_session_events(session):
 
 @pytest.mark.asyncio
 async def test_start_query_validates_model_and_effort_and_reports_failures(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
     runtime.start()
     events = []
     runtime.subscribe(lambda event_type, payload: events.append((event_type, payload)))
@@ -77,7 +111,7 @@ async def test_start_query_validates_model_and_effort_and_reports_failures(sessi
 
 def test_start_query_requires_a_discovered_model(session):
     session.model = None
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
 
     with pytest.raises(ValueError, match="No model available"):
         runtime.start_query("question")
@@ -85,7 +119,7 @@ def test_start_query_requires_a_discovered_model(session):
 
 @pytest.mark.asyncio
 async def test_transition_rejects_concurrent_changes(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
     entered = threading.Event()
     release = threading.Event()
 
@@ -112,7 +146,7 @@ async def test_transition_rejects_concurrent_changes(session):
 
 @pytest.mark.asyncio
 async def test_agent_transition_blocks_queries_and_other_transitions(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
     entered = threading.Event()
     release = threading.Event()
     agent_id = runtime.primary_agent_id
@@ -138,7 +172,7 @@ async def test_agent_transition_blocks_queries_and_other_transitions(session):
 
 
 def test_export_notebook_names_the_file_after_workspace_and_session(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
 
     with pytest.raises(ValueError, match="no messages"):
         runtime.export_notebook()
@@ -150,22 +184,78 @@ def test_export_notebook_names_the_file_after_workspace_and_session(session):
     assert notebook["cells"]
 
     with pytest.raises(RuntimeError, match="Open a workspace"):
-        Runtime().export_notebook()
+        Runtime(backends=stub_backends()).export_notebook()
 
 
 @pytest.mark.asyncio
 async def test_discovery_applies_startup_model_only_if_reported():
-    runtime = Runtime(model="unavailable-model")
-    with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
-        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-            return_value={
-                "models": [{"value": "default", "resolvedModel": "claude-sonnet-5"}]
-            }
-        )
-        await runtime.discover_models()
-
-    assert sdk.call_args.args[0].model is None
+    runtime = Runtime(
+        model="unavailable-model",
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic",
+                [
+                    [
+                        ModelSpec(
+                            id="claude-sonnet-5",
+                            raw_id="claude-sonnet-5",
+                            provider="anthropic",
+                            label="claude-sonnet-5",
+                            is_default=True,
+                        )
+                    ]
+                ],
+            )
+        ),
+    )
+    await runtime.discover_models()
     assert runtime.model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_discovery_merges_all_providers_and_survives_partial_failure():
+    runtime = Runtime(
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic",
+                [
+                    [
+                        ModelSpec(
+                            id="claude-opus-5",
+                            raw_id="claude-opus-5",
+                            provider="anthropic",
+                            label="claude-opus-5",
+                            efforts=["low", "high"],
+                            is_default=True,
+                        )
+                    ]
+                ],
+            ),
+            openai=StubBackend("openai", error=RuntimeError("codex missing")),
+            google=StubBackend(
+                "google",
+                [
+                    [
+                        ModelSpec(
+                            id="gemini-4-carbon",
+                            raw_id="gemini-4-carbon",
+                            provider="google",
+                            label="Gemini 4 Carbon",
+                            efforts=["medium", "high"],
+                        )
+                    ]
+                ],
+            ),
+        )
+    )
+    await runtime.discover_models()
+    assert runtime.models == ["claude-opus-5", "gemini-4-carbon"]
+    assert runtime.model_providers == {
+        "claude-opus-5": "anthropic",
+        "gemini-4-carbon": "google",
+    }
+    assert runtime.model_labels["gemini-4-carbon"] == "Gemini 4 Carbon"
+    assert runtime.model == "claude-opus-5"
 
 
 def test_cli_lookup_excludes_launch_directory_and_relative_path(tmp_path, monkeypatch):
@@ -182,133 +272,94 @@ def test_cli_lookup_excludes_launch_directory_and_relative_path(tmp_path, monkey
         "PATH", os.pathsep.join(("", str(workspace), "bin", str(installed_bin)))
     )
 
+    assert find_cli_executables(CLAUDE_CLI_NAME)[0] == installed_bin / CLAUDE_CLI_NAME
     assert claude_cli_candidates()[0] == installed_bin / CLAUDE_CLI_NAME
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failed_discovery",
-    [
-        pytest.param(RuntimeError("CLI unavailable"), id="failed-handshake"),
-        pytest.param({"commands": []}, id="missing-catalogue"),
-        pytest.param({"models": []}, id="empty-catalogue"),
-        pytest.param({"models": [None, {"value": "default"}]}, id="unusable-models"),
-    ],
-)
-async def test_cli_fallback_is_used_for_existing_and_new_chats(
-    session, tmp_path, failed_discovery
-):
-    installed = tmp_path / "installed" / CLAUDE_CLI_NAME
-    bundled = tmp_path / "bundled" / CLAUDE_CLI_NAME
-    runtime = Runtime(session)
+async def test_catalogue_refresh_revalidates_chats_and_propagates_providers(session):
+    anthropic = StubBackend(
+        "anthropic",
+        responses=[
+            [
+                ModelSpec(
+                    id="old-model",
+                    raw_id="old-model",
+                    provider="anthropic",
+                    label="old-model",
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="shared-model",
+                    raw_id="shared-model",
+                    provider="anthropic",
+                    label="shared-model",
+                    efforts=["high"],
+                ),
+            ],
+            [
+                ModelSpec(
+                    id="new-model",
+                    raw_id="new-model",
+                    provider="anthropic",
+                    label="new-model",
+                    efforts=["medium"],
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="shared-model",
+                    raw_id="shared-model",
+                    provider="anthropic",
+                    label="shared-model",
+                    efforts=["low"],
+                ),
+            ],
+        ],
+    )
+    runtime = Runtime(session, backends=stub_backends(anthropic=anthropic))
+    await runtime.discover_models()
+    assert session.model == "old-model"
+    other = runtime.get_agent(runtime.create_agent())
+    other.model = "shared-model"
+    other.effort = "high"
+    session._sdk_session_id = "resumed-session"
 
-    def catalog(identifier):
-        return {"models": [{"value": "default", "resolvedModel": identifier}]}
+    await runtime.authenticate("anthropic", "api_key", "unverified-key")
 
-    with (
-        patch(
-            "nocturnomath.runtime.claude_cli_candidates",
-            return_value=[installed, bundled],
-        ),
-        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
-    ):
-        info = sdk.return_value.__aenter__.return_value.get_server_info
-        info.side_effect = [
-            catalog("local-model"),
-            failed_discovery,
-            catalog("bundled-model"),
-        ]
-        await runtime.discover_models()
-        assert session._client_options().cli_path == installed
-        assert session.model == "local-model"
-
-        await runtime.authenticate("api_key", "unverified-key")
-
-    assert [args.args[0].cli_path for args in sdk.call_args_list] == [
-        installed,
-        installed,
-        bundled,
-    ]
-    assert runtime.models == ["bundled-model"]
-    assert session.model == "bundled-model"
-    assert session._client_options().cli_path == bundled
-    new_session = runtime.get_agent(runtime.create_agent())
-    assert new_session._client_options().cli_path == bundled
-
-
-@pytest.mark.asyncio
-async def test_catalogue_refresh_revalidates_chats_using_the_same_cli(
-    session, tmp_path
-):
-    installed = tmp_path / "installed" / CLAUDE_CLI_NAME
-    runtime = Runtime(session)
-    common_model = {"value": "shared-model", "supportedEffortLevels": ["high"]}
-
-    with (
-        patch("nocturnomath.runtime.claude_cli_candidates", return_value=[installed]),
-        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
-    ):
-        info = sdk.return_value.__aenter__.return_value.get_server_info
-        info.side_effect = [
-            {
-                "models": [
-                    {"value": "default", "resolvedModel": "old-model"},
-                    common_model,
-                ]
-            },
-            {
-                "models": [
-                    {
-                        "value": "default",
-                        "resolvedModel": "new-model",
-                        "supportedEffortLevels": ["medium"],
-                    },
-                    {**common_model, "supportedEffortLevels": ["low"]},
-                ]
-            },
-        ]
-        await runtime.discover_models()
-        assert session.model == "old-model"
-        other = runtime.get_agent(runtime.create_agent())
-        other.model = "shared-model"
-        other.effort = "high"
-        session._sdk_session_id = "resumed-session"
-
-        await runtime.authenticate("api_key", "unverified-key")
-
-    options = session._client_options()
-    assert (options.cli_path, options.model, options.effort, options.resume) == (
-        installed,
+    assert (session.model, session.effort, session._sdk_session_id) == (
         "new-model",
         "medium",
         "resumed-session",
     )
     assert (other.model, other.effort) == ("shared-model", "low")
+    assert session.model_providers["new-model"] == "anthropic"
 
 
 @pytest.mark.asyncio
-async def test_auth_selection_reaches_sdk_and_keeps_context(session):
-    runtime = Runtime(session)
+async def test_auth_selection_reaches_backend_and_keeps_context(session):
+    anthropic = StubBackend(
+        "anthropic",
+        responses=[
+            [
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="claude-sonnet-5",
+                    efforts=["low", "medium", "high"],
+                )
+            ]
+        ],
+    )
+    runtime = Runtime(session, backends=stub_backends(anthropic=anthropic))
     session._sdk_session_id = "resumed-session"
-    with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
-        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-            return_value={
-                "models": [
-                    {"value": "default"},
-                    {
-                        "value": "sonnet",
-                        "resolvedModel": "claude-sonnet-5",
-                        "supportedEffortLevels": ["low", "medium", "high"],
-                    },
-                ]
-            }
-        )
-        result = await runtime.authenticate("subscription", "oauth-secret")
 
-    options = sdk.call_args.args[0]
-    assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
-    assert options.env["ANTHROPIC_API_KEY"] == ""
-    assert result["method"] == "subscription"
+    result = await runtime.authenticate("anthropic", "subscription", "oauth-secret")
+
+    seen_auth = anthropic.auth_seen[-1]
+    assert seen_auth.sdk_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
+    assert seen_auth.sdk_env()["ANTHROPIC_API_KEY"] == ""
+    assert result["providers"]["anthropic"]["method"] == "subscription"
     assert "oauth-secret" not in repr(result)
     assert session.auth is runtime.auth
     assert session._sdk_session_id == "resumed-session"
@@ -317,44 +368,51 @@ async def test_auth_selection_reaches_sdk_and_keeps_context(session):
 
 @pytest.mark.asyncio
 async def test_auth_selection_survives_failed_model_discovery(session):
-    runtime = Runtime(session)
+    runtime = Runtime(
+        session,
+        backends=stub_backends(
+            anthropic=StubBackend("anthropic", error=RuntimeError("CLI unavailable")),
+            openai=StubBackend("openai", error=RuntimeError("CLI unavailable")),
+            google=StubBackend("google", error=RuntimeError("CLI unavailable")),
+        ),
+    )
     runtime.models = ["existing-model"]
-    with patch("nocturnomath.runtime.ClaudeSDKClient") as sdk:
-        sdk.return_value.__aenter__.side_effect = RuntimeError("CLI unavailable")
-        result = await runtime.authenticate("api_key", "unverified-key")
 
-    assert result["method"] == "api_key"
-    assert session.auth.sdk_env()["ANTHROPIC_API_KEY"] == "unverified-key"
+    result = await runtime.authenticate("anthropic", "api_key", "unverified-key")
+
+    assert result["providers"]["anthropic"]["method"] == "api_key"
+    assert (
+        session.auth.get("anthropic").sdk_env()["ANTHROPIC_API_KEY"] == "unverified-key"
+    )
     assert runtime.models == []
     assert not runtime.changing
 
 
 @pytest.mark.asyncio
 async def test_auth_change_waits_for_idle_and_returns_to_automatic(session):
-    runtime = Runtime(session)
+    runtime = Runtime(session, backends=stub_backends())
     runtime.discover_models = AsyncMock()
     blocker = asyncio.Event()
     session._current_task = asyncio.create_task(blocker.wait())
     with pytest.raises(RuntimeError):
-        await runtime.authenticate("api_key", "manual-key")
-    assert session.auth.method == "claude_code"
+        await runtime.authenticate("openai", "api_key", "manual-key")
+    assert session.auth.get("openai").method == "cli"
     blocker.set()
     await session._current_task
     session._current_task = None
 
-    await runtime.authenticate("api_key", "manual-key")
-    assert session.auth.method == "api_key"
-    result = await runtime.authenticate("claude_code")
-    assert result["method"] == "claude_code"
-    assert session.auth.sdk_env() == {}
+    await runtime.authenticate("openai", "api_key", "manual-key")
+    assert session.auth.get("openai").method == "api_key"
+    result = await runtime.authenticate("openai", "cli")
+    assert result["providers"]["openai"]["method"] == "cli"
+    assert session.auth.get("openai").sdk_env() == {}
     assert session.auth is runtime.auth
 
 
 def test_runtime_and_session_share_one_auth(session, tmp_path):
-    from nocturnomath.auth import ClaudeAuth
-
-    manual = ClaudeAuth.interactive("api_key", "manual-key")
-    runtime = Runtime(session, auth=manual)
+    manual = AuthStore()
+    manual.set("anthropic", "api_key", "manual-key")
+    runtime = Runtime(session, auth=manual, backends=stub_backends())
     assert session.auth is manual
     assert runtime.auth is manual
 
@@ -364,6 +422,6 @@ def test_runtime_and_session_share_one_auth(session, tmp_path):
         received.update(kwargs)
         return session
 
-    fresh = Runtime(session_factory=factory, auth=manual)
+    fresh = Runtime(session_factory=factory, auth=manual, backends=stub_backends())
     fresh.open_workspace(tmp_path)
     assert received["auth"] is manual

@@ -1,32 +1,28 @@
 """Conversation orchestration for a scientific exploration session."""
 
 import asyncio
-import dataclasses
 import json
 import logging
-import os
-import shlex
 import subprocess
-import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-import claude_agent_sdk
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    StreamEvent,
-    SystemMessage,
-    TextBlock,
-    create_sdk_mcp_server,
+from .auth import AuthStore, ProviderId
+from .backends import (
+    DEFAULT_EFFORT,
+    EFFORT_LEVELS,
+    AgentBackend,
+    CompactionNotice,
+    MessageUsage,
+    SessionStarted,
+    TextBlockDone,
+    TextDelta,
+    TurnResult,
+    default_backends,
 )
-
-from .auth import ClaudeAuth
 from .environment import ResearchEnvironment
 from .kernel import Kernel
 from .prompt import DEFAULT_EXPLORATION_PROMPT, build_system_prompt
@@ -35,52 +31,9 @@ from .workspace import Workspace
 
 logger = logging.getLogger("nocturnomath")
 
-DEFAULT_EFFORT = "high"
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-CONTEXT_USAGE_TIMEOUT_S = 10
-CLAUDE_CLI_NAME = "claude.exe" if sys.platform == "win32" else "claude"
-BUNDLED_CLAUDE_CLI = (
-    Path(claude_agent_sdk.__file__).with_name("_bundled") / CLAUDE_CLI_NAME
-)
-
-
-def claude_cli_candidates() -> list[Path]:
-    """Prefer an installed Claude CLI, then the executable shipped by the SDK."""
-    launch_dir = Path.cwd().resolve()
-    directories = [Path(entry) for entry in os.get_exec_path()]
-    home = Path(os.path.expanduser("~"))
-    if home.is_absolute():
-        directories.append(home / ".local" / "bin")
-    for directory in directories:
-        if not directory.is_absolute():
-            continue
-        candidate = directory / CLAUDE_CLI_NAME
-        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
-            continue
-        resolved = candidate.resolve()
-        if launch_dir in (directory.resolve(), resolved.parent):
-            continue
-        if resolved != BUNDLED_CLAUDE_CLI.resolve():
-            return [candidate, BUNDLED_CLAUDE_CLI]
-        break
-    return [BUNDLED_CLAUDE_CLI]
-
-
-def _stream_delta_text(event: StreamEvent) -> str | None:
-    """Return the incremental assistant text a stream event carries, if any."""
-    if event.parent_tool_use_id:
-        return None
-    raw = event.event or {}
-    if raw.get("type") != "content_block_delta":
-        return None
-    delta = raw.get("delta") or {}
-    if delta.get("type") != "text_delta":
-        return None
-    return delta.get("text") or None
-
 
 class ExplorationSession:
-    """Own one kernel, one workspace, and one Claude conversation at a time."""
+    """Own one kernel, one workspace, and one multi-provider conversation at a time."""
 
     def __init__(
         self,
@@ -90,7 +43,10 @@ class ExplorationSession:
         timeout_s: int = 600,
         image_cap: int = 2,
         python: str | None = None,
-        auth: ClaudeAuth | None = None,
+        auth: AuthStore | None = None,
+        backends: Mapping[ProviderId, AgentBackend] | None = None,
+        model_providers: Mapping[str, ProviderId] | None = None,
+        model_raw_ids: Mapping[str, str] | None = None,
     ):
         if effort is not None and effort not in EFFORT_LEVELS:
             raise ValueError(f"Unknown effort level: {effort}")
@@ -100,12 +56,19 @@ class ExplorationSession:
         self.default_effort: str | None = self.effort
         self.timeout_s = timeout_s
         self.image_cap = image_cap
-        self.auth = auth or ClaudeAuth()
-        self.cli_path = BUNDLED_CLAUDE_CLI
+        self.auth = auth or AuthStore()
+        self.backends: dict[ProviderId, AgentBackend] = (
+            dict(backends) if backends is not None else default_backends()
+        )
+        self.model_providers: dict[str, ProviderId] = (
+            dict(model_providers) if model_providers is not None else {}
+        )
+        self.model_raw_ids: dict[str, str] = (
+            dict(model_raw_ids) if model_raw_ids is not None else {}
+        )
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
         self.status = "idle"
-        self._current_client: ClaudeSDKClient | None = None
         self._current_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_operation_lock = asyncio.Lock()
@@ -114,6 +77,7 @@ class ExplorationSession:
         self._pending_verdict: str | None = None
         self._pending_verdict_probe_id: str | None = None
         self._slurm_review_probe_id: str | None = None
+        self._active_provider: ProviderId | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
@@ -146,7 +110,24 @@ class ExplorationSession:
 
     @property
     def can_compact(self) -> bool:
-        return self._sdk_session_id is not None
+        return self._sdk_session_id is not None and self._active_provider is not None
+
+    def provider_for_model(self, model: str | None) -> ProviderId:
+        if model and model in self.model_providers:
+            return self.model_providers[model]
+        if model:
+            if model.startswith(("openai/", "gpt-")):
+                return "openai"
+            if model.startswith(("google/", "gemini-")):
+                return "google"
+        return "anthropic"
+
+    def raw_model_id(self, model: str) -> str:
+        if model in self.model_raw_ids:
+            return self.model_raw_ids[model]
+        provider = self.provider_for_model(model)
+        prefix = f"{provider}/"
+        return model.removeprefix(prefix)
 
     def has_active_query(self) -> bool:
         return (
@@ -222,6 +203,7 @@ class ExplorationSession:
         self.kernel.on_start = self.record_kernel_start
         self.record_kernel_start("workspace changed")
         self._session_initialized = False
+        self._active_provider = None
         self._sdk_session_id = None
         self._resume_prefix = None
         self._results_since_note = 0
@@ -370,7 +352,7 @@ class ExplorationSession:
 
         path = self.workspace.transcript_file(session_id)
         records = self.workspace.read_transcript(path)
-        sdk_id = self.workspace.sdk_id(records)
+        saved_provider, sdk_id = self.workspace.sdk_session_info(records)
         changed = path != self.workspace.transcript_path
         previous_state = self.workspace.session_state()
         self.workspace.use_transcript(path)
@@ -388,7 +370,22 @@ class ExplorationSession:
                 raise
         else:
             replayed = 0
-        self._sdk_session_id = sdk_id
+
+        target_provider = self.provider_for_model(self.model)
+        can_restore_native = (
+            sdk_id is not None
+            and saved_provider in self.backends
+            and saved_provider == target_provider
+        )
+        if can_restore_native:
+            self._active_provider = saved_provider
+            self._sdk_session_id = sdk_id
+            self._resume_prefix = None
+        else:
+            self._active_provider = None
+            self._sdk_session_id = None
+            self._resume_prefix = self.workspace.recap(records)
+
         self._sent_documents = {}
         self._results_since_note = 0
         self._restore_pending_verdict(records)
@@ -402,7 +399,6 @@ class ExplorationSession:
             None,
         )
         self._session_initialized = False
-        self._resume_prefix = None if sdk_id else self.workspace.recap(records)
 
         if restore_kernel:
             probe_word = "probe" if replayed == 1 else "probes"
@@ -421,7 +417,7 @@ class ExplorationSession:
             "kernel_restored": restore_kernel,
             "probes_replayed": replayed,
             "records": records,
-            "context_restored": sdk_id is not None,
+            "context_restored": can_restore_native,
             "context_usage": self.context_usage,
         }
 
@@ -452,107 +448,42 @@ class ExplorationSession:
     def shutdown(self):
         self.kernel.shutdown()
 
-    def _client_options(self) -> ClaudeAgentOptions:
-        compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
-        return ClaudeAgentOptions(
-            cli_path=self.cli_path,
-            # The research MCP tools are the complete execution surface. Do not
-            # inherit Claude Code's built-ins or unrelated MCP configuration.
-            tools=[],
-            system_prompt=build_system_prompt(self.exploration_prompt),
-            mcp_servers={"explore": create_sdk_mcp_server("explore", tools=self.tools)},
-            strict_mcp_config=True,
-            # Keep the user's authentication/provider settings, but do not load
-            # instructions or hooks from the selected research workspace.
-            setting_sources=["user"],
-            settings=json.dumps(
-                {
-                    "hooks": {
-                        "SessionStart": [
-                            {
-                                "matcher": "compact",
-                                "hooks": [{"type": "command", "command": compact_hook}],
-                            }
-                        ]
-                    }
-                }
-            ),
-            skills=[],
-            permission_mode="bypassPermissions",
-            model=self.model,
-            effort=self.effort,
-            max_buffer_size=20 * 1024 * 1024,
-            include_partial_messages=True,
-            env={
-                **self.auth.sdk_env(),
-                "NOCTURNOMATH_WORKSPACE_PATH": str(self.workspace_path),
-            },
-            cwd=self.workspace_path,
-            resume=self._sdk_session_id,
-        )
-
     async def _record_compaction(self):
         self.log_transcript("compaction")
         await self.emit("context_compacted")
 
     async def compact(self):
         self.require_idle("compact this explorer")
-        if not self._sdk_session_id:
+        if not self._sdk_session_id or self._active_provider is None:
             raise RuntimeError("This explorer has no conversation context to compact.")
+        provider = self._active_provider
+        backend = self.backends[provider]
         self._is_busy = True
         started_at = time.monotonic()
         try:
             await self.emit("status_change", status="compacting")
-            async with ClaudeSDKClient(self._client_options()) as client:
-                self._current_client = client
-                await client.query("/compact")
-                compacted = False
-                async for message in client.receive_response():
-                    self._track_session_id(getattr(message, "session_id", None))
-                    if (
-                        isinstance(message, SystemMessage)
-                        and message.subtype == "compact_boundary"
-                    ):
-                        compacted = True
-                        await self._record_compaction()
-                if not compacted:
-                    raise RuntimeError(
-                        "Claude did not confirm that compaction completed."
-                    )
-                logger.info(
-                    "Claude compaction completed in %.1fs",
-                    time.monotonic() - started_at,
-                )
-                self.context_usage = None
-                try:
-                    usage = await asyncio.wait_for(
-                        client.get_context_usage(), timeout=CONTEXT_USAGE_TIMEOUT_S
-                    )
-                    used = usage.get("totalTokens")
-                    window = usage.get("rawMaxTokens")
-                    if isinstance(used, int) and used >= 0:
-                        self.context_usage = {
-                            "used_tokens": used,
-                            "window_tokens": window
-                            if isinstance(window, int) and window > 0
-                            else None,
-                            "model": usage.get("model"),
-                        }
-                except TimeoutError:
-                    logger.warning(
-                        "Context usage refresh timed out after %ss",
-                        CONTEXT_USAGE_TIMEOUT_S,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not refresh context usage after compaction: %s", exc
-                    )
-                self.log_transcript("meta", context_usage=self.context_usage)
-                await self.emit(
-                    "context_usage_changed", context_usage=self.context_usage
-                )
+            result = await backend.compact(
+                system_prompt=build_system_prompt(self.exploration_prompt),
+                tools=self.tools,
+                workspace_path=self.workspace_path,
+                model=self.raw_model_id(self.model) if self.model else None,
+                effort=self.effort,
+                auth=self.auth.get(provider),
+                resume_session_id=self._sdk_session_id,
+            )
+            self._track_session_id(result.session_id, provider)
+            await self._record_compaction()
+            if not backend.uses_compact_hook:
+                self._record_dirty = True
+            logger.info(
+                "%s compaction completed in %.1fs",
+                provider,
+                time.monotonic() - started_at,
+            )
+            self.context_usage = result.context_usage
+            self.log_transcript("meta", context_usage=self.context_usage)
+            await self.emit("context_usage_changed", context_usage=self.context_usage)
         finally:
-            self._current_client = None
             self._is_busy = False
             await self.emit("status_change", status="idle")
 
@@ -583,8 +514,22 @@ class ExplorationSession:
         if self.model is None:
             raise RuntimeError("No model available.")
 
+        provider = self.provider_for_model(self.model)
+        backend = self.backends[provider]
         self._is_busy = True
         try:
+            # When switching providers mid-chat, capture the prior transcript recap
+            # before logging the new user message so it is never duplicated.
+            if self._active_provider is not None and provider != self._active_provider:
+                prior_records = self.workspace.current_records()
+                self._resume_prefix = (
+                    self.workspace.recap(prior_records) if prior_records else None
+                )
+                self._sdk_session_id = None
+                self._active_provider = None
+                self._sent_documents = {}
+                self.context_usage = None
+
             # Snapshot the selection before yielding so changes made while this turn runs
             # apply to the next message.
             document_prefix, sent_documents = (
@@ -596,36 +541,41 @@ class ExplorationSession:
             else:
                 self.log_transcript("slurm_review", probe_id=slurm_probe_id)
                 await self.emit("slurm_review", probe_id=slurm_probe_id)
-            options = self._client_options()
-            async with ClaudeSDKClient(options) as client:
-                self._current_client = client
-                prefix = ""
-                resume_prefix = self._resume_prefix
-                initialize_session = False
-                if resume_prefix:
-                    prefix = self.opening_notes() + resume_prefix
-                    initialize_session = True
-                elif not self._session_initialized:
-                    prefix = self.opening_notes()
-                    initialize_session = True
-                elif self._record_dirty:
-                    prefix = (
-                        "The shared scientific record changed in another exploration. "
-                        "Treat this current copy as authoritative:\n\n"
-                        + self.opening_notes()
-                    )
 
-                prefix += document_prefix
-                if self._pending_verdict is not None:
-                    prefix += (
-                        f"Probe {self._pending_verdict_probe_id} still needs a verdict "
-                        f"against its prediction: {self._pending_verdict}. "
-                        "Call verdict before starting another probe.\n\n"
-                    )
-                kernel_notice = self._kernel_notice
-                prefix += kernel_notice
-                prompt = prefix + user_text if prefix else user_text
-                await client.query(prompt)
+            prefix = ""
+            resume_prefix = self._resume_prefix
+            initialize_session = False
+            if resume_prefix:
+                prefix = self.opening_notes() + resume_prefix
+                initialize_session = True
+            elif not self._session_initialized:
+                prefix = self.opening_notes()
+                initialize_session = True
+            elif self._record_dirty:
+                prefix = (
+                    "The shared scientific record changed in another exploration. "
+                    "Treat this current copy as authoritative:\n\n"
+                    + self.opening_notes()
+                )
+
+            prefix += document_prefix
+            if self._pending_verdict is not None:
+                prefix += (
+                    f"Probe {self._pending_verdict_probe_id} still needs a verdict "
+                    f"against its prediction: {self._pending_verdict}. "
+                    "Call verdict before starting another probe.\n\n"
+                )
+            kernel_notice = self._kernel_notice
+            prefix += kernel_notice
+            prompt = prefix + user_text if prefix else user_text
+
+            accepted = False
+
+            def commit_prompt_state():
+                nonlocal accepted
+                if accepted:
+                    return
+                accepted = True
                 self._resume_prefix = None
                 if initialize_session:
                     self._session_initialized = True
@@ -633,110 +583,70 @@ class ExplorationSession:
                     self._kernel_notice = ""
                 self._record_dirty = False
                 self._sent_documents.update(sent_documents)
-                accumulated_text = []
-                last_prompt_tokens = None
-                last_prompt_model = None
-                async for message in client.receive_response():
-                    self._track_session_id(getattr(message, "session_id", None))
-                    if isinstance(message, ResultMessage) and message.is_error:
-                        raise RuntimeError(
-                            message.result or "Claude could not finish this turn."
+                self._active_provider = provider
+
+            accumulated_text: list[str] = []
+            async for event in backend.run_turn(
+                prompt,
+                system_prompt=build_system_prompt(self.exploration_prompt),
+                tools=self.tools,
+                workspace_path=self.workspace_path,
+                model=self.raw_model_id(self.model),
+                effort=self.effort,
+                auth=self.auth.get(provider),
+                resume_session_id=self._sdk_session_id,
+            ):
+                commit_prompt_state()
+                if isinstance(event, SessionStarted):
+                    self._track_session_id(event.session_id, provider)
+                elif isinstance(event, TextDelta):
+                    await self.emit("assistant_delta", text=event.text)
+                elif isinstance(event, CompactionNotice):
+                    await self._record_compaction()
+                    if not backend.uses_compact_hook:
+                        self._record_dirty = True
+                elif isinstance(event, MessageUsage):
+                    self.log_transcript(
+                        "message_usage",
+                        message_id=event.message_id,
+                        model=event.model,
+                        usage=event.usage,
+                    )
+                elif isinstance(event, TextBlockDone):
+                    accumulated_text.append(event.text)
+                    self.log_transcript("agent", text=event.text)
+                    await self.emit("assistant_text", text=event.text)
+                elif isinstance(event, TurnResult):
+                    if any(
+                        value is not None
+                        for value in (
+                            event.usage,
+                            event.model_usage,
+                            event.total_cost_usd,
+                            event.duration_ms,
+                            event.duration_api_ms,
+                            event.num_turns,
                         )
-                    if isinstance(message, ResultMessage):
+                    ):
                         self.log_transcript(
                             "usage",
-                            usage=message.usage,
-                            model_usage={
-                                name: dataclasses.asdict(value)
-                                if dataclasses.is_dataclass(value)
-                                else value
-                                for name, value in message.model_usage.items()
-                            }
-                            if message.model_usage is not None
-                            else None,
-                            total_cost_usd=message.total_cost_usd,
-                            duration_ms=message.duration_ms,
-                            duration_api_ms=message.duration_api_ms,
-                            num_turns=message.num_turns,
+                            usage=event.usage,
+                            model_usage=event.model_usage,
+                            total_cost_usd=event.total_cost_usd,
+                            duration_ms=event.duration_ms,
+                            duration_api_ms=event.duration_api_ms,
+                            num_turns=event.num_turns,
                         )
-                    if isinstance(message, StreamEvent):
-                        delta = _stream_delta_text(message)
-                        if delta:
-                            await self.emit("assistant_delta", text=delta)
-                    elif (
-                        isinstance(message, SystemMessage)
-                        and message.subtype == "compact_boundary"
-                    ):
-                        await self._record_compaction()
-                    elif isinstance(message, AssistantMessage):
-                        usage = message.usage or {}
-                        if message.parent_tool_use_id is None and usage:
-                            self.log_transcript(
-                                "message_usage",
-                                message_id=message.message_id,
-                                model=message.model,
-                                usage=usage,
-                            )
-                        prompt_counts = (
-                            usage.get("input_tokens", 0),
-                            usage.get("cache_read_input_tokens", 0),
-                            usage.get("cache_creation_input_tokens", 0),
-                        )
-                        if (
-                            message.parent_tool_use_id is None
-                            and any(
-                                key in usage
-                                for key in (
-                                    "input_tokens",
-                                    "cache_read_input_tokens",
-                                    "cache_creation_input_tokens",
-                                )
-                            )
-                            and all(
-                                isinstance(count, int) and count >= 0
-                                for count in prompt_counts
-                            )
-                        ):
-                            last_prompt_tokens = sum(prompt_counts)
-                            last_prompt_model = message.model
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                accumulated_text.append(block.text)
-                                self.log_transcript("agent", text=block.text)
-                                await self.emit("assistant_text", text=block.text)
-                    elif (
-                        isinstance(message, ResultMessage)
-                        and last_prompt_tokens is not None
-                    ):
-                        models = message.model_usage or {}
-                        model_usage = models.get(last_prompt_model or "")
-                        if model_usage is None:
-                            model_usage = next(
-                                (
-                                    value
-                                    for value in models.values()
-                                    if value.get("canonicalModel") == last_prompt_model
-                                ),
-                                None,
-                            )
-                        if model_usage is None and len(models) == 1:
-                            model_usage = next(iter(models.values()))
-                        window = (model_usage or {}).get("contextWindow")
-                        self.context_usage = {
-                            "used_tokens": last_prompt_tokens,
-                            "window_tokens": window
-                            if isinstance(window, int) and window > 0
-                            else None,
-                            "model": last_prompt_model,
-                        }
+                    if event.context_usage is not None:
+                        self.context_usage = event.context_usage
                         self.log_transcript("meta", context_usage=self.context_usage)
                         await self.emit(
                             "context_usage_changed", context_usage=self.context_usage
                         )
-                await self.emit(
-                    "turn_complete", full_text="\n\n".join(accumulated_text)
-                )
-                return True
+
+            commit_prompt_state()
+            await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
+            return True
         except asyncio.CancelledError:
             await self.emit("status_change", status="cancelled")
             raise
@@ -746,14 +656,24 @@ class ExplorationSession:
             return False
         finally:
             self._is_busy = False
-            self._current_client = None
             await self.emit("status_change", status="idle")
 
-    def _track_session_id(self, session_id: str | None):
-        if not session_id or session_id == self._sdk_session_id:
+    def _track_session_id(
+        self, session_id: str | None, provider: ProviderId | None = None
+    ):
+        resolved_provider = (
+            provider or self._active_provider or self.provider_for_model(self.model)
+        )
+        if not session_id or (
+            session_id == self._sdk_session_id
+            and resolved_provider == self._active_provider
+        ):
             return
+        self._active_provider = resolved_provider
         self._sdk_session_id = session_id
-        self.log_transcript("meta", sdk_session_id=session_id)
+        self.log_transcript(
+            "meta", provider=resolved_provider, sdk_session_id=session_id
+        )
 
     def reset_client_session(self):
         self.require_idle("start a new session")
@@ -765,6 +685,7 @@ class ExplorationSession:
             self.workspace.restore_session_state(previous_state)
             raise
         self._session_initialized = False
+        self._active_provider = None
         self._sdk_session_id = None
         self._resume_prefix = None
         self._sent_documents = {}

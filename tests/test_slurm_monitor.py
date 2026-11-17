@@ -7,10 +7,10 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from conftest import FakeEnvironment, FakeKernel
 
 from nocturnomath import slurm
+from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
 from nocturnomath.runtime import Runtime
 from nocturnomath.session import ExplorationSession
 
@@ -552,28 +552,24 @@ async def test_declared_plot_must_arrive_before_review(
 
 @pytest.mark.asyncio
 async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_probe(
-    session, runtime, cluster, monkeypatch
+    session, runtime, cluster
 ):
     probe_id, job_id = await submit(session, ["plot-1.png"])
-    session._sdk_session_id = "original-conversation"
+    session._track_session_id("original-conversation", "anthropic")
     probe = complete(session, cluster, probe_id, job_id)
     (probe / "plot-1.png").write_bytes(b"saved plot")
-    options_used = []
+    resumes = []
 
-    class ReviewClient:
-        def __init__(self, options):
-            options_used.append(options)
+    class ReviewBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
+        async def run_turn(self, prompt, *, resume_session_id=None, **kwargs):
+            resumes.append(resume_session_id)
             assert probe_id in prompt
-
-        async def receive_response(self):
             result = await tools(session)["check_slurm_job"].handler(
                 {"probe_id": probe_id}
             )
@@ -582,12 +578,16 @@ async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_pr
             await tools(session)["verdict"].handler(
                 {"text": "It printed 42 as predicted."}
             )
-            yield AssistantMessage(content=[TextBlock("Reviewed.")], model="test")
+            yield TextBlockDone("Reviewed.")
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", ReviewClient)
+        async def compact(self, **kwargs):
+            return None
+
+    session.backends["anthropic"] = ReviewBackend()
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
-    assert options_used[0].resume == "original-conversation"
+    assert resumes == ["original-conversation"]
     records = session.workspace.current_records()
     assert sum(record["kind"] == "user" for record in records) == 1
     assert any(record["kind"] == "slurm_review" for record in records)
@@ -602,53 +602,40 @@ async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_pr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement_state", ["COMPLETED", "FAILED"])
 async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
-    session, runtime, cluster, monkeypatch, replacement_state
+    session, runtime, cluster, replacement_state
 ):
     original_id, job_id = await submit(session)
-    session._track_session_id("original-conversation")
+    session._track_session_id("original-conversation", "anthropic")
     original = complete(session, cluster, original_id, job_id, "OUT_OF_MEMORY")
     error = "slurmstepd: error: Detected an out-of-memory event.\n"
     (original / "stderr.txt").write_text(error)
     queries = []
-    options_used = []
+    resumes = []
 
-    class CorrectionClient:
-        def __init__(self, options):
-            options_used.append(options)
+    class CorrectionBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
+        async def run_turn(self, prompt, *, resume_session_id=None, **kwargs):
+            resumes.append(resume_session_id)
             # The automatic continuation must allow an evidence-based resubmission.
             assert "submit_slurm" in prompt
             assert "Stop after reviewing it; do not launch further probes" not in prompt
-            self.probe_id = re.search(
-                r"Runtime event: Slurm probe (S\d+/P\d+)", prompt
-            )[1]
-            queries.append(self.probe_id)
-
-        async def receive_response(self):
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            queries.append(target)
             handlers = tools(session)
-            result = await handlers["check_slurm_job"].handler(
-                {"probe_id": self.probe_id}
-            )
+            result = await handlers["check_slurm_job"].handler({"probe_id": target})
             assert not result.get("is_error")
-            if self.probe_id == original_id:
+            if target == original_id:
                 assert "OUT_OF_MEMORY" in result["content"][0]["text"]
                 await handlers["verdict"].handler(
                     {"text": "The job exhausted its 1 GB allocation before completing."}
                 )
-                yield AssistantMessage(
-                    content=[
-                        TextBlock(
-                            "I will rerun the same script with 2 GB of memory to address the recorded OOM failure."
-                        )
-                    ],
-                    model="test",
+                yield TextBlockDone(
+                    "I will rerun the same script with 2 GB of memory to address the recorded OOM failure."
                 )
                 submitted = await handlers["submit_slurm"].handler(
                     {
@@ -667,9 +654,13 @@ async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
                 else:
                     verdict = "The replacement failed too; no further correction is supported by its output. User input is needed."
                 await handlers["verdict"].handler({"text": verdict})
-                yield AssistantMessage(content=[TextBlock(verdict)], model="test")
+                yield TextBlockDone(verdict)
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", CorrectionClient)
+        async def compact(self, **kwargs):
+            return None
+
+    session.backends["anthropic"] = CorrectionBackend()
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
     jobs = slurm.list_jobs(session.workspace)
@@ -707,7 +698,7 @@ async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
     assert queries == [original_id, replacement_id]
     assert len(slurm.list_jobs(session.workspace)) == 2
     assert slurm.pending_jobs(session.workspace) == []
-    assert all(options.resume == "original-conversation" for options in options_used)
+    assert all(resume == "original-conversation" for resume in resumes)
     records = session.workspace.current_records()
     assert [
         record["probe_id"] for record in records if record["kind"] == "verdict"
@@ -757,7 +748,7 @@ async def test_review_without_a_verdict_reports_it_and_does_not_loop(
     ],
 )
 async def test_interrupted_correction_resumes_without_repeating_verdict_or_submission(
-    session, runtime, cluster, monkeypatch, point, failure
+    session, runtime, cluster, point, failure
 ):
     original_id, job_id = await submit(session)
     original = complete(session, cluster, original_id, job_id, "OUT_OF_MEMORY")
@@ -765,30 +756,21 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
     queries = []
     interrupted = False
 
-    class CorrectionClient:
-        def __init__(self, options):
-            pass
+    class CorrectionBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
-            self.target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[
-                1
-            ]
-            queries.append(self.target)
-
-        async def receive_response(self):
+        async def run_turn(self, prompt, **kwargs):
             nonlocal interrupted
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            queries.append(target)
             handlers = tools(runtime.get_agent(runtime.find_agent_for_session("S001")))
-            result = await handlers["check_slurm_job"].handler(
-                {"probe_id": self.target}
-            )
+            result = await handlers["check_slurm_job"].handler({"probe_id": target})
             assert not result.get("is_error")
-            if self.target == original_id:
+            if target == original_id:
                 already_reviewed = slurm.has_verdict(session.workspace, original_id)
                 if already_reviewed:
                     assert "Existing verdict" in result["content"][0]["text"]
@@ -811,17 +793,11 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
                     assert not result.get("is_error")
                 if not interrupted:
                     interrupted = True
+                    yield SessionStarted("sdk-chat")
                     if failure == "sdk_error":
-                        yield ResultMessage(
-                            subtype="error_during_execution",
-                            duration_ms=1,
-                            duration_api_ms=1,
-                            is_error=True,
-                            num_turns=1,
-                            session_id="sdk-chat",
-                            result="SDK failed before completing the correction",
+                        raise RuntimeError(
+                            "SDK failed before completing the correction"
                         )
-                        return
                     if failure == "cancelled":
                         raise asyncio.CancelledError()
                     raise RuntimeError("Connection lost during correction")
@@ -829,11 +805,15 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
                 await handlers["verdict"].handler(
                     {"text": "The replacement printed 42 as predicted."}
                 )
-            yield AssistantMessage(
-                content=[TextBlock("Correction handled.")], model="test"
-            )
+            yield TextBlockDone("Correction handled.")
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", CorrectionClient)
+        async def compact(self, **kwargs):
+            return None
+
+    backend = CorrectionBackend()
+    session.backends["anthropic"] = backend
+    runtime.backends["anthropic"] = backend
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
     assert slurm.has_verdict(session.workspace, original_id)

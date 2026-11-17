@@ -202,39 +202,3 @@ class AuthStore:
                 for provider in PROVIDERS
             },
         }
-
-
-# Temporary compatibility bridge until Unit 4 updates session.py and runtime.py.
-AuthMethod = Literal["claude_code", "subscription", "api_key"]
-LABELS: dict[str, str] = {
-    "claude_code": "Claude Code (automatic)",
-    "subscription": "Claude subscription",
-    "api_key": "Claude API key",
-}
-
-
-@dataclass(frozen=True)
-class ClaudeAuth:
-    """Temporary Claude-only auth wrapper removed once Unit 4 wires AuthStore."""
-
-    method: AuthMethod = "claude_code"
-    credential: str | None = field(default=None, repr=False)
-
-    @classmethod
-    def interactive(cls, method: AuthMethod, credential: str | None) -> ClaudeAuth:
-        mapped = "cli" if method == "claude_code" else method
-        auth = ProviderAuth.interactive("anthropic", mapped, credential)
-        return cls(method=method, credential=auth.credential)
-
-    def sdk_env(self) -> dict[str, str]:
-        mapped = "cli" if self.method == "claude_code" else self.method
-        return ProviderAuth("anthropic", mapped, self.credential).sdk_env()
-
-    def public(self) -> dict[str, str | None]:
-        mapped = "cli" if self.method == "claude_code" else self.method
-        data = ProviderAuth("anthropic", mapped, self.credential).public()
-        return {
-            "method": self.method,
-            "label": LABELS[self.method],
-            "note": data["note"],
-        }
