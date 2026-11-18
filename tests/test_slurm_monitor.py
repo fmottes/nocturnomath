@@ -853,3 +853,156 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
         record["probe_id"] for record in records if record["kind"] == "verdict"
     ] == [original_id, jobs[1]["probe_id"]]
     assert (original / "stderr.txt").read_text() == "Out of memory\n"
+
+
+@pytest.mark.asyncio
+async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavailable(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    anthropic_calls = []
+    openai_calls = []
+    openai_available = True
+
+    class AnthropicStub:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="Claude Sonnet 5",
+                    efforts=["medium"],
+                    is_default=True,
+                )
+            ]
+
+        async def run_turn(self, prompt, **kwargs):
+            anthropic_calls.append({"prompt": prompt, **kwargs})
+            yield TextBlockDone("Should not be called.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub:
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            if not openai_available:
+                return []
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["high"],
+                )
+            ]
+
+        async def run_turn(self, prompt, *, model, resume_session_id=None, **kwargs):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+            handlers = tools(owner)
+            if len(openai_calls) == 1:
+                submitted = await handlers["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                yield SessionStarted("oai-thread-1")
+                yield TextBlockDone("Submitted from OpenAI.")
+            else:
+                result = await handlers["check_slurm_job"].handler(
+                    {"probe_id": "S001/P001"}
+                )
+                assert not result.get("is_error")
+                await handlers["verdict"].handler(
+                    {"text": "Printed 42 as predicted on OpenAI."}
+                )
+                yield TextBlockDone("Reviewed on OpenAI.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub:
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": AnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+    runtime.set_session_defaults("claude-sonnet-5", "medium", provider="anthropic")
+
+    assert (
+        runtime.start_query(
+            "Investigate on OpenAI.", "gpt-5.4", "high", provider="openai"
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    # Reopen the workspace while OpenAI is unavailable and Claude is the default.
+    openai_available = False
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    assert runtime.models == ["claude-sonnet-5"]
+
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert anthropic_calls == []
+    assert len(openai_calls) == 1
+    assert len(runtime.agents) == 1
+    assert slurm.needs_review(runtime.session.workspace, probe_id)
+
+    # Restore OpenAI availability; automatic review resumes on OpenAI, not Claude.
+    openai_available = True
+    await runtime.discover_models()
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert anthropic_calls == []
+    assert len(openai_calls) == 2
+    assert openai_calls[1]["model"] == "gpt-5.4"
+    assert openai_calls[1]["resume_session_id"] == "oai-thread-1"
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert owner.model == "gpt-5.4"
+    assert slurm.has_verdict(owner.workspace, probe_id)
+    assert not slurm.needs_review(owner.workspace, probe_id)

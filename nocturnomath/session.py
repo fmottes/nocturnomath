@@ -109,6 +109,9 @@ class ExplorationSession:
         self._pending_verdict_probe_id: str | None = None
         self._slurm_review_probe_id: str | None = None
         self._active_provider: ProviderId | None = None
+        self._owner_provider: ProviderId | None = None
+        self._active_model: str | None = None
+        self._active_effort: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._kernel_notice = ""
@@ -269,6 +272,9 @@ class ExplorationSession:
 
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
+        self._owner_provider = None
+        self._active_model = None
+        self._active_effort = None
         self.context_usage = None
 
     def set_workspace(self, new_dir: Path | str, python=None):
@@ -290,6 +296,9 @@ class ExplorationSession:
         self.record_kernel_start("workspace changed")
         self._session_initialized = False
         self._active_provider = None
+        self._owner_provider = None
+        self._active_model = None
+        self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
         self._results_since_note = 0
@@ -655,6 +664,9 @@ class ExplorationSession:
         path = self.workspace.transcript_file(session_id)
         records = self.workspace.read_transcript(path)
         saved_provider, sdk_id = self.workspace.sdk_session_info(records)
+        owner_provider, saved_model, saved_effort = (
+            self.workspace.session_provider_and_model(records)
+        )
         changed = path != self.workspace.transcript_path
         previous_state = self.workspace.session_state()
         self.workspace.use_transcript(path)
@@ -682,6 +694,15 @@ class ExplorationSession:
             self._active_provider = None
             self._sdk_session_id = None
             self._resume_prefix = self.workspace.recap(records)
+        self._owner_provider = (
+            saved_provider
+            if saved_provider in self.backends
+            else owner_provider
+            if owner_provider in self.backends
+            else None
+        )
+        self._active_model = saved_model
+        self._active_effort = saved_effort
 
         self._sent_documents = {}
         self._record_dirty_seq = 0
@@ -819,17 +840,44 @@ class ExplorationSession:
             self._is_busy = False
             await self.emit("status_change", status="idle")
 
-    def bind_next_turn(self) -> BoundTurnConfig:
-        """Bind the current model, provider, effort, and auth for the next turn."""
-        if self.model is None:
+    def _owner_turn_model(
+        self, owner_provider: ProviderId
+    ) -> tuple[str | None, str | None]:
+        if self.model and self.provider_for_model(self.model) == owner_provider:
+            return self.model, self.effort
+        if (
+            self._active_model
+            and self.provider_for_model(self._active_model) == owner_provider
+            and (not self.model_providers or self._active_model in self.model_providers)
+        ):
+            return self._active_model, self._active_effort
+        if (
+            self.default_model
+            and self.provider_for_model(self.default_model) == owner_provider
+            and (not self.model_providers or self.default_model in self.model_providers)
+        ):
+            return self.default_model, self.default_effort
+        for candidate, candidate_provider in self.model_providers.items():
+            if candidate_provider == owner_provider:
+                return candidate, None
+        return None, None
+
+    def bind_next_turn(
+        self,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> BoundTurnConfig:
+        """Bind the model, provider, effort, and auth for the next turn."""
+        catalogue_model = model if model is not None else self.model
+        if catalogue_model is None:
             raise RuntimeError("No model available.")
-        catalogue_model = self.model
         provider = self.provider_for_model(catalogue_model)
+        chosen_effort = effort if model is not None else self.effort
         bound = BoundTurnConfig(
             catalogue_model=catalogue_model,
             provider=provider,
             raw_model=self.raw_model_id(catalogue_model),
-            effort=self.effort,
+            effort=chosen_effort,
             auth=self.auth.get(provider),
         )
         self._bound_turn = bound
@@ -859,9 +907,24 @@ class ExplorationSession:
     async def query(self, user_text: str, *, slurm_probe_id: str | None = None):
         if self._is_busy:
             raise RuntimeError("Agent is already running a query.")
+        owner_provider = (
+            self._active_provider or self._owner_provider
+            if slurm_probe_id is not None
+            else None
+        )
         bound = self._bound_turn
         self._bound_turn = None
-        if bound is None:
+        if owner_provider is not None and (
+            bound is None or bound.provider != owner_provider
+        ):
+            chosen_model, chosen_effort = self._owner_turn_model(owner_provider)
+            if chosen_model is None:
+                raise RuntimeError(
+                    f"Provider {owner_provider} is not available to review {slurm_probe_id}."
+                )
+            bound = self.bind_next_turn(chosen_model, chosen_effort)
+            self._bound_turn = None
+        elif bound is None:
             bound = self.bind_next_turn()
             self._bound_turn = None
 
@@ -946,10 +1009,10 @@ class ExplorationSession:
                 pending_session_id: str | None = None
                 resume_id = self._sdk_session_id
 
-                def commit_prompt_state():
+                def commit_prompt_state() -> bool:
                     nonlocal accepted
                     if accepted:
-                        return
+                        return True
                     accepted = True
                     self._resume_prefix = None
                     if initialize_session:
@@ -961,13 +1024,34 @@ class ExplorationSession:
                     )
                     self._sent_documents.update(sent_documents)
                     self._active_provider = provider
+                    self._owner_provider = provider
+                    self._active_model = turn_catalogue_model
+                    self._active_effort = turn_effort
+                    return False
 
                 def commit_progress():
                     nonlocal pending_session_id
-                    commit_prompt_state()
+                    prev_provider = self._active_provider
+                    prev_model = self._active_model
+                    was_accepted = commit_prompt_state()
                     if pending_session_id is not None:
                         self._track_session_id(pending_session_id, provider)
                         pending_session_id = None
+                    elif (
+                        not was_accepted
+                        and self._sdk_session_id is None
+                        and (
+                            prev_provider != provider
+                            or prev_model != turn_catalogue_model
+                        )
+                    ):
+                        meta_fields: dict[str, Any] = {
+                            "provider": provider,
+                            "model": turn_catalogue_model,
+                        }
+                        if turn_effort is not None:
+                            meta_fields["effort"] = turn_effort
+                        self.log_transcript("meta", **meta_fields)
 
                 def wrap_tool(spec: ToolSpec) -> ToolSpec:
                     async def wrapped_handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -1071,12 +1155,14 @@ class ExplorationSession:
                         )
                         self._sdk_session_id = None
                         self._active_provider = None
+                        self._owner_provider = provider
                         self._sent_documents = {}
                         self.context_usage = None
                         self._session_initialized = False
                         self.log_transcript(
                             "meta",
                             context_rebuilt=True,
+                            provider=provider,
                             stale_sdk_session_id=resume_id,
                         )
                         await self.emit(
@@ -1126,10 +1212,26 @@ class ExplorationSession:
         ):
             return
         self._active_provider = resolved_provider
+        self._owner_provider = resolved_provider
         self._sdk_session_id = session_id
-        self.log_transcript(
-            "meta", provider=resolved_provider, sdk_session_id=session_id
-        )
+        meta_fields: dict[str, Any] = {
+            "provider": resolved_provider,
+            "sdk_session_id": session_id,
+        }
+        active_model = self._turn_model or self._active_model or self.model
+        if active_model and self.provider_for_model(active_model) == resolved_provider:
+            meta_fields["model"] = active_model
+            if (
+                self._turn_selection is not None
+                and self._turn_selection[0] == resolved_provider
+            ):
+                if self._turn_selection[2] is not None:
+                    meta_fields["effort"] = self._turn_selection[2]
+            elif self._active_effort is not None and active_model == self._active_model:
+                meta_fields["effort"] = self._active_effort
+            elif active_model == self.model and self.effort is not None:
+                meta_fields["effort"] = self.effort
+        self.log_transcript("meta", **meta_fields)
 
     def reset_client_session(self):
         self.require_idle("start a new session")
@@ -1142,6 +1244,9 @@ class ExplorationSession:
             raise
         self._session_initialized = False
         self._active_provider = None
+        self._owner_provider = None
+        self._active_model = None
+        self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
         self._sent_documents = {}

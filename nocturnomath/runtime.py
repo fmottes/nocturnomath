@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ class Runtime:
         self.model_raw_ids: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
         self._provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+        self._provider_default_models: dict[ProviderId, str] = {}
         self._models_discovered = False
         self._auth_revision = 0
         self._discovery_seq = 0
@@ -157,6 +159,96 @@ class Runtime:
             and agent_id not in self._changing_agents
         )
 
+    def _select_provider_model(
+        self,
+        provider: ProviderId,
+        preferred_model: str | None = None,
+        preferred_effort: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        if self._models_discovered or self.models:
+            available = self._provider_models.get(provider, [])
+            if not available:
+                return None, None
+            model = (
+                self.resolve_model(preferred_model, provider)
+                if preferred_model
+                else None
+            )
+            effort_pref = preferred_effort
+            if model is None and self.session is not None:
+                def_model, def_effort, def_prov = self._workspace_defaults(self.session)
+                if def_model is not None and def_prov == provider:
+                    model = def_model
+                    if effort_pref is None:
+                        effort_pref = def_effort
+            if model is None:
+                model = self._provider_default_models.get(provider) or available[0]
+            return model, self._select_effort(model, effort_pref)
+        if preferred_model and (
+            not self.model_providers
+            or self.model_providers.get(preferred_model) == provider
+        ):
+            return preferred_model, preferred_effort
+        if (
+            self.session is not None
+            and self.session.model is not None
+            and self.session.provider_for_model(self.session.model) == provider
+        ):
+            return self.session.model, preferred_effort or self.session.effort
+        if self.model is not None and (
+            self.session is None
+            or self.session.provider_for_model(self.model) == provider
+        ):
+            return self.model, preferred_effort or self.effort
+        return None, None
+
+    def _slurm_review_model(
+        self,
+        workspace,
+        session_id: str,
+        session: ExplorationSession | None = None,
+    ) -> tuple[str | None, str | None]:
+        owner_provider: ProviderId | None = None
+        preferred_model: str | None = None
+        preferred_effort: str | None = None
+        if session is not None:
+            owner_provider = session._active_provider or session._owner_provider
+            preferred_model = session._active_model
+            preferred_effort = session._active_effort
+        if owner_provider is None:
+            records: list[dict[str, Any]] = []
+            with suppress(Exception):
+                records = (
+                    session.workspace.current_records()
+                    if session is not None
+                    else workspace.read_transcript(
+                        workspace.transcript_file(session_id)
+                    )
+                )
+            raw_provider, rec_model, rec_effort = workspace.session_provider_and_model(
+                records
+            )
+            if raw_provider in self.backends:
+                owner_provider = raw_provider
+                preferred_model = preferred_model or rec_model
+                preferred_effort = preferred_effort or rec_effort
+        if owner_provider is not None:
+            if (
+                preferred_model is None
+                and session is not None
+                and session.model is not None
+                and session.provider_for_model(session.model) == owner_provider
+            ):
+                preferred_model = session.model
+                preferred_effort = preferred_effort or session.effort
+            return self._select_provider_model(
+                owner_provider, preferred_model, preferred_effort
+            )
+        target = session or self.session
+        if target is None or target.model is None:
+            return None, None
+        return target.model, target.effort
+
     async def _poll_slurm_jobs(self):
         if not self._started or self.changing or self.session is None:
             return
@@ -176,24 +268,26 @@ class Runtime:
                 return
             terminal = metadata["status"] in ("completed", "error")
             key = (workspace.path, probe_id)
-            agent_id = self.find_agent_for_session(probe_id.split("/")[0])
+            session_id = probe_id.split("/")[0]
+            agent_id = self.find_agent_for_session(session_id)
             if (
                 terminal
                 and agent_id is None
                 and key not in self._slurm_review_attempts
-                and self.session.model is not None
                 and not self._changing_agents
                 and not any(agent.has_active_query() for agent in self.agents.values())
             ):
-                # Resume the owning chat, never repurpose the user's current chat.
-                agent_id = await self.transition(
-                    partial(
-                        self.create_agent,
-                        workspace.path,
-                        session_id=probe_id.split("/")[0],
+                review_model, _ = self._slurm_review_model(workspace, session_id)
+                if review_model is not None:
+                    # Resume the owning chat, never repurpose the user's current chat.
+                    agent_id = await self.transition(
+                        partial(
+                            self.create_agent,
+                            workspace.path,
+                            session_id=session_id,
+                        )
                     )
-                )
-                await self.emit("agent_added", self.agent_snapshot(agent_id))
+                    await self.emit("agent_added", self.agent_snapshot(agent_id))
             if agent_id is None:
                 continue
             session = self.agents.get(agent_id)
@@ -213,7 +307,7 @@ class Runtime:
                 else:
                     probe = (
                         workspace.sessions_path
-                        / probe_id.split("/")[0]
+                        / session_id
                         / "probes"
                         / probe_id.split("/")[1]
                     )
@@ -240,14 +334,31 @@ class Runtime:
                 and key not in self._slurm_review_attempts
                 and not session.has_active_query()
                 and agent_id not in self._changing_agents
-                and session.model is not None
                 and session._pending_verdict_probe_id in (None, probe_id)
             ):
-                session._current_task = asyncio.create_task(
-                    self._review_slurm(session, probe_id, key)
+                review_model, review_effort = self._slurm_review_model(
+                    workspace, session_id, session
                 )
+                if review_model is not None:
+                    session._current_task = asyncio.create_task(
+                        self._review_slurm(
+                            session,
+                            probe_id,
+                            key,
+                            model=review_model,
+                            effort=review_effort,
+                        )
+                    )
 
-    async def _review_slurm(self, session, probe_id, key):
+    async def _review_slurm(
+        self,
+        session,
+        probe_id,
+        key,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+    ):
         try:
             with slurm.review_lock(session.workspace, probe_id) as claimed:
                 if not claimed or not slurm.needs_review(session.workspace, probe_id):
@@ -259,6 +370,8 @@ class Runtime:
                     slurm.set_review_pending, session.workspace, probe_id, True
                 )
                 session._slurm_review_probe_id = probe_id
+                if model is not None:
+                    session.bind_next_turn(model, effort)
                 completed = await session.review_slurm(probe_id)
                 reviewed = slurm.has_verdict(session.workspace, probe_id)
                 if completed and reviewed:
@@ -283,6 +396,7 @@ class Runtime:
             logger.exception("Slurm review failed for %s", probe_id)
             await session.emit("error", message=f"Review of {probe_id} failed: {exc}")
         finally:
+            session._bound_turn = None
             session._slurm_review_probe_id = None
             if session._current_task is asyncio.current_task():
                 session._current_task = None
@@ -336,6 +450,7 @@ class Runtime:
         model_raw_ids: dict[str, str] = {}
         model_efforts: dict[str, list[str]] = {}
         provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+        provider_default_models: dict[ProviderId, str] = {}
         provider_defaults: list[str] = []
         seen: set[str] = set()
 
@@ -360,6 +475,7 @@ class Runtime:
                 provider_models[spec.provider].append(spec_id)
                 if spec.is_default:
                     provider_defaults.append(spec_id)
+                    provider_default_models.setdefault(spec.provider, spec_id)
 
         previous_providers = dict(self.model_providers)
         previous_raw_ids = dict(self.model_raw_ids)
@@ -379,6 +495,7 @@ class Runtime:
         self.model_raw_ids = model_raw_ids
         self.model_efforts = model_efforts
         self._provider_models = provider_models
+        self._provider_default_models = provider_default_models
         self._models_discovered = True
         self.sdk_default_model = (
             provider_defaults[0] if provider_defaults else models[0] if models else None
@@ -404,8 +521,18 @@ class Runtime:
                     session.default_provider = default_provider
                     session.default_effort = default_effort
                     if session.model is None:
-                        session.model = default_model
-                        session.effort = default_effort
+                        owner_provider = (
+                            session._active_provider or session._owner_provider
+                        )
+                        if owner_provider is not None:
+                            session.model, session.effort = self._select_provider_model(
+                                owner_provider,
+                                session._active_model,
+                                session._active_effort,
+                            )
+                        else:
+                            session.model = default_model
+                            session.effort = default_effort
                     else:
                         sess_pref, sess_prov = previous_selection(session.model)
                         session.model = self._select_model(sess_pref, sess_prov)
@@ -723,13 +850,32 @@ class Runtime:
         if self.primary_agent_id is None:
             self.primary_agent_id = agent_id
             self.session = session
-        if self.models:
+        if self.models or self._models_discovered:
             default_model, default_effort, default_provider = self._workspace_defaults(
                 session
             )
             self._apply_defaults_to(
                 session, default_model, default_effort, default_provider
             )
+            if session_id is not None:
+                owner_provider = session._active_provider or session._owner_provider
+                if owner_provider is not None:
+                    session.model, session.effort = self._select_provider_model(
+                        owner_provider,
+                        session._active_model,
+                        session._active_effort,
+                    )
+        elif session_id is not None:
+            owner_provider = session._active_provider or session._owner_provider
+            if owner_provider is not None and (
+                session.model is None
+                or session.provider_for_model(session.model) != owner_provider
+            ):
+                session.model, session.effort = self._select_provider_model(
+                    owner_provider,
+                    session._active_model,
+                    session._active_effort,
+                )
         self._subscribe_to_agent(agent_id, session)
         return agent_id
 

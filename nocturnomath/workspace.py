@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .auth import PROVIDERS
 from .notes import ResearchNotes, write_text
 
 logger = logging.getLogger("nocturnomath")
@@ -502,6 +503,25 @@ class Workspace:
     @classmethod
     def sdk_id(cls, records: list[dict[str, Any]]) -> str | None:
         return cls.sdk_session_info(records)[1]
+
+    @staticmethod
+    def session_provider_and_model(
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None, str | None]:
+        for record in reversed(records):
+            if record.get("kind") != "meta":
+                continue
+            provider = record.get("provider")
+            if provider in PROVIDERS or record.get("sdk_session_id"):
+                resolved = provider if provider in PROVIDERS else "anthropic"
+                model = record.get("model")
+                effort = record.get("effort")
+                return (
+                    resolved,
+                    model if isinstance(model, str) and model else None,
+                    effort if isinstance(effort, str) and effort else None,
+                )
+        return None, None, None
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []
