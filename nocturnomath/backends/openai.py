@@ -23,20 +23,25 @@ from .base import (
     EFFORT_LEVELS,
     CompactionNotice,
     CompactResult,
+    JsonMessageStream,
     ModelSpec,
+    SessionResumeError,
     SessionStarted,
+    StderrCollector,
     TextBlockDone,
     TextDelta,
     TurnEvent,
     TurnResult,
     find_cli_executables,
-    read_jsonl,
+    package_version,
+    terminate_process,
 )
 
 logger = logging.getLogger("nocturnomath.backends.openai")
 
 CODEX_CLI_NAME = "codex.exe" if sys.platform == "win32" else "codex"
 DISCOVERY_TIMEOUT_S = 15.0
+COMPACT_TIMEOUT_S = 120.0
 
 CODEX_DISABLE_FLAGS = (
     "--disable",
@@ -104,6 +109,28 @@ def _disabled_mcp_overrides(codex_home: Path) -> list[str]:
     return flags
 
 
+def _extract_context_usage(
+    tu: dict[str, Any], model: str | None
+) -> dict[str, Any] | None:
+    last = tu.get("last") or {}
+    if not isinstance(last, dict):
+        return None
+    window = tu.get("modelContextWindow")
+    used = last.get("totalTokens")
+    if not isinstance(used, int) or used < 0:
+        inp = last.get("inputTokens")
+        cached = last.get("cachedInputTokens", 0)
+        if isinstance(inp, int) and inp >= 0:
+            used = inp + (cached if isinstance(cached, int) else 0)
+    if not isinstance(used, int) or used < 0:
+        return None
+    return {
+        "used_tokens": used,
+        "window_tokens": window if isinstance(window, int) and window > 0 else None,
+        "model": model,
+    }
+
+
 class OpenAIBackend:
     """Drive the local ``codex app-server`` over JSON-RPC stdio."""
 
@@ -114,6 +141,7 @@ class OpenAIBackend:
         self.cli_path = cli_path
         self._api_key_home: tempfile.TemporaryDirectory[str] | None = None
         self._api_key_secret: str | None = None
+        self._atexit_registered = False
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
@@ -134,7 +162,9 @@ class OpenAIBackend:
             self._api_key_home = None
             self._api_key_secret = None
 
-    def _prepare_env(self, auth: ProviderAuth) -> tuple[dict[str, str], Path]:
+    def _prepare_env_and_flags(
+        self, auth: ProviderAuth
+    ) -> tuple[dict[str, str], Path, list[str]]:
         env = {**os.environ, **auth.sdk_env()}
         if auth.method == "api_key":
             if self._api_key_home is None or self._api_key_secret != auth.credential:
@@ -143,12 +173,15 @@ class OpenAIBackend:
                     prefix="nocturnomath-codex-"
                 )
                 self._api_key_secret = auth.credential
-                atexit.register(self._cleanup_api_home)
+                if not self._atexit_registered:
+                    atexit.register(self._cleanup_api_home)
+                    self._atexit_registered = True
             codex_home = Path(self._api_key_home.name)
             env["CODEX_HOME"] = str(codex_home)
-            return env, codex_home
+            return env, codex_home, ["-c", 'cli_auth_credentials_store="ephemeral"']
+        self._cleanup_api_home()
         codex_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
-        return env, codex_home
+        return env, codex_home, []
 
     def _next_id(self) -> int:
         self._next_rpc_id += 1
@@ -164,15 +197,23 @@ class OpenAIBackend:
     async def _rpc(
         self,
         proc: asyncio.subprocess.Process,
-        messages: AsyncIterator[dict[str, Any]],
+        messages: JsonMessageStream,
         method: str,
         params: dict[str, Any],
+        stderr: StderrCollector | None = None,
     ) -> dict[str, Any]:
         req_id = self._next_id()
-        await self._send(
-            proc, {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        )
-        async for msg in messages:
+        try:
+            await self._send(
+                proc,
+                {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
+            )
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            detail = await stderr.text() if stderr is not None else ""
+            raise RuntimeError(
+                detail or f"Codex app-server closed before replying to {method}."
+            ) from exc
+        while (msg := await messages.next_wire()) is not None:
             if "id" in msg and "method" in msg:
                 await self._handle_server_request(proc, msg)
                 continue
@@ -182,7 +223,12 @@ class OpenAIBackend:
                     text = err.get("message") if isinstance(err, dict) else str(err)
                     raise RuntimeError(text or f"Codex RPC {method} failed.")
                 return msg.get("result") or {}
-        raise RuntimeError(f"Codex app-server closed before replying to {method}.")
+            if "id" not in msg:
+                messages.buffer_notification(msg)
+        detail = await stderr.text() if stderr is not None else ""
+        raise RuntimeError(
+            detail or f"Codex app-server closed before replying to {method}."
+        )
 
     async def _handle_server_request(
         self, proc: asyncio.subprocess.Process, msg: dict[str, Any]
@@ -191,13 +237,24 @@ class OpenAIBackend:
         method = msg.get("method")
         if method in (
             "item/commandExecution/requestApproval",
-            "execCommandApproval",
             "item/fileChange/requestApproval",
-            "applyPatchApproval",
         ):
             await self._send(
                 proc,
                 {"jsonrpc": "2.0", "id": req_id, "result": {"decision": "decline"}},
+            )
+        elif method in ("execCommandApproval", "applyPatchApproval"):
+            await self._send(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "decision": {
+                            "denied": {"rejection": "Built-in tools are disabled."}
+                        }
+                    },
+                },
             )
         elif method == "item/permissions/requestApproval":
             await self._send(
@@ -208,7 +265,11 @@ class OpenAIBackend:
                     "result": {"permissions": {}, "scope": "turn"},
                 },
             )
-        elif method in ("item/tool/requestUserInput", "mcpServer/elicitation/request"):
+        elif method == "item/tool/requestUserInput":
+            await self._send(
+                proc, {"jsonrpc": "2.0", "id": req_id, "result": {"answers": {}}}
+            )
+        elif method == "mcpServer/elicitation/request":
             await self._send(
                 proc, {"jsonrpc": "2.0", "id": req_id, "result": {"action": "decline"}}
             )
@@ -222,36 +283,22 @@ class OpenAIBackend:
                 },
             )
 
-    @staticmethod
-    async def _terminate(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            with suppress(Exception):
-                proc.stdin.close()
-        with suppress(ProcessLookupError):
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except TimeoutError:
-            with suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
-
     async def _initialize_session(
         self,
         proc: asyncio.subprocess.Process,
-        messages: AsyncIterator[dict[str, Any]],
+        messages: JsonMessageStream,
         auth: ProviderAuth,
+        stderr: StderrCollector | None = None,
     ) -> None:
         await self._rpc(
             proc,
             messages,
             "initialize",
             {
-                "clientInfo": {"name": "nocturnomath", "version": "0.3.1"},
+                "clientInfo": {"name": "nocturnomath", "version": package_version()},
                 "capabilities": {"experimentalApi": True},
             },
+            stderr,
         )
         await self._send(
             proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}}
@@ -262,21 +309,24 @@ class OpenAIBackend:
                 messages,
                 "account/login/start",
                 {"type": "apiKey", "apiKey": auth.credential or ""},
+                stderr,
             )
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         candidates = codex_cli_candidates()
         if not candidates:
             return []
-        env, codex_home = self._prepare_env(auth)
+        env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
         for candidate in candidates:
             proc: asyncio.subprocess.Process | None = None
+            stderr: StderrCollector | None = None
             try:
                 async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
                     proc = await asyncio.create_subprocess_exec(
                         str(candidate),
                         "app-server",
                         *CODEX_DISABLE_FLAGS,
+                        *auth_flags,
                         "-c",
                         "mcp_servers={}",
                         *_disabled_mcp_overrides(codex_home),
@@ -287,10 +337,11 @@ class OpenAIBackend:
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
                     )
-                    messages = read_jsonl(proc.stdout)
-                    await self._initialize_session(proc, messages, auth)
+                    stderr = StderrCollector(proc.stderr)
+                    messages = JsonMessageStream(proc.stdout)
+                    await self._initialize_session(proc, messages, auth, stderr)
                     acct = await self._rpc(
-                        proc, messages, "account/read", {"refreshToken": False}
+                        proc, messages, "account/read", {"refreshToken": False}, stderr
                     )
                     has_env_key = bool(
                         os.environ.get("CODEX_API_KEY")
@@ -311,7 +362,9 @@ class OpenAIBackend:
                         params: dict[str, Any] = {"includeHidden": False}
                         if cursor is not None:
                             params["cursor"] = cursor
-                        page = await self._rpc(proc, messages, "model/list", params)
+                        page = await self._rpc(
+                            proc, messages, "model/list", params, stderr
+                        )
                         data = page.get("data") or []
                         if isinstance(data, list):
                             raw_models.extend(
@@ -359,7 +412,9 @@ class OpenAIBackend:
                 )
             finally:
                 if proc is not None:
-                    await self._terminate(proc)
+                    await terminate_process(proc, stderr)
+                elif stderr is not None:
+                    await stderr.close()
         return []
 
     async def run_turn(
@@ -375,7 +430,7 @@ class OpenAIBackend:
         resume_session_id: str | None = None,
     ) -> AsyncIterator[TurnEvent]:
         cli_path = self._resolve_cli()
-        env, codex_home = self._prepare_env(auth)
+        env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-"
         ) as isolated_cwd:
@@ -385,6 +440,7 @@ class OpenAIBackend:
                     str(cli_path),
                     "app-server",
                     *CODEX_DISABLE_FLAGS,
+                    *auth_flags,
                     "-c",
                     _toml_mcp_override(cfg),
                     *_disabled_mcp_overrides(codex_home),
@@ -396,36 +452,39 @@ class OpenAIBackend:
                     cwd=isolated_cwd,
                     env=env,
                 )
+                stderr = StderrCollector(proc.stderr)
                 thread_id = resume_session_id
                 turn_id: str | None = None
                 try:
-                    messages = read_jsonl(proc.stdout)
-                    await self._initialize_session(proc, messages, auth)
+                    messages = JsonMessageStream(proc.stdout)
+                    await self._initialize_session(proc, messages, auth, stderr)
                     thread_params = {
                         "cwd": isolated_cwd,
                         "baseInstructions": system_prompt,
-                        "developerInstructions": system_prompt,
                         "model": model,
                         "sandbox": "read-only",
                         "approvalPolicy": "never",
                     }
                     if resume_session_id:
-                        res = await self._rpc(
-                            proc,
-                            messages,
-                            "thread/resume",
-                            {"threadId": resume_session_id, **thread_params},
-                        )
+                        try:
+                            res = await self._rpc(
+                                proc,
+                                messages,
+                                "thread/resume",
+                                {"threadId": resume_session_id, **thread_params},
+                                stderr,
+                            )
+                        except RuntimeError as exc:
+                            raise SessionResumeError(str(exc)) from exc
                     else:
                         res = await self._rpc(
-                            proc, messages, "thread/start", thread_params
+                            proc, messages, "thread/start", thread_params, stderr
                         )
                     thread_id = (res.get("thread") or {}).get("id") or resume_session_id
                     if not isinstance(thread_id, str) or not thread_id:
                         raise RuntimeError(
                             "Codex app-server did not return a thread ID."
                         )
-                    yield SessionStarted(thread_id)
 
                     turn_params: dict[str, Any] = {
                         "threadId": thread_id,
@@ -435,13 +494,17 @@ class OpenAIBackend:
                     if effort:
                         turn_params["effort"] = effort
                     turn_res = await self._rpc(
-                        proc, messages, "turn/start", turn_params
+                        proc, messages, "turn/start", turn_params, stderr
                     )
                     turn_id = (turn_res.get("turn") or {}).get("id")
+                    yield SessionStarted(thread_id)
 
                     last_error: str | None = None
                     last_context_usage: dict[str, Any] | None = None
-                    total_usage: dict[str, Any] | None = None
+                    baseline_total: dict[str, Any] | None = None
+                    latest_total: dict[str, Any] | None = None
+                    accumulated_last: dict[str, int] = {}
+                    saw_compaction_item = False
                     turn_finished = False
 
                     async for msg in messages:
@@ -456,35 +519,42 @@ class OpenAIBackend:
                                 yield TextDelta(delta)
                         elif method == "item/completed":
                             item = params.get("item") or {}
-                            if item.get("type") == "agentMessage":
+                            item_type = item.get("type")
+                            if item_type == "agentMessage":
                                 text = item.get("text")
                                 if isinstance(text, str) and text:
                                     yield TextBlockDone(text)
+                            elif item_type == "contextCompaction":
+                                saw_compaction_item = True
+                                yield CompactionNotice()
                         elif method == "thread/compacted":
-                            yield CompactionNotice()
+                            if not saw_compaction_item:
+                                yield CompactionNotice()
                         elif method == "thread/tokenUsage/updated":
                             tu = params.get("tokenUsage") or {}
-                            last = tu.get("last") or {}
+                            notif_turn_id = params.get("turnId")
                             total = tu.get("total") or {}
-                            window = tu.get("modelContextWindow")
-                            used = last.get("totalTokens")
-                            if not isinstance(used, int) or used < 0:
-                                inp = last.get("inputTokens")
-                                cached = last.get("cachedInputTokens", 0)
-                                if isinstance(inp, int) and inp >= 0:
-                                    used = inp + (
-                                        cached if isinstance(cached, int) else 0
-                                    )
-                            if isinstance(used, int) and used >= 0:
-                                last_context_usage = {
-                                    "used_tokens": used,
-                                    "window_tokens": window
-                                    if isinstance(window, int) and window > 0
-                                    else None,
-                                    "model": model,
-                                }
-                            if isinstance(total, dict) and total:
-                                total_usage = total
+                            last = tu.get("last") or {}
+                            if (
+                                turn_id
+                                and isinstance(notif_turn_id, str)
+                                and notif_turn_id
+                                and notif_turn_id != turn_id
+                            ):
+                                if isinstance(total, dict) and total:
+                                    baseline_total = total
+                            else:
+                                ctx = _extract_context_usage(tu, model)
+                                if ctx is not None:
+                                    last_context_usage = ctx
+                                if isinstance(total, dict) and total:
+                                    latest_total = total
+                                if isinstance(last, dict):
+                                    for key, val in last.items():
+                                        if isinstance(val, int):
+                                            accumulated_last[key] = (
+                                                accumulated_last.get(key, 0) + val
+                                            )
                         elif method == "error":
                             err = params.get("error") or {}
                             message = (
@@ -509,16 +579,32 @@ class OpenAIBackend:
                                     or last_error
                                     or "OpenAI Codex could not finish this turn."
                                 )
+                            if latest_total and baseline_total:
+                                turn_usage: dict[str, Any] | None = {
+                                    key: max(0, val - baseline_total.get(key, 0))
+                                    for key, val in latest_total.items()
+                                    if isinstance(val, int)
+                                    and isinstance(baseline_total.get(key, 0), int)
+                                }
+                            elif resume_session_id is None and latest_total:
+                                turn_usage = latest_total
+                            elif accumulated_last:
+                                turn_usage = accumulated_last
+                            else:
+                                turn_usage = latest_total
                             yield TurnResult(
-                                usage=total_usage,
+                                usage=turn_usage,
                                 context_usage=last_context_usage,
                                 num_turns=1,
                             )
                             break
 
                     if not turn_finished:
+                        detail = await stderr.text()
                         raise RuntimeError(
-                            last_error or "Codex app-server disconnected unexpectedly."
+                            last_error
+                            or detail
+                            or "Codex app-server disconnected unexpectedly."
                         )
                 except asyncio.CancelledError:
                     if thread_id and turn_id:
@@ -537,7 +623,7 @@ class OpenAIBackend:
                             )
                     raise
                 finally:
-                    await self._terminate(proc)
+                    await terminate_process(proc, stderr)
 
     async def compact(
         self,
@@ -551,7 +637,7 @@ class OpenAIBackend:
         resume_session_id: str,
     ) -> CompactResult:
         cli_path = self._resolve_cli()
-        env, codex_home = self._prepare_env(auth)
+        env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-"
         ) as isolated_cwd:
@@ -559,6 +645,7 @@ class OpenAIBackend:
                 str(cli_path),
                 "app-server",
                 *CODEX_DISABLE_FLAGS,
+                *auth_flags,
                 "-c",
                 "mcp_servers={}",
                 *_disabled_mcp_overrides(codex_home),
@@ -570,66 +657,87 @@ class OpenAIBackend:
                 cwd=isolated_cwd,
                 env=env,
             )
+            stderr = StderrCollector(proc.stderr)
             try:
-                messages = read_jsonl(proc.stdout)
-                await self._initialize_session(proc, messages, auth)
-                await self._rpc(
-                    proc,
-                    messages,
-                    "thread/resume",
-                    {
-                        "threadId": resume_session_id,
-                        "cwd": isolated_cwd,
-                        "baseInstructions": system_prompt,
-                        "developerInstructions": system_prompt,
-                        **({"model": model} if model else {}),
-                        "sandbox": "read-only",
-                        "approvalPolicy": "never",
-                    },
-                )
-                await self._rpc(
-                    proc,
-                    messages,
-                    "thread/compact/start",
-                    {"threadId": resume_session_id},
-                )
+                messages = JsonMessageStream(proc.stdout)
                 compacted = False
                 context_usage: dict[str, Any] | None = None
-                async for msg in messages:
-                    if "id" in msg and "method" in msg:
-                        await self._handle_server_request(proc, msg)
-                        continue
-                    method = msg.get("method")
-                    params = msg.get("params") or {}
-                    if method == "thread/tokenUsage/updated":
-                        tu = params.get("tokenUsage") or {}
-                        last = tu.get("last") or {}
-                        window = tu.get("modelContextWindow")
-                        used = last.get("totalTokens")
-                        if isinstance(used, int) and used >= 0:
-                            context_usage = {
-                                "used_tokens": used,
-                                "window_tokens": window
-                                if isinstance(window, int) and window > 0
-                                else None,
-                                "model": model,
-                            }
-                    elif method == "thread/compacted":
-                        compacted = True
-                        break
-                    elif method == "error":
-                        err = params.get("error") or {}
-                        message = (
-                            err.get("message") if isinstance(err, dict) else str(err)
+                async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                    await self._initialize_session(proc, messages, auth, stderr)
+                    try:
+                        await self._rpc(
+                            proc,
+                            messages,
+                            "thread/resume",
+                            {
+                                "threadId": resume_session_id,
+                                "cwd": isolated_cwd,
+                                "baseInstructions": system_prompt,
+                                **({"model": model} if model else {}),
+                                "sandbox": "read-only",
+                                "approvalPolicy": "never",
+                            },
+                            stderr,
                         )
-                        if not params.get("willRetry"):
-                            raise RuntimeError(message or "Codex compaction failed.")
+                    except RuntimeError as exc:
+                        raise SessionResumeError(str(exc)) from exc
+                    await self._rpc(
+                        proc,
+                        messages,
+                        "thread/compact/start",
+                        {"threadId": resume_session_id},
+                        stderr,
+                    )
+                    async for msg in messages:
+                        if "id" in msg and "method" in msg:
+                            await self._handle_server_request(proc, msg)
+                            continue
+                        method = msg.get("method")
+                        params = msg.get("params") or {}
+                        if method == "thread/tokenUsage/updated":
+                            ctx = _extract_context_usage(
+                                params.get("tokenUsage") or {}, model
+                            )
+                            if ctx is not None:
+                                context_usage = ctx
+                        elif method == "item/completed":
+                            item = params.get("item") or {}
+                            if item.get("type") == "contextCompaction":
+                                compacted = True
+                        elif method == "thread/compacted":
+                            compacted = True
+                            break
+                        elif method == "turn/completed":
+                            turn = params.get("turn") or {}
+                            if turn.get("status") == "failed":
+                                err = turn.get("error") or {}
+                                message = (
+                                    err.get("message")
+                                    if isinstance(err, dict)
+                                    else None
+                                )
+                                raise RuntimeError(
+                                    message or "Codex compaction failed."
+                                )
+                            break
+                        elif method == "error":
+                            err = params.get("error") or {}
+                            message = (
+                                err.get("message")
+                                if isinstance(err, dict)
+                                else str(err)
+                            )
+                            if not params.get("willRetry"):
+                                raise RuntimeError(
+                                    message or "Codex compaction failed."
+                                )
                 if not compacted:
+                    detail = await stderr.text()
                     raise RuntimeError(
-                        "Codex did not confirm that compaction completed."
+                        detail or "Codex did not confirm that compaction completed."
                     )
                 return CompactResult(
                     session_id=resume_session_id, context_usage=context_usage
                 )
             finally:
-                await self._terminate(proc)
+                await terminate_process(proc, stderr)

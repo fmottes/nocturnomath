@@ -24,20 +24,28 @@ from .base import (
     CompactResult,
     MessageUsage,
     ModelSpec,
+    SessionResumeError,
     SessionStarted,
+    StderrCollector,
     TextBlockDone,
     TextDelta,
     TurnEvent,
     TurnResult,
     find_cli_executables,
     read_jsonl,
+    terminate_process,
 )
 
 logger = logging.getLogger("nocturnomath.backends.anthropic")
 
 CLAUDE_CLI_NAME = "claude.exe" if sys.platform == "win32" else "claude"
 DISCOVERY_TIMEOUT_S = 15.0
+COMPACT_TIMEOUT_S = 120.0
 CONTEXT_USAGE_TIMEOUT_S = 10.0
+
+
+def _is_missing_session_error(text: str) -> bool:
+    return "no conversation found" in text.lower()
 
 
 def _bundled_claude_cli() -> Path | None:
@@ -183,26 +191,48 @@ class AnthropicBackend:
         proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await proc.stdin.drain()
 
-    @staticmethod
-    async def _terminate(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            with suppress(Exception):
-                proc.stdin.close()
-        with suppress(ProcessLookupError):
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except TimeoutError:
-            with suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
+    async def _await_initialize(
+        self,
+        proc: asyncio.subprocess.Process,
+        messages: AsyncIterator[dict[str, Any]],
+        init_id: str,
+        stderr: StderrCollector,
+        *,
+        resume_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        async for msg in messages:
+            msg_type = msg.get("type")
+            if (
+                msg_type == "control_response"
+                and (msg.get("response") or {}).get("request_id") == init_id
+            ):
+                resp = msg.get("response") or {}
+                if resp.get("subtype") == "error":
+                    raise RuntimeError(
+                        str(resp.get("error") or "Claude CLI initialization failed.")
+                    )
+                return resp.get("response") or {}
+            if msg_type == "control_request":
+                await self._handle_control_request(proc, msg)
+            elif msg_type == "result" and msg.get("is_error"):
+                detail = _error_result_text(msg)
+                if resume_session_id and _is_missing_session_error(detail):
+                    raise SessionResumeError(detail)
+                raise RuntimeError(detail)
+        detail = await stderr.text()
+        rc = await proc.wait()
+        if resume_session_id and _is_missing_session_error(detail):
+            raise SessionResumeError(detail)
+        raise RuntimeError(
+            detail
+            or f"Claude CLI exited before completing initialization (status {rc})."
+        )
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         env = {**os.environ, **auth.sdk_env()}
         for candidate in claude_cli_candidates():
             proc: asyncio.subprocess.Process | None = None
+            stderr: StderrCollector | None = None
             try:
                 async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
                     proc = await asyncio.create_subprocess_exec(
@@ -222,26 +252,15 @@ class AnthropicBackend:
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
                     )
-                    req_id = f"init_{uuid.uuid4().hex[:8]}"
-                    await self._write_json(
-                        proc,
-                        {
-                            "type": "control_request",
-                            "request_id": req_id,
-                            "request": {"subtype": "initialize", "skills": []},
-                        },
+                    stderr = StderrCollector(proc.stderr)
+                    req_id = await self._send_control(
+                        proc, "initialize", {"skills": []}
                     )
-                    entries: list[Any] = []
-                    async for msg in read_jsonl(proc.stdout):
-                        if (
-                            msg.get("type") == "control_response"
-                            and (msg.get("response") or {}).get("request_id") == req_id
-                        ):
-                            resp = (msg.get("response") or {}).get("response") or {}
-                            raw_models = resp.get("models")
-                            if isinstance(raw_models, list):
-                                entries = raw_models
-                            break
+                    resp = await self._await_initialize(
+                        proc, read_jsonl(proc.stdout), req_id, stderr
+                    )
+                    raw_models = resp.get("models")
+                    entries = raw_models if isinstance(raw_models, list) else []
                     models = _parse_models(entries)
                     if models:
                         self.cli_path = candidate
@@ -255,7 +274,9 @@ class AnthropicBackend:
                 )
             finally:
                 if proc is not None:
-                    await self._terminate(proc)
+                    await terminate_process(proc, stderr)
+                elif stderr is not None:
+                    await stderr.close()
         return []
 
     def _build_turn_cmd(
@@ -399,17 +420,25 @@ class AnthropicBackend:
                 cwd=workspace_path,
                 env=env,
             )
+            stderr = StderrCollector(proc.stderr)
             try:
-                init_id = await self._send_control(proc, "initialize", {"skills": []})
                 messages = read_jsonl(proc.stdout)
-                async for msg in messages:
-                    if (
-                        msg.get("type") == "control_response"
-                        and (msg.get("response") or {}).get("request_id") == init_id
-                    ):
-                        break
-                    if msg.get("type") == "control_request":
-                        await self._handle_control_request(proc, msg)
+                try:
+                    init_id = await self._send_control(
+                        proc, "initialize", {"skills": []}
+                    )
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    detail = await stderr.text()
+                    if resume_session_id and _is_missing_session_error(detail):
+                        raise SessionResumeError(detail) from exc
+                    raise RuntimeError(detail or str(exc)) from exc
+                await self._await_initialize(
+                    proc,
+                    messages,
+                    init_id,
+                    stderr,
+                    resume_session_id=resume_session_id,
+                )
 
                 await self._write_json(
                     proc,
@@ -425,8 +454,20 @@ class AnthropicBackend:
                 last_prompt_tokens: int | None = None
                 last_prompt_model: str | None = None
                 saw_result = False
+                progressed = False
 
                 async for msg in messages:
+                    msg_type = msg.get("type")
+                    if msg_type == "result" and msg.get("is_error"):
+                        detail = _error_result_text(msg)
+                        if (
+                            resume_session_id
+                            and not progressed
+                            and _is_missing_session_error(detail)
+                        ):
+                            raise SessionResumeError(detail)
+                        raise RuntimeError(detail)
+
                     session_id = msg.get("session_id")
                     if (
                         isinstance(session_id, str)
@@ -436,7 +477,6 @@ class AnthropicBackend:
                         seen_session_id = session_id
                         yield SessionStarted(session_id)
 
-                    msg_type = msg.get("type")
                     if msg_type == "control_request":
                         await self._handle_control_request(proc, msg)
                         continue
@@ -450,11 +490,13 @@ class AnthropicBackend:
                             if delta.get("type") == "text_delta":
                                 chunk = delta.get("text")
                                 if isinstance(chunk, str) and chunk:
+                                    progressed = True
                                     yield TextDelta(chunk)
                     elif (
                         msg_type == "system"
                         and msg.get("subtype") == "compact_boundary"
                     ):
+                        progressed = True
                         yield CompactionNotice()
                     elif msg_type == "assistant":
                         inner = (
@@ -467,6 +509,7 @@ class AnthropicBackend:
                         msg_model = inner.get("model") or msg.get("model")
                         msg_id = inner.get("id") or msg.get("message_id")
                         if parent_tool is None and isinstance(usage, dict) and usage:
+                            progressed = True
                             yield MessageUsage(
                                 message_id=msg_id,
                                 model=msg_model,
@@ -491,15 +534,15 @@ class AnthropicBackend:
                                     and block.get("type") == "text"
                                     and isinstance(block.get("text"), str)
                                 ):
+                                    progressed = True
                                     yield TextBlockDone(block["text"])
                     elif msg_type == "result":
                         saw_result = True
-                        if msg.get("is_error"):
-                            raise RuntimeError(_error_result_text(msg))
                         model_usage = msg.get("modelUsage") or msg.get("model_usage")
                         context_usage = _context_usage_from_turn(
                             last_prompt_tokens, last_prompt_model, model_usage
                         )
+                        progressed = True
                         yield TurnResult(
                             usage=msg.get("usage"),
                             model_usage=model_usage,
@@ -512,21 +555,18 @@ class AnthropicBackend:
                         break
 
                 if not saw_result:
-                    stderr_bytes = (
-                        await proc.stderr.read() if proc.stderr is not None else b""
-                    )
+                    detail = await stderr.text()
                     rc = await proc.wait()
-                    if rc != 0:
-                        detail = stderr_bytes.decode("utf-8", errors="replace").strip()
-                        raise RuntimeError(
-                            detail or f"Claude CLI exited with status {rc}."
-                        )
+                    raise RuntimeError(
+                        detail
+                        or f"Claude CLI exited without completing the turn (status {rc})."
+                    )
             except asyncio.CancelledError:
                 with suppress(Exception):
                     await self._send_control(proc, "interrupt")
                 raise
             finally:
-                await self._terminate(proc)
+                await terminate_process(proc, stderr)
 
     async def compact(
         self,
@@ -562,51 +602,64 @@ class AnthropicBackend:
                 cwd=workspace_path,
                 env=env,
             )
+            stderr = StderrCollector(proc.stderr)
             try:
-                init_id = await self._send_control(proc, "initialize", {"skills": []})
                 messages = read_jsonl(proc.stdout)
-                async for msg in messages:
-                    if (
-                        msg.get("type") == "control_response"
-                        and (msg.get("response") or {}).get("request_id") == init_id
-                    ):
-                        break
-                    if msg.get("type") == "control_request":
-                        await self._handle_control_request(proc, msg)
-
-                await self._write_json(
-                    proc,
-                    {
-                        "type": "user",
-                        "message": {"role": "user", "content": "/compact"},
-                        "parent_tool_use_id": None,
-                        "session_id": resume_session_id,
-                    },
-                )
-
                 compacted = False
                 latest_session_id: str | None = resume_session_id
-                async for msg in messages:
-                    sid = msg.get("session_id")
-                    if isinstance(sid, str) and sid:
-                        latest_session_id = sid
-                    msg_type = msg.get("type")
-                    if msg_type == "control_request":
-                        await self._handle_control_request(proc, msg)
-                        continue
-                    if (
-                        msg_type == "system"
-                        and msg.get("subtype") == "compact_boundary"
-                    ):
-                        compacted = True
-                    elif msg_type == "result":
-                        if msg.get("is_error"):
-                            raise RuntimeError(_error_result_text(msg))
-                        break
+                async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                    try:
+                        init_id = await self._send_control(
+                            proc, "initialize", {"skills": []}
+                        )
+                    except (BrokenPipeError, ConnectionResetError) as exc:
+                        detail = await stderr.text()
+                        if _is_missing_session_error(detail):
+                            raise SessionResumeError(detail) from exc
+                        raise RuntimeError(detail or str(exc)) from exc
+                    await self._await_initialize(
+                        proc,
+                        messages,
+                        init_id,
+                        stderr,
+                        resume_session_id=resume_session_id,
+                    )
+
+                    await self._write_json(
+                        proc,
+                        {
+                            "type": "user",
+                            "message": {"role": "user", "content": "/compact"},
+                            "parent_tool_use_id": None,
+                            "session_id": resume_session_id,
+                        },
+                    )
+
+                    async for msg in messages:
+                        sid = msg.get("session_id")
+                        if isinstance(sid, str) and sid:
+                            latest_session_id = sid
+                        msg_type = msg.get("type")
+                        if msg_type == "control_request":
+                            await self._handle_control_request(proc, msg)
+                            continue
+                        if (
+                            msg_type == "system"
+                            and msg.get("subtype") == "compact_boundary"
+                        ):
+                            compacted = True
+                        elif msg_type == "result":
+                            if msg.get("is_error"):
+                                detail = _error_result_text(msg)
+                                if not compacted and _is_missing_session_error(detail):
+                                    raise SessionResumeError(detail)
+                                raise RuntimeError(detail)
+                            break
 
                 if not compacted:
+                    detail = await stderr.text()
                     raise RuntimeError(
-                        "Claude did not confirm that compaction completed."
+                        detail or "Claude did not confirm that compaction completed."
                     )
 
                 context_usage: dict[str, Any] | None = None
@@ -649,4 +702,4 @@ class AnthropicBackend:
                     session_id=latest_session_id, context_usage=context_usage
                 )
             finally:
-                await self._terminate(proc)
+                await terminate_process(proc, stderr)

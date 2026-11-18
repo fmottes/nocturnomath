@@ -8,9 +8,11 @@ import pytest
 from nocturnomath.auth import ProviderAuth
 from nocturnomath.backends import (
     AnthropicBackend,
+    CompactionNotice,
     GoogleBackend,
     MessageUsage,
     OpenAIBackend,
+    SessionResumeError,
     SessionStarted,
     TextBlockDone,
     TextDelta,
@@ -125,6 +127,11 @@ for line in sys.stdin:
     assert logs[1]["api_key"] == ""
     assert "--tools" in logs[1]["argv"]
     assert "--strict-mcp-config" in logs[1]["argv"]
+    assert "NOCTURNOMATH_MCP_TOKEN" not in json.dumps(logs[1]["argv"])
+    mcp_idx = logs[1]["argv"].index("--mcp-config") + 1
+    mcp_payload = json.loads(logs[1]["argv"][mcp_idx])["mcpServers"]["explore"]
+    assert mcp_payload["env"] == {}
+    assert mcp_payload["args"][-1].endswith("bridge.json")
     assert "--resume=ant-1" in logs[2]["argv"]
 
 
@@ -165,6 +172,8 @@ for line in sys.stdin:
             {{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True, "supportedReasoningEfforts": [{{"reasoningEffort": "low"}}, {{"reasoningEffort": "high"}}, {{"reasoningEffort": "ultra"}}]}},
         ], "nextCursor": None}}}}), flush=True)
     elif method in ("thread/start", "thread/resume"):
+        logs[-1]["thread_params"] = msg.get("params")
+        open(log_path, "w").write(json.dumps(logs))
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"thread": {{"id": "thr-1"}}}}}}), flush=True)
     elif method == "turn/start":
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"turn": {{"id": "turn-1"}}}}}}), flush=True)
@@ -228,13 +237,24 @@ for line in sys.stdin:
         assert compact.session_id == "thr-1"
         assert compact.context_usage["used_tokens"] == 300
 
-        # In CLI mode, user-configured MCP servers from CODEX_HOME/config.toml are disabled.
+        # In CLI mode, user-configured MCP servers from CODEX_HOME/config.toml are disabled,
+        # and the temporary API-key CODEX_HOME is removed immediately.
+        api_home_path = Path(backend._api_key_home.name)
+        assert api_home_path.is_dir()
         cli_models = await backend.discover_models(ProviderAuth("openai", "cli"))
         assert len(cli_models) == 1
+        assert backend._api_key_home is None
+        assert not api_home_path.exists()
 
     logs = json.loads(log_path.read_text())
     assert logs[0]["codex_home"] != str(real_home)
     assert logs[1]["cwd"] != str(tmp_path)
+    assert 'cli_auth_credentials_store="ephemeral"' in logs[0]["argv"]
+    assert 'cli_auth_credentials_store="ephemeral"' in logs[1]["argv"]
+    assert 'cli_auth_credentials_store="ephemeral"' not in logs[3]["argv"]
+    assert "developerInstructions" not in logs[1]["thread_params"]
+    assert "baseInstructions" in logs[1]["thread_params"]
+    assert "NOCTURNOMATH_MCP_TOKEN" not in json.dumps(logs[1]["argv"])
     assert "mcp_servers.node_repl.enabled=false" in logs[3]["argv"]
     assert "mcp_servers.user_extra.enabled=false" in logs[3]["argv"]
     assert (real_home / "auth.json").read_text() == '{"keep":"untouched"}\n'
@@ -357,3 +377,297 @@ for line in sys.stdin:
     assert logs[1]["perms"] == ["deny", "allow"]
     assert logs[1]["cwd"] != str(tmp_path)
     backend._cleanup_api_dir()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_drains_large_stderr_and_surfaces_early_exits(tmp_path):
+    noisy = _write_fake_cli(
+        tmp_path / "claude_noisy",
+        """
+import json, sys
+sys.stderr.write("W" * (160 * 1024) + "\\n")
+sys.stderr.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": msg["request_id"], "response": {}}}), flush=True)
+    elif msg.get("type") == "user":
+        print(json.dumps({"type": "assistant", "session_id": "ant-noisy", "parent_tool_use_id": None, "message": {"id": "m1", "model": "claude", "content": [{"type": "text", "text": "ok"}]}}), flush=True)
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": "ant-noisy"}), flush=True)
+""",
+    )
+    backend = AnthropicBackend(cli_path=noisy)
+    events = [
+        e
+        async for e in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="claude",
+            effort=None,
+            auth=ProviderAuth("anthropic", "cli"),
+        )
+    ]
+    assert [e.text for e in events if isinstance(e, TextBlockDone)] == ["ok"]
+
+    silent_exit = _write_fake_cli(
+        tmp_path / "claude_silent_exit",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": msg["request_id"], "response": {}}}), flush=True)
+    elif msg.get("type") == "user":
+        sys.stderr.write("unexpected eof detail\\n")
+        sys.stderr.flush()
+        sys.exit(0)
+""",
+    )
+    with pytest.raises(RuntimeError, match="unexpected eof detail"):
+        async for _ in AnthropicBackend(cli_path=silent_exit).run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="claude",
+            effort=None,
+            auth=ProviderAuth("anthropic", "cli"),
+        ):
+            pass
+
+    missing_resume = _write_fake_cli(
+        tmp_path / "claude_missing_resume",
+        """
+import json, sys
+sys.stderr.write("No conversation found with session ID: stale-id\\n")
+sys.stderr.flush()
+print(json.dumps({"type": "result", "is_error": True, "errors": ["No conversation found with session ID: stale-id"]}), flush=True)
+sys.exit(1)
+""",
+    )
+    with pytest.raises(SessionResumeError, match="No conversation found"):
+        async for _ in AnthropicBackend(cli_path=missing_resume).run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="claude",
+            effort=None,
+            auth=ProviderAuth("anthropic", "cli"),
+            resume_session_id="stale-id",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_openai_buffered_resume_usage_delta_and_context_compaction_item(tmp_path):
+    fake = _write_fake_cli(
+        tmp_path / "codex_resume",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+    elif method == "thread/resume":
+        if msg["params"]["threadId"] == "missing":
+            print(json.dumps({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "Thread not found"}}), flush=True)
+            continue
+        # Emit prior-turn token usage notification before thread/resume response!
+        print(json.dumps({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated", "params": {"turnId": "turn-prev", "tokenUsage": {"modelContextWindow": 200000, "last": {"totalTokens": 100, "inputTokens": 80, "outputTokens": 20}, "total": {"totalTokens": 100, "inputTokens": 80, "outputTokens": 20}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"thread": {"id": "thr-1"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"turn": {"id": "turn-now"}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": {"type": "contextCompaction"}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "thread/compacted", "params": {}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "resumed"}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated", "params": {"turnId": "turn-now", "tokenUsage": {"modelContextWindow": 200000, "last": {"totalTokens": 250, "inputTokens": 200, "outputTokens": 50}, "total": {"totalTokens": 350, "inputTokens": 280, "outputTokens": 70}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-now", "status": "completed"}}}), flush=True)
+    elif method == "thread/compact/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": {"type": "contextCompaction"}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "compact-1", "status": "completed"}}}), flush=True)
+""",
+    )
+    backend = OpenAIBackend(cli_path=fake)
+    auth = ProviderAuth("openai", "cli")
+
+    with pytest.raises(SessionResumeError, match="Thread not found"):
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gpt-5.6-sol",
+            effort=None,
+            auth=auth,
+            resume_session_id="missing",
+        ):
+            pass
+
+    events = [
+        e
+        async for e in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gpt-5.6-sol",
+            effort=None,
+            auth=auth,
+            resume_session_id="thr-1",
+        )
+    ]
+    assert sum(isinstance(e, CompactionNotice) for e in events) == 1
+    result = next(e for e in events if isinstance(e, TurnResult))
+    assert result.usage == {"totalTokens": 250, "inputTokens": 200, "outputTokens": 50}
+    assert result.context_usage["used_tokens"] == 250
+
+    compact = await backend.compact(
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="gpt-5.6-sol",
+        effort=None,
+        auth=auth,
+        resume_session_id="thr-1",
+    )
+    assert compact.session_id == "thr-1"
+
+
+@pytest.mark.asyncio
+async def test_google_executor_errors_cancelled_permissions_and_compact(tmp_path):
+    log_path = tmp_path / "agy_edge_log.json"
+    fake = _write_fake_cli(
+        tmp_path / "agy_edge",
+        f"""
+import json, os, sys
+log_path = {str(log_path)!r}
+logs = json.loads(open(log_path).read()) if os.path.exists(log_path) else []
+logs.append({{"argv": sys.argv[1:]}})
+open(log_path, "w").write(json.dumps(logs))
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"protocolVersion": 1}}}}), flush=True)
+    elif method == "authenticate":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": "agy-1", "models": {{"currentModelId": "gemini-pro-orchestrator", "availableModels": [
+            {{"modelId": "gemini-4-carbon-high", "name": "Gemini 4 Carbon (High)"}},
+            {{"modelId": "gemini-pro-orchestrator", "name": "Orchestrator (Carbon)"}},
+        ]}}}}}}), flush=True)
+    elif method == "session/resume":
+        if msg["params"]["sessionId"] == "missing":
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "error": {{"code": -32000, "message": "Session not found"}}}}), flush=True)
+            continue
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": msg["params"]["sessionId"]}}}}), flush=True)
+    elif method == "session/set_model":
+        logs[-1]["set_model"] = msg["params"]["modelId"]
+        open(log_path, "w").write(json.dumps(logs))
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+    elif method == "session/prompt":
+        text = msg["params"]["prompt"][0]["text"]
+        if text == "trigger_perm_and_error":
+            print(json.dumps({{"jsonrpc": "2.0", "id": "p1", "method": "session/request_permission", "params": {{"sessionId": "agy-1", "toolCall": {{"name": "unknown_tool"}}, "options": []}}}}), flush=True)
+            resp = json.loads(sys.stdin.readline())
+            logs[-1]["perm_outcome"] = resp["result"]["outcome"]
+            open(log_path, "w").write(json.dumps(logs))
+            print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": "agy-1", "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "\\n\\u26a0 agent executor error: Error 400, API key not valid"}}}}}}}}), flush=True)
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn"}}}}), flush=True)
+        elif text == "/compact":
+            sid = msg["params"]["sessionId"]
+            if sid == "no-compact":
+                print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "available_commands_update", "availableCommands": [{{"name": "plan"}}]}}}}}}), flush=True)
+            elif sid == "stray-reply":
+                print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "Nothing to compact yet."}}}}}}}}), flush=True)
+                print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn"}}}}), flush=True)
+            else:
+                print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "available_commands_update", "availableCommands": [{{"name": "compact"}}]}}}}}}), flush=True)
+                print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn", "usage": {{"inputTokens": 450, "cachedReadTokens": 50}}}}}}), flush=True)
+""",
+    )
+    backend = GoogleBackend(cli_path=fake)
+    api_auth = ProviderAuth.interactive("google", "api_key", "AIza-secret")
+    with patch("nocturnomath.backends.google.agy_cli_candidates", return_value=[fake]):
+        models = await backend.discover_models(api_auth)
+        assert [m.is_default for m in models] == [False, True]
+        api_dir_path = Path(backend._api_key_dir.name)
+        assert api_dir_path.is_dir()
+
+        cli_auth = ProviderAuth("google", "cli")
+        await backend.discover_models(cli_auth)
+        assert backend._api_key_dir is None
+        assert not api_dir_path.exists()
+
+    with pytest.raises(SessionResumeError, match="Session not found"):
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=cli_auth,
+            resume_session_id="missing",
+        ):
+            pass
+
+    with pytest.raises(RuntimeError, match="API key not valid"):
+        async for _ in backend.run_turn(
+            "trigger_perm_and_error",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=cli_auth,
+        ):
+            pass
+
+    with pytest.raises(RuntimeError, match="does not support /compact"):
+        await backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=cli_auth,
+            resume_session_id="no-compact",
+        )
+
+    with pytest.raises(RuntimeError, match="Nothing to compact yet"):
+        await backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=cli_auth,
+            resume_session_id="stray-reply",
+        )
+
+    compact = await backend.compact(
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="gemini-4-carbon",
+        effort="high",
+        auth=cli_auth,
+        resume_session_id="ok-compact",
+    )
+    assert compact.context_usage == {
+        "used_tokens": 500,
+        "window_tokens": None,
+        "model": "gemini-4-carbon",
+    }
+    logs = json.loads(log_path.read_text())
+    assert logs[3]["perm_outcome"] == {"outcome": "cancelled"}
+    assert logs[-1]["set_model"] == "gemini-4-carbon-high"

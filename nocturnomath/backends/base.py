@@ -6,8 +6,11 @@ import asyncio
 import json
 import os
 import sys
+from collections import deque
 from collections.abc import AsyncIterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -16,6 +19,18 @@ from ..tools import ToolSpec
 
 DEFAULT_EFFORT = "high"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def package_version() -> str:
+    """Return the installed Nocturnomath package version."""
+    try:
+        return version("nocturnomath")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+class SessionResumeError(RuntimeError):
+    """Raised when a saved native provider session/thread cannot be resumed."""
 
 
 @dataclass(frozen=True)
@@ -205,3 +220,86 @@ async def read_jsonl(
             continue
         if isinstance(item, dict):
             yield item
+
+
+class StderrCollector:
+    """Concurrently drain subprocess stderr while retaining a bounded tail."""
+
+    def __init__(self, stream: asyncio.StreamReader | None, max_bytes: int = 32768):
+        self._buffer = bytearray()
+        self._max_bytes = max_bytes
+        self._task: asyncio.Task[None] | None = (
+            asyncio.create_task(self._drain(stream)) if stream is not None else None
+        )
+
+    async def _drain(self, stream: asyncio.StreamReader) -> None:
+        with suppress(Exception):
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                self._buffer.extend(chunk)
+                if len(self._buffer) > self._max_bytes:
+                    del self._buffer[: len(self._buffer) - self._max_bytes]
+
+    async def text(self) -> str:
+        """Return the collected stderr tail, waiting briefly for EOF."""
+        if self._task is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=1.0)
+        return self._buffer.decode("utf-8", errors="replace").strip()
+
+    async def close(self) -> None:
+        """Cancel and await the background stderr reader task."""
+        if self._task is None:
+            return
+        if not self._task.done():
+            self._task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await self._task
+
+
+async def terminate_process(
+    proc: asyncio.subprocess.Process, stderr: StderrCollector | None = None
+) -> None:
+    """Terminate a subprocess gracefully, killing it if it ignores SIGTERM."""
+    try:
+        if proc.returncode is None:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                with suppress(Exception):
+                    proc.stdin.close()
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+    finally:
+        if stderr is not None:
+            await stderr.close()
+
+
+class JsonMessageStream:
+    """JSON-RPC stream allowing RPC calls to buffer concurrent notifications."""
+
+    def __init__(self, stream: asyncio.StreamReader | None):
+        self._iter = read_jsonl(stream)
+        self._buffered: deque[dict[str, Any]] = deque()
+
+    async def next_wire(self) -> dict[str, Any] | None:
+        """Read the next object directly from the underlying stdout stream."""
+        return await anext(self._iter, None)
+
+    def buffer_notification(self, message: dict[str, Any]) -> None:
+        """Queue a notification observed during an RPC so later loops process it."""
+        self._buffered.append(message)
+
+    def __aiter__(self) -> JsonMessageStream:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._buffered:
+            return self._buffered.popleft()
+        return await self._iter.__anext__()
