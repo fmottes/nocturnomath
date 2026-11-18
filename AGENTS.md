@@ -67,4 +67,4 @@ Work on the `dev` branch unless the user directs otherwise. Preserve unrelated w
 
 ## Commit & Pull Request Guidelines
 
-Use short, imperative, sentence-case subjects, for example `Restore the current chat when the page reconnects`. Keep commits focused and run checks that are proportionate to the change. Pull requests should explain behavior and relevant verification; include screenshots when they materially help review a UI change. Never commit credentials or generated research artifacts.
+Commit after every meaningful unit of work. Use short, imperative, sentence-case subjects, for example `Restore the current chat when the page reconnects`. Keep commits focused and run checks that are proportionate to the change. Pull requests should explain behavior and relevant verification; include screenshots when they materially help review a UI change. Never commit credentials or generated research artifacts.
