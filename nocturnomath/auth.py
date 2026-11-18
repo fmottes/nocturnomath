@@ -61,12 +61,19 @@ _INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
     "openai": (
         "CODEX_API_KEY",
         "OPENAI_API_KEY",
+        "CODEX_ACCESS_TOKEN",
     ),
     "google": (
         "GOOGLE_GENAI_USE_VERTEXAI",
-        "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
     ),
+}
+
+_PROVIDER_SECRET_ENV: dict[ProviderId, tuple[str, ...]] = {
+    "anthropic": _CREDENTIAL_ENV["anthropic"],
+    "openai": (*_CREDENTIAL_ENV["openai"], "CODEX_ACCESS_TOKEN"),
+    "google": _CREDENTIAL_ENV["google"],
 }
 
 
@@ -131,6 +138,21 @@ class ProviderAuth:
             env["OPENAI_API_KEY"] = secret
         elif self.provider == "google":
             env["GEMINI_API_KEY"] = secret
+        return env
+
+    def process_env(self, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Build a subprocess environment isolated from other providers' secrets."""
+        env = dict(os.environ if base_env is None else base_env)
+        for other, keys in _PROVIDER_SECRET_ENV.items():
+            if other != self.provider:
+                for key in keys:
+                    env.pop(key, None)
+        if self.method != "cli":
+            if self.provider == "openai":
+                env["CODEX_ACCESS_TOKEN"] = ""
+            elif self.provider == "google":
+                env["GOOGLE_GENAI_USE_VERTEXAI"] = ""
+            env.update(self.sdk_env())
         return env
 
     def public(self) -> dict[str, Any]:

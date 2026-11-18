@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -161,6 +162,15 @@ def _is_windows_batch(candidate: Path) -> bool:
     return sys.platform == "win32" and candidate.suffix.lower() in (".bat", ".cmd")
 
 
+def is_usable_cli_binary(candidate: Path) -> bool:
+    """Return whether ``candidate`` is an executable non-batch binary file."""
+    return (
+        os.path.isfile(candidate)
+        and os.access(candidate, os.X_OK)
+        and not _is_windows_batch(candidate)
+    )
+
+
 def find_cli_executables(
     binary_name: str, extra_candidates: Sequence[Path] = ()
 ) -> list[Path]:
@@ -175,9 +185,7 @@ def find_cli_executables(
     seen: set[Path] = set()
 
     def add_if_usable(candidate: Path, *, ignore_cwd: bool) -> None:
-        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
-            return
-        if _is_windows_batch(candidate):
+        if not is_usable_cli_binary(candidate):
             return
         resolved = candidate.resolve()
         if ignore_cwd and launch_dir in (candidate.parent.resolve(), resolved.parent):
@@ -279,6 +287,20 @@ async def _discard_stream(stream: asyncio.StreamReader | None) -> None:
             pass
 
 
+def _signal_process_or_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    if os.name == "posix" and proc.pid is not None:
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            pgid = os.getpgid(proc.pid)
+            if pgid == proc.pid:
+                os.killpg(pgid, sig)
+                return
+    with suppress(ProcessLookupError):
+        if sig == getattr(signal, "SIGKILL", None):
+            proc.kill()
+        else:
+            proc.terminate()
+
+
 async def terminate_process(
     proc: asyncio.subprocess.Process, stderr: StderrCollector | None = None
 ) -> None:
@@ -288,20 +310,31 @@ async def terminate_process(
         if proc.stdout is not None
         else None
     )
+    cancelled_exc: asyncio.CancelledError | None = None
     try:
         if proc.returncode is None:
             if proc.stdin is not None and not proc.stdin.is_closing():
                 with suppress(Exception):
                     proc.stdin.close()
-            with suppress(ProcessLookupError):
-                proc.terminate()
+            _signal_process_or_group(proc, signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.CancelledError as exc:
+                cancelled_exc = exc
             except TimeoutError:
-                with suppress(ProcessLookupError):
-                    proc.kill()
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                pass
+            if proc.returncode is None:
+                kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+                _signal_process_or_group(proc, kill_sig)
+                wait_task = asyncio.create_task(proc.wait())
+                try:
+                    await asyncio.wait_for(asyncio.shield(wait_task), timeout=2.0)
+                except asyncio.CancelledError as exc:
+                    cancelled_exc = cancelled_exc or exc
+                    with suppress(TimeoutError, Exception):
+                        await asyncio.wait_for(wait_task, timeout=0.5)
+                except TimeoutError:
+                    wait_task.cancel()
     finally:
         if stdout_drain is not None:
             if not stdout_drain.done():
@@ -310,6 +343,8 @@ async def terminate_process(
                 await stdout_drain
         if stderr is not None:
             await stderr.close()
+    if cancelled_exc is not None:
+        raise cancelled_exc
 
 
 class JsonMessageStream:

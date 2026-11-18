@@ -32,7 +32,9 @@ from .base import (
     TextDelta,
     TurnEvent,
     TurnResult,
+    TurnStarted,
     find_cli_executables,
+    is_usable_cli_binary,
     read_jsonl,
     terminate_process,
 )
@@ -40,6 +42,7 @@ from .base import (
 logger = logging.getLogger("nocturnomath.backends.anthropic")
 
 CLAUDE_CLI_NAME = "claude.exe" if sys.platform == "win32" else "claude"
+_CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DISCOVERY_TIMEOUT_S = 15.0
 COMPACT_TIMEOUT_S = 600.0
 CONTEXT_USAGE_TIMEOUT_S = 10.0
@@ -167,7 +170,7 @@ def _parse_models(entries: list[Any]) -> list[ModelSpec]:
         supported = (
             [level for level in raw_levels if level in EFFORT_LEVELS]
             if isinstance(raw_levels, list)
-            else list(EFFORT_LEVELS)
+            else list(_CLAUDE_EFFORT_LEVELS)
             if entry.get("supportsEffort")
             else []
         )
@@ -208,7 +211,7 @@ class AnthropicBackend:
         self.cli_path = cli_path
 
     def _resolve_cli(self) -> Path:
-        if self.cli_path is not None and os.path.isfile(self.cli_path):
+        if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
             return self.cli_path
         candidates = claude_cli_candidates()
         if not candidates:
@@ -233,6 +236,7 @@ class AnthropicBackend:
         stderr: StderrCollector,
         *,
         resume_session_id: str | None = None,
+        allowed_tools: set[str] = frozenset(),
     ) -> dict[str, Any]:
         async for msg in messages:
             msg_type = msg.get("type")
@@ -247,7 +251,7 @@ class AnthropicBackend:
                     )
                 return resp.get("response") or {}
             if msg_type == "control_request":
-                await self._handle_control_request(proc, msg)
+                await self._handle_control_request(proc, msg, allowed_tools)
             elif msg_type == "result" and msg.get("is_error"):
                 detail = _error_result_text(msg)
                 if resume_session_id and _is_missing_session_error(detail):
@@ -265,7 +269,7 @@ class AnthropicBackend:
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
-        env = {**os.environ, **auth.sdk_env()}
+        env = auth.process_env()
         for candidate in claude_cli_candidates():
             proc: asyncio.subprocess.Process | None = None
             stderr: StderrCollector | None = None
@@ -287,6 +291,7 @@ class AnthropicBackend:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
+                        start_new_session=(os.name == "posix"),
                     )
                     stderr = StderrCollector(proc.stderr)
                     req_id = await self._send_control(
@@ -400,7 +405,10 @@ class AnthropicBackend:
         return req_id
 
     async def _handle_control_request(
-        self, proc: asyncio.subprocess.Process, msg: dict[str, Any]
+        self,
+        proc: asyncio.subprocess.Process,
+        msg: dict[str, Any],
+        allowed_tools: set[str] = frozenset(),
     ) -> None:
         req_id = msg.get("request_id")
         request = msg.get("request") or {}
@@ -408,6 +416,20 @@ class AnthropicBackend:
             return
         subtype = request.get("subtype")
         if subtype == "can_use_tool":
+            tool_name = str(
+                request.get("tool_name") or request.get("name") or ""
+            ).strip()
+            response_body: dict[str, Any]
+            if tool_name and tool_name in allowed_tools:
+                response_body = {
+                    "behavior": "allow",
+                    "updatedInput": request.get("input") or {},
+                }
+            else:
+                response_body = {
+                    "behavior": "deny",
+                    "message": "Built-in tools are disabled.",
+                }
             await self._write_json(
                 proc,
                 {
@@ -415,10 +437,7 @@ class AnthropicBackend:
                     "response": {
                         "subtype": "success",
                         "request_id": req_id,
-                        "response": {
-                            "behavior": "allow",
-                            "updatedInput": request.get("input") or {},
-                        },
+                        "response": response_body,
                     },
                 },
             )
@@ -450,9 +469,17 @@ class AnthropicBackend:
     ) -> AsyncIterator[TurnEvent]:
         cli_path = self._resolve_cli()
         env = {
-            **os.environ,
-            **auth.sdk_env(),
+            **auth.process_env(),
             "NOCTURNOMATH_WORKSPACE_PATH": str(workspace_path),
+        }
+        allowed_tools = {
+            name
+            for spec in tools
+            for name in (
+                spec.name,
+                f"mcp__explore__{spec.name}",
+                f"explore/{spec.name}",
+            )
         }
         required_timeout_ms = max(1, int(tool_timeout_s)) * 1000
         try:
@@ -476,6 +503,7 @@ class AnthropicBackend:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workspace_path,
                 env=env,
+                start_new_session=(os.name == "posix"),
             )
             stderr = StderrCollector(proc.stderr)
             try:
@@ -495,6 +523,7 @@ class AnthropicBackend:
                     init_id,
                     stderr,
                     resume_session_id=resume_session_id,
+                    allowed_tools=allowed_tools,
                 )
 
                 await self._write_json(
@@ -512,6 +541,7 @@ class AnthropicBackend:
                 last_prompt_model: str | None = None
                 saw_result = False
                 progressed = False
+                emitted_turn_started = False
 
                 async for msg in messages:
                     msg_type = msg.get("type")
@@ -535,14 +565,23 @@ class AnthropicBackend:
                         yield SessionStarted(session_id)
 
                     if msg_type == "control_request":
-                        await self._handle_control_request(proc, msg)
+                        await self._handle_control_request(proc, msg, allowed_tools)
                         continue
 
                     if msg_type == "stream_event":
                         if msg.get("parent_tool_use_id"):
                             continue
                         raw = msg.get("event") or {}
-                        if raw.get("type") == "content_block_delta":
+                        raw_type = raw.get("type")
+                        if not emitted_turn_started and raw_type in (
+                            "message_start",
+                            "content_block_start",
+                            "content_block_delta",
+                        ):
+                            emitted_turn_started = True
+                            progressed = True
+                            yield TurnStarted()
+                        if raw_type == "content_block_delta":
                             delta = raw.get("delta") or {}
                             if delta.get("type") == "text_delta":
                                 chunk = delta.get("text")
@@ -584,7 +623,7 @@ class AnthropicBackend:
                                 last_prompt_tokens = sum(counts)
                                 last_prompt_model = msg_model
                         content = inner.get("content") or []
-                        if isinstance(content, list):
+                        if parent_tool is None and isinstance(content, list):
                             for block in content:
                                 if (
                                     isinstance(block, dict)
@@ -618,9 +657,10 @@ class AnthropicBackend:
                         detail
                         or f"Claude CLI exited without completing the turn (status {rc})."
                     )
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
                 with suppress(Exception):
                     await self._send_control(proc, "interrupt")
+                await bridge.cancel_in_flight()
                 raise
             finally:
                 await terminate_process(proc, stderr)
@@ -636,134 +676,134 @@ class AnthropicBackend:
         auth: ProviderAuth,
         resume_session_id: str,
     ) -> CompactResult:
+        del tools
         cli_path = self._resolve_cli()
         env = {
-            **os.environ,
-            **auth.sdk_env(),
+            **auth.process_env(),
             "NOCTURNOMATH_WORKSPACE_PATH": str(workspace_path),
         }
-        async with McpToolBridge(tools) as bridge:
-            cmd = self._build_turn_cmd(
-                cli_path,
-                system_prompt=system_prompt,
-                mcp_config={"explore": bridge.stdio_server_config()},
-                model=model,
-                effort=effort,
-                resume_session_id=resume_session_id,
-            )
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_path,
-                env=env,
-            )
-            stderr = StderrCollector(proc.stderr)
+        cmd = self._build_turn_cmd(
+            cli_path,
+            system_prompt=system_prompt,
+            mcp_config=None,
+            model=model,
+            effort=effort,
+            resume_session_id=resume_session_id,
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_path,
+            env=env,
+            start_new_session=(os.name == "posix"),
+        )
+        stderr = StderrCollector(proc.stderr)
+        try:
+            messages = read_jsonl(proc.stdout)
+            compacted = False
+            latest_session_id: str | None = resume_session_id
             try:
-                messages = read_jsonl(proc.stdout)
-                compacted = False
-                latest_session_id: str | None = resume_session_id
-                try:
-                    async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                        try:
-                            init_id = await self._send_control(
-                                proc, "initialize", {"skills": []}
-                            )
-                        except (BrokenPipeError, ConnectionResetError) as exc:
-                            detail = await stderr.text()
-                            if _is_missing_session_error(detail):
-                                raise SessionResumeError(detail) from exc
-                            raise RuntimeError(detail or str(exc)) from exc
-                        await self._await_initialize(
-                            proc,
-                            messages,
-                            init_id,
-                            stderr,
-                            resume_session_id=resume_session_id,
+                async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                    try:
+                        init_id = await self._send_control(
+                            proc, "initialize", {"skills": []}
                         )
-
-                        await self._write_json(
-                            proc,
-                            {
-                                "type": "user",
-                                "message": {"role": "user", "content": "/compact"},
-                                "parent_tool_use_id": None,
-                                "session_id": resume_session_id,
-                            },
-                        )
-
-                        async for msg in messages:
-                            sid = msg.get("session_id")
-                            if isinstance(sid, str) and sid:
-                                latest_session_id = sid
-                            msg_type = msg.get("type")
-                            if msg_type == "control_request":
-                                await self._handle_control_request(proc, msg)
-                                continue
-                            if (
-                                msg_type == "system"
-                                and msg.get("subtype") == "compact_boundary"
-                            ):
-                                compacted = True
-                            elif msg_type == "result":
-                                if msg.get("is_error"):
-                                    detail = _error_result_text(msg)
-                                    if not compacted and _is_missing_session_error(
-                                        detail
-                                    ):
-                                        raise SessionResumeError(detail)
-                                    raise RuntimeError(detail)
-                                break
-                except TimeoutError as exc:
-                    raise RuntimeError(
-                        f"Claude compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
-                    ) from exc
-
-                if not compacted:
-                    detail = await stderr.text()
-                    raise RuntimeError(
-                        detail or "Claude did not confirm that compaction completed."
+                    except (BrokenPipeError, ConnectionResetError) as exc:
+                        detail = await stderr.text()
+                        if _is_missing_session_error(detail):
+                            raise SessionResumeError(detail) from exc
+                        raise RuntimeError(detail or str(exc)) from exc
+                    await self._await_initialize(
+                        proc,
+                        messages,
+                        init_id,
+                        stderr,
+                        resume_session_id=resume_session_id,
                     )
 
-                context_usage: dict[str, Any] | None = None
-                try:
-                    async with asyncio.timeout(CONTEXT_USAGE_TIMEOUT_S):
-                        ctx_id = await self._send_control(proc, "get_context_usage")
-                        async for msg in messages:
-                            if (
-                                msg.get("type") == "control_response"
-                                and (msg.get("response") or {}).get("request_id")
-                                == ctx_id
-                            ):
-                                resp = msg.get("response") or {}
-                                if resp.get("subtype") == "error":
-                                    raise RuntimeError(
-                                        resp.get("error") or "get_context_usage failed"
-                                    )
-                                usage = resp.get("response") or {}
-                                used = usage.get("totalTokens")
-                                window = usage.get("rawMaxTokens")
-                                if isinstance(used, int) and used >= 0:
-                                    context_usage = {
-                                        "used_tokens": used,
-                                        "window_tokens": window
-                                        if isinstance(window, int) and window > 0
-                                        else None,
-                                        "model": usage.get("model"),
-                                    }
-                                break
-                except TimeoutError:
-                    logger.warning(
-                        "Context usage refresh timed out after %ss",
-                        CONTEXT_USAGE_TIMEOUT_S,
+                    await self._write_json(
+                        proc,
+                        {
+                            "type": "user",
+                            "message": {"role": "user", "content": "/compact"},
+                            "parent_tool_use_id": None,
+                            "session_id": resume_session_id,
+                        },
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not refresh context usage after compaction: %s", exc
-                    )
-                return CompactResult(
-                    session_id=latest_session_id, context_usage=context_usage
+
+                    async for msg in messages:
+                        sid = msg.get("session_id")
+                        if isinstance(sid, str) and sid:
+                            latest_session_id = sid
+                        msg_type = msg.get("type")
+                        if msg_type == "control_request":
+                            await self._handle_control_request(proc, msg)
+                            continue
+                        if (
+                            msg_type == "system"
+                            and msg.get("subtype") == "compact_boundary"
+                        ):
+                            compacted = True
+                        elif msg_type == "result":
+                            if msg.get("is_error"):
+                                detail = _error_result_text(msg)
+                                if not compacted and _is_missing_session_error(detail):
+                                    raise SessionResumeError(detail)
+                                raise RuntimeError(detail)
+                            break
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Claude compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
+                ) from exc
+
+            if not compacted:
+                detail = await stderr.text()
+                raise RuntimeError(
+                    detail or "Claude did not confirm that compaction completed."
                 )
-            finally:
-                await terminate_process(proc, stderr)
+
+            context_usage: dict[str, Any] | None = None
+            try:
+                async with asyncio.timeout(CONTEXT_USAGE_TIMEOUT_S):
+                    ctx_id = await self._send_control(proc, "get_context_usage")
+                    async for msg in messages:
+                        if msg.get("type") == "control_request":
+                            await self._handle_control_request(proc, msg)
+                            continue
+                        if (
+                            msg.get("type") == "control_response"
+                            and (msg.get("response") or {}).get("request_id") == ctx_id
+                        ):
+                            resp = msg.get("response") or {}
+                            if resp.get("subtype") == "error":
+                                raise RuntimeError(
+                                    resp.get("error") or "get_context_usage failed"
+                                )
+                            usage = resp.get("response") or {}
+                            used = usage.get("totalTokens")
+                            window = usage.get("rawMaxTokens")
+                            if isinstance(used, int) and used >= 0:
+                                context_usage = {
+                                    "used_tokens": used,
+                                    "window_tokens": window
+                                    if isinstance(window, int) and window > 0
+                                    else None,
+                                    "model": usage.get("model"),
+                                }
+                            break
+            except TimeoutError:
+                logger.warning(
+                    "Context usage refresh timed out after %ss",
+                    CONTEXT_USAGE_TIMEOUT_S,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not refresh context usage after compaction: %s", exc
+                )
+            return CompactResult(
+                session_id=latest_session_id, context_usage=context_usage
+            )
+        finally:
+            await terminate_process(proc, stderr)

@@ -35,6 +35,7 @@ from .base import (
     TurnResult,
     TurnStarted,
     find_cli_executables,
+    is_usable_cli_binary,
     package_version,
     terminate_process,
 )
@@ -68,6 +69,8 @@ CODEX_DISABLE_FLAGS = (
     "multi_agent",
     "--disable",
     "memories",
+    "--disable",
+    "code_mode",
     "-c",
     'web_search="disabled"',
 )
@@ -168,7 +171,7 @@ class OpenAIBackend:
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
-        if self.cli_path is not None and os.path.isfile(self.cli_path):
+        if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
             return self.cli_path
         candidates = codex_cli_candidates()
         if not candidates:
@@ -189,7 +192,7 @@ class OpenAIBackend:
     def _env_and_flags_for_home(
         auth: ProviderAuth, api_home: Path | None
     ) -> tuple[dict[str, str], Path, list[str]]:
-        env = {**os.environ, **auth.sdk_env()}
+        env = auth.process_env()
         if auth.method == "api_key":
             assert api_home is not None
             env["CODEX_HOME"] = str(api_home)
@@ -245,7 +248,7 @@ class OpenAIBackend:
                 detail or f"Codex app-server closed before replying to {method}."
             ) from exc
         while (msg := await messages.next_wire()) is not None:
-            if "id" in msg and "method" in msg:
+            if msg.get("id") is not None and "method" in msg:
                 await self._handle_server_request(proc, msg)
                 continue
             if msg.get("id") == req_id:
@@ -254,7 +257,7 @@ class OpenAIBackend:
                     text = err.get("message") if isinstance(err, dict) else str(err)
                     raise RuntimeError(text or f"Codex RPC {method} failed.")
                 return msg.get("result") or {}
-            if "id" not in msg:
+            if msg.get("id") is None:
                 messages.buffer_notification(msg)
         detail = await stderr.text() if stderr is not None else ""
         raise RuntimeError(
@@ -364,6 +367,7 @@ class OpenAIBackend:
             env, codex_home, auth_flags = self._env_and_flags_for_home(
                 auth, Path(temp_home) if temp_home is not None else None
             )
+            fallback_commit: Callable[[], None] | None = None
             for candidate in candidates:
                 proc: asyncio.subprocess.Process | None = None
                 stderr: StderrCollector | None = None
@@ -383,6 +387,7 @@ class OpenAIBackend:
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                             env=env,
+                            start_new_session=(os.name == "posix"),
                         )
                         stderr = StderrCollector(proc.stderr)
                         messages = JsonMessageStream(proc.stdout)
@@ -395,8 +400,9 @@ class OpenAIBackend:
                             stderr,
                         )
                         has_env_key = bool(
-                            os.environ.get("CODEX_API_KEY")
-                            or os.environ.get("OPENAI_API_KEY")
+                            env.get("CODEX_API_KEY")
+                            or env.get("OPENAI_API_KEY")
+                            or env.get("CODEX_ACCESS_TOKEN")
                         )
                         if (
                             acct.get("requiresOpenaiAuth", True)
@@ -464,7 +470,10 @@ class OpenAIBackend:
                             commit_auth_home()
                             self.cli_path = chosen
 
-                        return specs, commit
+                        if specs:
+                            return specs, commit
+                        if fallback_commit is None:
+                            fallback_commit = commit
                 except Exception as exc:
                     logger.warning(
                         "Codex model discovery with %s failed: %s", candidate, exc
@@ -474,6 +483,8 @@ class OpenAIBackend:
                         await terminate_process(proc, stderr)
                     elif stderr is not None:
                         await stderr.close()
+            if fallback_commit is not None:
+                return [], fallback_commit
         return [], commit_cleanup
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
@@ -516,6 +527,7 @@ class OpenAIBackend:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=isolated_cwd,
                     env=env,
+                    start_new_session=(os.name == "posix"),
                 )
                 stderr = StderrCollector(proc.stderr)
                 thread_id = resume_session_id
@@ -574,12 +586,26 @@ class OpenAIBackend:
                     saw_compaction_item = False
                     turn_finished = False
 
+                    def _is_other_turn(notif_params: dict[str, Any]) -> bool:
+                        if not turn_id:
+                            return False
+                        nt = notif_params.get("turnId") or (
+                            (notif_params.get("turn") or {}).get("id")
+                            if isinstance(notif_params.get("turn"), dict)
+                            else None
+                        )
+                        return isinstance(nt, str) and bool(nt) and nt != turn_id
+
                     async for msg in messages:
-                        if "id" in msg and "method" in msg:
+                        if msg.get("id") is not None and "method" in msg:
                             await self._handle_server_request(proc, msg)
                             continue
                         method = msg.get("method")
                         params = msg.get("params") or {}
+                        if method != "thread/tokenUsage/updated" and _is_other_turn(
+                            params
+                        ):
+                            continue
                         if method == "item/started":
                             item = params.get("item") or {}
                             if item.get("type") in (
@@ -642,7 +668,12 @@ class OpenAIBackend:
                         elif method == "turn/completed":
                             turn_finished = True
                             turn = params.get("turn") or {}
-                            if turn.get("status") == "failed":
+                            status = turn.get("status")
+                            if status == "interrupted":
+                                raise asyncio.CancelledError(
+                                    "OpenAI Codex turn was interrupted."
+                                )
+                            if status == "failed":
                                 err = turn.get("error") or {}
                                 message = (
                                     err.get("message")
@@ -681,7 +712,7 @@ class OpenAIBackend:
                             or detail
                             or "Codex app-server disconnected unexpectedly."
                         )
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, GeneratorExit):
                     if thread_id and turn_id:
                         with suppress(Exception):
                             await self._send(
@@ -696,6 +727,7 @@ class OpenAIBackend:
                                     },
                                 },
                             )
+                    await bridge.cancel_in_flight()
                     raise
                 finally:
                     await terminate_process(proc, stderr)
@@ -731,6 +763,7 @@ class OpenAIBackend:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=isolated_cwd,
                 env=env,
+                start_new_session=(os.name == "posix"),
             )
             stderr = StderrCollector(proc.stderr)
             try:
@@ -783,7 +816,7 @@ class OpenAIBackend:
                                     )
                                 except (TimeoutError, StopAsyncIteration):
                                     break
-                            if "id" in msg and "method" in msg:
+                            if msg.get("id") is not None and "method" in msg:
                                 await self._handle_server_request(proc, msg)
                                 continue
                             method = msg.get("method")

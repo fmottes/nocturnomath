@@ -1046,3 +1046,117 @@ print(json.dumps({{"type": "result", "subtype": "success"}}), flush=True)
 
     seen_timeouts = (tmp_path / "env.log").read_text().splitlines()
     assert seen_timeouts == ["660000", "900000"]
+
+
+@pytest.mark.asyncio
+async def test_google_cli_mode_disables_builtin_tools_and_honors_gemini_api_key(
+    tmp_path, monkeypatch
+):
+    log_path = tmp_path / "agy_cli_env_log.json"
+    fake = _write_fake_cli(
+        tmp_path / "agy",
+        f"""
+import json, os, sys
+log_path = {str(log_path)!r}
+entry = {{"argv": sys.argv[1:], "methods": [], "meta": None}}
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    entry["methods"].append(method)
+    if method in ("session/new", "session/resume"):
+        entry["meta"] = (msg.get("params") or {{}}).get("_meta")
+        open(log_path, "w").write(json.dumps(entry))
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": "agy-env-1", "models": {{"availableModels": [{{"modelId": "gemini-4-carbon-ultra", "name": "Gemini 4 Carbon (Ultra)"}}]}}}}}}), flush=True)
+    elif method in ("initialize", "authenticate", "session/set_model"):
+        open(log_path, "w").write(json.dumps(entry))
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+    elif method == "session/prompt":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn"}}}}), flush=True)
+""",
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-from-shell")
+    monkeypatch.setenv("OPENAI_API_KEY", "other-provider-secret")
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    backend = GoogleBackend(cli_path=fake)
+    cli_auth = ProviderAuth("google", "cli")
+    assert "OPENAI_API_KEY" not in cli_auth.process_env()
+
+    with patch("nocturnomath.backends.google.agy_cli_candidates", return_value=[fake]):
+        models = await backend.discover_models(cli_auth)
+        assert len(models) == 1
+        assert models[0].efforts == ["ultra"]
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="ultra",
+            auth=cli_auth,
+        ):
+            pass
+
+    entry = json.loads(log_path.read_text())
+    assert "--gemini-dir" in entry["argv"]
+    assert "authenticate" in entry["methods"]
+    assert entry["meta"]["antigravity"]["disableBuiltInTools"] is True
+    backend._cleanup_api_dir()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_filters_subagent_text_denies_unknown_tools_and_caps_efforts(
+    tmp_path,
+):
+    from nocturnomath.backends.anthropic import _parse_models
+
+    parsed = _parse_models(
+        [
+            {
+                "value": "claude-next",
+                "resolvedModel": "claude-next",
+                "supportsEffort": True,
+            }
+        ]
+    )
+    assert "ultra" not in parsed[0].efforts
+
+    log_path = tmp_path / "claude_perm.json"
+    fake = _write_fake_cli(
+        tmp_path / "claude",
+        f"""
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({{"type": "control_response", "response": {{"subtype": "success", "request_id": msg["request_id"], "response": {{}}}}}}), flush=True)
+    elif msg.get("type") == "user":
+        print(json.dumps({{"type": "control_request", "request_id": "c1", "request": {{"subtype": "can_use_tool", "tool_name": "Bash", "input": {{}}}}}}), flush=True)
+        r1 = json.loads(sys.stdin.readline())["response"]["response"]["behavior"]
+        print(json.dumps({{"type": "control_request", "request_id": "c2", "request": {{"subtype": "can_use_tool", "tool_name": "mcp__explore__ping", "input": {{}}}}}}), flush=True)
+        r2 = json.loads(sys.stdin.readline())["response"]["response"]["behavior"]
+        open({str(log_path)!r}, "w").write(json.dumps([r1, r2]))
+        print(json.dumps({{"type": "assistant", "session_id": "ant-sub", "parent_tool_use_id": "sub-1", "message": {{"content": [{{"type": "text", "text": "subagent internal"}}]}} }}), flush=True)
+        print(json.dumps({{"type": "assistant", "session_id": "ant-sub", "parent_tool_use_id": None, "message": {{"content": [{{"type": "text", "text": "main reply"}}]}} }}), flush=True)
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "session_id": "ant-sub"}}), flush=True)
+""",
+    )
+
+    @tool("ping", "Ping.", {})
+    async def ping(_args):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    events = [
+        e
+        async for e in AnthropicBackend(cli_path=fake).run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[ping],
+            workspace_path=tmp_path,
+            model="claude-next",
+            effort="high",
+            auth=ProviderAuth("anthropic", "cli"),
+        )
+    ]
+    assert json.loads(log_path.read_text()) == ["deny", "allow"]
+    assert [e.text for e in events if isinstance(e, TextBlockDone)] == ["main reply"]

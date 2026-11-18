@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from .base import (
     TurnResult,
     TurnStarted,
     find_cli_executables,
+    is_usable_cli_binary,
     terminate_process,
 )
 
@@ -41,8 +42,8 @@ logger = logging.getLogger("nocturnomath.backends.google")
 AGY_CLI_NAME = "agy.exe" if sys.platform == "win32" else "agy"
 DISCOVERY_TIMEOUT_S = 15.0
 COMPACT_TIMEOUT_S = 600.0
-_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(low|medium|high|xhigh|max)$")
-_EFFORT_LABEL_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Max)\)\s*$")
+_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(low|medium|high|xhigh|max|ultra)$")
+_EFFORT_LABEL_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Max|Ultra)\)\s*$")
 _AGY_EXECUTOR_ERROR_PREFIXES = (
     "⚠ agent executor error:",
     "⚠ failed to construct executor:",
@@ -157,6 +158,14 @@ def _mcp_server_entry(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _uses_api_key_mode(auth: ProviderAuth, env: Mapping[str, str]) -> bool:
+    if auth.method == "api_key":
+        return True
+    if env.get("GOOGLE_GENAI_USE_VERTEXAI"):
+        return False
+    return bool(env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY"))
+
+
 class GoogleBackend:
     """Drive the local ``agy acp`` server over JSON-RPC stdio."""
 
@@ -167,12 +176,12 @@ class GoogleBackend:
         self.cli_path = cli_path
         self._slug_map: dict[tuple[str, str], str] = {}
         self._api_key_dir: tempfile.TemporaryDirectory[str] | None = None
-        self._api_key_secret: str | None = None
+        self._api_key_secret: tuple[str, str | None, str, str] | None = None
         self._atexit_registered = False
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
-        if self.cli_path is not None and os.path.isfile(self.cli_path):
+        if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
             return self.cli_path
         candidates = agy_cli_candidates()
         if not candidates:
@@ -200,15 +209,21 @@ class GoogleBackend:
     def _prepare_env_and_flags(
         self, auth: ProviderAuth
     ) -> tuple[dict[str, str], list[str]]:
-        env = {**os.environ, **auth.sdk_env()}
+        env = auth.process_env()
         flags = ["--include-default-customizations=false"]
-        if auth.method == "api_key":
-            if self._api_key_dir is None or self._api_key_secret != auth.credential:
+        if _uses_api_key_mode(auth, env):
+            secret_key = (
+                auth.method,
+                auth.credential,
+                env.get("GOOGLE_API_KEY") or "",
+                env.get("GEMINI_API_KEY") or "",
+            )
+            if self._api_key_dir is None or self._api_key_secret != secret_key:
                 self._cleanup_api_dir()
                 self._api_key_dir = tempfile.TemporaryDirectory(
                     prefix="nocturnomath-agy-"
                 )
-                self._api_key_secret = auth.credential
+                self._api_key_secret = secret_key
                 self._write_api_settings(Path(self._api_key_dir.name))
                 if not self._atexit_registered:
                     atexit.register(self._cleanup_api_dir)
@@ -303,7 +318,7 @@ class GoogleBackend:
                 detail or f"Antigravity ACP closed before replying to {method}."
             ) from exc
         while (msg := await messages.next_wire()) is not None:
-            if "id" in msg and "method" in msg:
+            if msg.get("id") is not None and "method" in msg:
                 await self._handle_request(proc, msg, allowed_tools)
                 continue
             if msg.get("id") == req_id:
@@ -312,7 +327,7 @@ class GoogleBackend:
                     text = err.get("message") if isinstance(err, dict) else str(err)
                     raise RuntimeError(text or f"Antigravity ACP {method} failed.")
                 return msg.get("result") or {}
-            if "id" not in msg:
+            if msg.get("id") is None:
                 messages.buffer_notification(msg)
         detail = await stderr.text() if stderr is not None else ""
         raise RuntimeError(
@@ -325,6 +340,8 @@ class GoogleBackend:
         messages: JsonMessageStream,
         auth: ProviderAuth,
         stderr: StderrCollector | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         await self._rpc(
             proc,
@@ -333,7 +350,8 @@ class GoogleBackend:
             {"protocolVersion": 1, "clientCapabilities": {}},
             stderr=stderr,
         )
-        if auth.method == "api_key":
+        effective_env = env if env is not None else auth.process_env()
+        if _uses_api_key_mode(auth, effective_env):
             await self._rpc(
                 proc,
                 messages,
@@ -345,21 +363,29 @@ class GoogleBackend:
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
+        env = auth.process_env()
+        use_api_dir = _uses_api_key_mode(auth, env)
+
         def commit_auth_dir() -> None:
             self._prepare_env_and_flags(auth)
 
         def commit_cleanup() -> None:
-            if auth.method != "api_key" or self._api_key_secret != auth.credential:
+            secret_key = (
+                auth.method,
+                auth.credential,
+                env.get("GOOGLE_API_KEY") or "",
+                env.get("GEMINI_API_KEY") or "",
+            )
+            if not use_api_dir or self._api_key_secret != secret_key:
                 self._cleanup_api_dir()
 
         candidates = agy_cli_candidates()
         if not candidates:
             return [], commit_cleanup
-        env = {**os.environ, **auth.sdk_env()}
         base_flags = ["--include-default-customizations=false"]
         with (
             tempfile.TemporaryDirectory(prefix="nocturnomath-agy-")
-            if auth.method == "api_key"
+            if use_api_dir
             else nullcontext()
         ) as probe_dir:
             flags = list(base_flags)
@@ -367,13 +393,13 @@ class GoogleBackend:
                 self._write_api_settings(Path(probe_dir))
                 flags.extend(["--gemini-dir", probe_dir])
             for candidate in candidates:
-                proc: asyncio.subprocess.Process | None = None
-                stderr: StderrCollector | None = None
-                try:
-                    async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                        with tempfile.TemporaryDirectory(
-                            prefix="nocturnomath-agy-cwd-"
-                        ) as isolated_cwd:
+                with tempfile.TemporaryDirectory(
+                    prefix="nocturnomath-agy-cwd-"
+                ) as isolated_cwd:
+                    proc: asyncio.subprocess.Process | None = None
+                    stderr: StderrCollector | None = None
+                    try:
+                        async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
                             proc = await asyncio.create_subprocess_exec(
                                 str(candidate),
                                 "acp",
@@ -383,15 +409,24 @@ class GoogleBackend:
                                 stderr=asyncio.subprocess.PIPE,
                                 cwd=isolated_cwd,
                                 env=env,
+                                start_new_session=(os.name == "posix"),
                             )
                             stderr = StderrCollector(proc.stderr)
                             messages = JsonMessageStream(proc.stdout)
-                            await self._initialize_acp(proc, messages, auth, stderr)
+                            await self._initialize_acp(
+                                proc, messages, auth, stderr, env=env
+                            )
                             session_info = await self._rpc(
                                 proc,
                                 messages,
                                 "session/new",
-                                {"cwd": isolated_cwd, "mcpServers": []},
+                                {
+                                    "cwd": isolated_cwd,
+                                    "mcpServers": [],
+                                    "_meta": {
+                                        "antigravity": {"disableBuiltInTools": True}
+                                    },
+                                },
                                 stderr=stderr,
                             )
                             models_state = session_info.get("models") or {}
@@ -409,21 +444,21 @@ class GoogleBackend:
                                     ] = slug_map,
                                 ) -> None:
                                     commit_auth_dir()
-                                    self._slug_map.update(discovered_slugs)
+                                    self._slug_map = dict(discovered_slugs)
                                     self.cli_path = chosen
 
                                 return specs, commit
-                except Exception as exc:
-                    logger.warning(
-                        "Google Antigravity model discovery with %s failed: %s",
-                        candidate,
-                        exc,
-                    )
-                finally:
-                    if proc is not None:
-                        await terminate_process(proc, stderr)
-                    elif stderr is not None:
-                        await stderr.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "Google Antigravity model discovery with %s failed: %s",
+                            candidate,
+                            exc,
+                        )
+                    finally:
+                        if proc is not None:
+                            await terminate_process(proc, stderr)
+                        elif stderr is not None:
+                            await stderr.close()
         return [], commit_cleanup
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
@@ -509,17 +544,21 @@ class GoogleBackend:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=isolated_cwd,
                     env=env,
+                    start_new_session=(os.name == "posix"),
                 )
                 stderr = StderrCollector(proc.stderr)
                 session_id = resume_session_id
                 try:
                     messages = JsonMessageStream(proc.stdout)
-                    await self._initialize_acp(proc, messages, auth, stderr)
+                    await self._initialize_acp(proc, messages, auth, stderr, env=env)
                     session_params: dict[str, Any] = {
                         "cwd": isolated_cwd,
                         "mcpServers": mcp_servers,
                         "_meta": {
-                            "antigravity": {"systemPrompt": {"append": system_prompt}}
+                            "antigravity": {
+                                "disableBuiltInTools": True,
+                                "systemPrompt": {"append": system_prompt},
+                            }
                         },
                     }
                     if resume_session_id:
@@ -582,7 +621,7 @@ class GoogleBackend:
                     prompt_done = False
 
                     async for msg in messages:
-                        if "id" in msg and "method" in msg:
+                        if msg.get("id") is not None and "method" in msg:
                             await self._handle_request(proc, msg, allowed_tools)
                             continue
                         if msg.get("method") == "session/update":
@@ -652,7 +691,7 @@ class GoogleBackend:
                             detail
                             or "Antigravity ACP disconnected before completing the turn."
                         )
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, GeneratorExit):
                     if session_id:
                         with suppress(Exception):
                             await self._send(
@@ -663,6 +702,7 @@ class GoogleBackend:
                                     "params": {"sessionId": session_id},
                                 },
                             )
+                    await bridge.cancel_in_flight()
                     raise
                 finally:
                     await terminate_process(proc, stderr)
@@ -692,6 +732,7 @@ class GoogleBackend:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=isolated_cwd,
                 env=env,
+                start_new_session=(os.name == "posix"),
             )
             stderr = StderrCollector(proc.stderr)
             try:
@@ -701,7 +742,9 @@ class GoogleBackend:
                 unexpected_chunks: list[str] = []
                 try:
                     async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                        await self._initialize_acp(proc, messages, auth, stderr)
+                        await self._initialize_acp(
+                            proc, messages, auth, stderr, env=env
+                        )
                         try:
                             await self._rpc(
                                 proc,
@@ -713,7 +756,8 @@ class GoogleBackend:
                                     "mcpServers": [],
                                     "_meta": {
                                         "antigravity": {
-                                            "systemPrompt": {"append": system_prompt}
+                                            "disableBuiltInTools": True,
+                                            "systemPrompt": {"append": system_prompt},
                                         }
                                     },
                                 },
@@ -750,7 +794,7 @@ class GoogleBackend:
                                 or "Antigravity ACP disconnected before compacting."
                             ) from exc
                         async for msg in messages:
-                            if "id" in msg and "method" in msg:
+                            if msg.get("id") is not None and "method" in msg:
                                 await self._handle_request(proc, msg, set())
                                 continue
                             if msg.get("method") == "session/update":
