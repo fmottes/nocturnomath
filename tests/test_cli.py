@@ -729,3 +729,19 @@ def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     completions = list(completer.get_completions(document, CompleteEvent()))
     assert [completion.text for completion in completions] == [" spaces"]
     assert completions[0].display_text.startswith("workspace with spaces")
+
+
+@pytest.mark.asyncio
+async def test_auth_drops_pending_model_when_catalogue_becomes_empty(terminal):
+    async def empty_discovery():
+        terminal.runtime.models = []
+        terminal.runtime.model = None
+        terminal.session.model = None
+
+    terminal.runtime.discover_models = empty_discovery
+    terminal.app.pending_model = "sonnet"
+
+    await terminal.run("/auth openai cli")
+    output = terminal.output()
+    assert terminal.app.pending_model is None
+    assert "Dropped pending model sonnet" in output

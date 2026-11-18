@@ -748,7 +748,7 @@ class TerminalApp:
         self.write(f"Selected {selected['title']}: {selected['label']}.")
         self.write("Credentials will be checked on your next message.", style="dim")
         models = self.runtime.models
-        if self.pending_model and models and self.pending_model not in models:
+        if self.pending_model and self.pending_model not in models:
             self.write(
                 f"Dropped pending model {self.pending_model}: not in the new catalogue.",
                 style="dim",

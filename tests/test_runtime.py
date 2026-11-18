@@ -425,3 +425,39 @@ def test_runtime_and_session_share_one_auth(session, tmp_path):
     fresh = Runtime(session_factory=factory, auth=manual, backends=stub_backends())
     fresh.open_workspace(tmp_path)
     assert received["auth"] is manual
+
+
+@pytest.mark.asyncio
+async def test_empty_model_discovery_clears_active_sessions_and_blocks_queries(session):
+    anthropic = StubBackend(
+        "anthropic",
+        responses=[
+            [
+                ModelSpec(
+                    id="claude-opus-5",
+                    raw_id="claude-opus-5",
+                    provider="anthropic",
+                    label="claude-opus-5",
+                    efforts=["low", "high"],
+                    is_default=True,
+                )
+            ],
+            [],
+        ],
+    )
+    runtime = Runtime(session, backends=stub_backends(anthropic=anthropic))
+    await runtime.discover_models()
+    other = runtime.get_agent(runtime.create_agent())
+    assert session.model == "claude-opus-5"
+    assert other.model == "claude-opus-5"
+
+    await runtime.authenticate("anthropic", "cli")
+    assert runtime.models == []
+    assert runtime.model is None
+    assert session.model is None
+    assert session.effort is None
+    assert session.default_model is None
+    assert other.model is None
+    assert other.effort is None
+    with pytest.raises(ValueError, match="No model available"):
+        runtime.start_query("question")

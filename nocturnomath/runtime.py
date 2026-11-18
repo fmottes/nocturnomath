@@ -60,6 +60,7 @@ class Runtime:
         self.model_raw_ids: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
         self._provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+        self._models_discovered = False
         self.sdk_default_model: str | None = None
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
@@ -326,6 +327,7 @@ class Runtime:
         self.model_raw_ids = model_raw_ids
         self.model_efforts = model_efforts
         self._provider_models = provider_models
+        self._models_discovered = True
         self.sdk_default_model = (
             provider_defaults[0] if provider_defaults else models[0] if models else None
         )
@@ -343,11 +345,8 @@ class Runtime:
                     session.default_effort = self._select_effort(
                         session.default_model, session.default_effort
                     )
-                    if models:
-                        session.model = self._select_model(session.model)
-                        session.effort = self._select_effort(
-                            session.model, session.effort
-                        )
+                    session.model = self._select_model(session.model)
+                    session.effort = self._select_effort(session.model, session.effort)
         self._wake_slurm_monitor()
 
     def _select_model(self, preferred: str | None) -> str | None:
@@ -480,7 +479,7 @@ class Runtime:
             session = self.require_session()
             session.set_workspace(target, python)
             self._workspace_defaults_pending = True
-            if self.models:
+            if self.models or self._models_discovered:
                 self._apply_workspace_defaults()
             self._wake_slurm_monitor()
             return session
@@ -494,7 +493,7 @@ class Runtime:
         self._workspace_defaults_pending = True
         self.create_agent(target, python=python)
         self._workspace_defaults_pending = True
-        if self.models:
+        if self.models or self._models_discovered:
             self._apply_workspace_defaults()
         self._wake_slurm_monitor()
         return self.require_session()
@@ -834,6 +833,10 @@ class Runtime:
         if model is not None and model not in self.models:
             raise ValueError("Choose a model from the model selector.")
         target_model = model or session.model
+        if self._models_discovered and target_model not in self.models:
+            if not self.models:
+                raise ValueError("No model available.")
+            raise ValueError("Choose a model from the model selector.")
         supported_efforts = self.model_efforts.get(target_model or "", [])
         if effort is not None and effort not in supported_efforts:
             raise ValueError("Choose an effort supported by the selected model.")
