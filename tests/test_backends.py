@@ -710,6 +710,30 @@ for line in sys.stdin:
         }), flush=True)
 """,
     )
+    fake_api_key_login = _write_fake_cli(
+        tmp_path / "claude_api_key_login",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": msg["request_id"],
+                "response": {
+                    "account": {
+                        "tokenSource": "none",
+                        "apiKeySource": "/login managed key",
+                        "apiProvider": "firstParty",
+                    },
+                    "models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-5-5"}],
+                },
+            },
+        }), flush=True)
+""",
+    )
     backend = AnthropicBackend()
     with patch(
         "nocturnomath.backends.anthropic.claude_cli_candidates", return_value=[fake]
@@ -719,6 +743,13 @@ for line in sys.stdin:
             ProviderAuth.interactive("anthropic", "api_key", "sk-ant-test")
         )
         assert [m.id for m in api_models] == ["claude-sonnet-5-5"]
+
+    with patch(
+        "nocturnomath.backends.anthropic.claude_cli_candidates",
+        return_value=[fake_api_key_login],
+    ):
+        managed_models = await backend.discover_models(ProviderAuth("anthropic", "cli"))
+        assert [m.id for m in managed_models] == ["claude-sonnet-5-5"]
 
 
 @pytest.mark.asyncio

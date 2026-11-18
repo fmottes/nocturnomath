@@ -866,7 +866,6 @@ class ExplorationSession:
                         description=spec.description,
                         input_schema=spec.input_schema,
                         handler=wrapped_handler,
-                        annotations=spec.annotations,
                     )
 
                 turn_tools = [wrap_tool(spec) for spec in self.tools]

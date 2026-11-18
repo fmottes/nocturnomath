@@ -239,11 +239,6 @@ class McpToolBridge:
                             "name": spec.name,
                             "description": spec.description,
                             "inputSchema": spec.input_schema,
-                            **(
-                                {"annotations": spec.annotations}
-                                if spec.annotations is not None
-                                else {}
-                            ),
                         }
                         for spec in self._tools
                     ]

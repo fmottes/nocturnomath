@@ -32,7 +32,6 @@ class ToolSpec:
     description: str
     input_schema: dict[str, Any]
     handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-    annotations: dict[str, Any] | None = None
 
 
 def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:

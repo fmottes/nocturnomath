@@ -63,6 +63,14 @@ def _has_claude_credentials(
     if any(env.get(name) for name in _CLAUDE_CREDENTIAL_VARS):
         return True
     account = resp.get("account")
+    if isinstance(account, dict):
+        api_key_source = account.get("apiKeySource")
+        if (
+            isinstance(api_key_source, str)
+            and api_key_source
+            and api_key_source != "none"
+        ):
+            return True
     return not (
         isinstance(account, dict)
         and account.get("tokenSource") == "none"
