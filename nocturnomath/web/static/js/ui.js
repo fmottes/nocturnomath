@@ -1,4 +1,4 @@
-import { elements, state } from "./state.js?v=20261117-1";
+import { elements, state } from "./state.js?v=20261117-2";
 
 // ============================================================================
 // Lightbox View

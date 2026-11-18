@@ -1,4 +1,4 @@
-import { elements, state } from "./state.js?v=20261117-1";
+import { elements, state } from "./state.js?v=20261117-2";
 import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261030-1";
 
 // ============================================================================

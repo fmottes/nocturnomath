@@ -1,7 +1,7 @@
-import { elements, state } from "./state.js?v=20261117-1";
+import { elements, state } from "./state.js?v=20261117-2";
 import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261117-2";
 import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-3";
 
 // ============================================================================
@@ -24,6 +24,7 @@ export function applyWorkspace(ws) {
     elements.effortSelect.value = "";
     elements.sessionDefaultsStatus.textContent = "";
     elements.explorationPromptStatus.textContent = "";
+    if (elements.promptModeStatus) elements.promptModeStatus.textContent = "";
     showDocumentsView("list");
   }
   state.workspace = ws;
@@ -49,9 +50,10 @@ export function applyWorkspace(ws) {
   );
   setSessionDefaults(ws.session_defaults);
   setExplorationPrompt(ws.exploration_prompt, ws.exploration_prompt_is_custom);
+  setPromptMode(ws.prompt_mode);
 
   updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
-  updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
+  updateAgentStatus(selected?.is_busy ? (selected?.status && selected.status !== "idle" ? selected.status : "thinking") : "idle");
   setContextUsage(selected?.context_usage);
 
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
@@ -346,6 +348,12 @@ export function setExplorationPrompt(prompt, isCustom) {
   state.explorationPromptIsCustom = Boolean(isCustom);
   elements.explorationPromptInput.value = state.explorationPrompt;
   elements.explorationPromptReset.disabled = !state.explorationPromptIsCustom;
+}
+
+export function setPromptMode(mode) {
+  state.promptMode = mode === "queue" ? "queue" : "steer";
+  if (elements.promptModeSelect) elements.promptModeSelect.value = state.promptMode;
+  refreshSendButton();
 }
 
 export function selectViewerTab(tab) {

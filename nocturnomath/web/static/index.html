@@ -23,7 +23,7 @@
   <link rel="stylesheet" href="/static/css/base.css">
   <link rel="stylesheet" href="/static/css/components.css">
   <link rel="stylesheet" href="/static/css/layout.css">
-  <link rel="stylesheet" href="/static/css/chat.css?v=20261016-4">
+  <link rel="stylesheet" href="/static/css/chat.css?v=20261117-2">
   <link rel="stylesheet" href="/static/css/viewer.css">
   <link rel="stylesheet" href="/static/css/modals.css?v=20261016-3">
   <link rel="stylesheet" href="/static/css/lightbox.css">
@@ -159,6 +159,8 @@
             <span class="badge badge-sm context-window-indicator" id="context-window-indicator" title="Context usage appears after the first response">Ctx —</span>
             <button class="btn btn-xs btn-ghost compact-context-button" id="btn-compact" type="button" title="Summarize older conversation context for this Explorer" disabled>Compact</button>
           </div>
+
+          <div class="pending-prompts hidden" id="pending-prompts" aria-live="polite"></div>
 
           <form class="chat-form" id="chat-form">
             <textarea
@@ -302,6 +304,18 @@
             </div>
             <p id="session-defaults-status" class="environment-status" role="status" aria-live="polite"></p>
           </form>
+          <h4>Prompts while working</h4>
+          <div class="settings-card">
+            <div class="form-group">
+              <label for="prompt-mode-select">Delivery mode</label>
+              <select id="prompt-mode-select" class="form-input">
+                <option value="steer">Steer (before next probe)</option>
+                <option value="queue">Queue (after current turn)</option>
+              </select>
+            </div>
+            <p class="environment-note">When you send a prompt while the agent is working, Steer delivers it before the next probe starts; Queue waits until the current turn finishes.</p>
+            <p id="prompt-mode-status" class="environment-status" role="status" aria-live="polite"></p>
+          </div>
           <h4>Scientific system prompt</h4>
           <form id="exploration-prompt-form" class="settings-card exploration-prompt-form">
             <label for="exploration-prompt-input">Instructions</label>
@@ -479,7 +493,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261117-1"></script>
+  <script type="module" src="/static/js/main.js?v=20261117-2"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

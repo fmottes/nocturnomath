@@ -91,6 +91,10 @@ class ExplorationPromptRequest(BaseModel):
     prompt: str | None
 
 
+class PromptModeRequest(BaseModel):
+    mode: str
+
+
 class AuthRequest(BaseModel):
     provider: Literal["anthropic", "openai", "google"]
     method: Literal["cli", "subscription", "api_key"]
@@ -629,6 +633,17 @@ def create_app(
         await runtime.broadcast("exploration_prompt_changed", data)
         return data
 
+    @app.put("/api/settings/prompt-mode")
+    async def set_prompt_mode(request: PromptModeRequest):
+        active_session()
+        try:
+            mode = await runtime.set_prompt_mode(request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        data = {"prompt_mode": mode}
+        await runtime.broadcast("prompt_mode_changed", data)
+        return data
+
     @app.post("/api/session/new")
     async def new_session():
         try:
@@ -832,20 +847,28 @@ def create_app(
                         )
                         continue
                     try:
-                        runtime.start_query(text, model, effort, agent_id)
+                        query_state = runtime.start_query(text, model, effort, agent_id)
                     except (RuntimeError, ValueError) as exc:
                         await runtime.broadcast(
                             "error", {"agent_id": agent_id, "message": str(exc)}
                         )
                         continue
-                    await runtime.broadcast(
-                        "user_message",
-                        {
-                            "agent_id": agent_id,
-                            "session_id": session.workspace.session_id,
-                            "text": text,
-                        },
-                    )
+                    if query_state == "started":
+                        await runtime.broadcast(
+                            "user_message",
+                            {
+                                "agent_id": agent_id,
+                                "session_id": session.workspace.session_id,
+                                "text": text,
+                            },
+                        )
+                    elif session._last_pending_task is not None:
+                        await session._last_pending_task
+
+                elif action == "cancel_pending_prompt":
+                    prompt_id = data.get("prompt_id")
+                    if isinstance(prompt_id, str) and prompt_id:
+                        await session.remove_pending_prompt(prompt_id)
 
                 elif action == "interrupt":
                     await session.interrupt()

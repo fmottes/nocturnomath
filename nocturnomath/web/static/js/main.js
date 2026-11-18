@@ -1,9 +1,9 @@
-import { elements, state } from "./state.js?v=20261117-1";
+import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261117-1";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261117-2";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261030-1";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261117-1";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261117-2";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
 import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
 
@@ -97,6 +97,37 @@ function restoreExplorerView(agent) {
     : (agent.scrollTop || 0);
 }
 
+function renderPendingPrompts(prompts = []) {
+  if (!elements.pendingPrompts) return;
+  elements.pendingPrompts.classList.toggle("hidden", !prompts.length);
+  elements.pendingPrompts.replaceChildren(...prompts.map((item) => {
+    const row = document.createElement("div");
+    row.className = "pending-prompt-item";
+
+    const mode = document.createElement("span");
+    mode.className = "pending-prompt-mode";
+    mode.textContent = item.mode === "queue" ? "Queue" : "Steer";
+
+    const text = document.createElement("span");
+    text.className = "pending-prompt-text";
+    text.textContent = item.text;
+    text.title = item.text;
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn btn-xs btn-ghost pending-prompt-cancel";
+    cancel.textContent = "×";
+    cancel.title = "Cancel pending prompt";
+    cancel.setAttribute("aria-label", "Cancel pending prompt");
+    cancel.addEventListener("click", () => {
+      sendWs("cancel_pending_prompt", { agent_id: state.activeAgentId, prompt_id: item.id });
+    });
+
+    row.append(mode, text, cancel);
+    return row;
+  }));
+}
+
 function applyExplorer(agent, repaint = false) {
   if (!agent?.agent_id) return;
   const prior = state.agents.get(agent.agent_id) || {};
@@ -108,6 +139,7 @@ function applyExplorer(agent, repaint = false) {
     updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
     updateAgentStatus(agent.is_busy && (!agent.status || agent.status === "idle")
       ? "thinking" : (agent.status || "idle"));
+    renderPendingPrompts(state.agents.get(agent.agent_id)?.pending_prompts || []);
     if (agent.documents) refreshDocuments();
     if (repaint) {
       restoreChat(agent.records || [], agent.kernel_busy);
@@ -224,6 +256,7 @@ function handleServerEvent(event) {
       current.kernel_busy = false;
     }
     if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
+    if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
     if (event.agent_id !== state.activeAgentId && event.type !== "agent_focused") {
@@ -357,7 +390,9 @@ function handleServerEvent(event) {
         state.agents.get(event.agent_id).context_usage = null;
         state.agents.get(event.agent_id).session_id = event.session_id;
         state.agents.get(event.agent_id).can_compact = false;
+        state.agents.get(event.agent_id).pending_prompts = [];
       }
+      renderPendingPrompts([]);
       setContextUsage(null);
       setSessionId(event.session_id);
       renderExplorerTabs();
@@ -372,6 +407,14 @@ function handleServerEvent(event) {
 
     case "exploration_prompt_changed":
       setExplorationPrompt(event.exploration_prompt, event.exploration_prompt_is_custom);
+      break;
+
+    case "prompt_mode_changed":
+      setPromptMode(event.prompt_mode);
+      break;
+
+    case "pending_prompts_changed":
+      renderPendingPrompts(event.pending_prompts || []);
       break;
 
     case "session_resumed":
@@ -528,6 +571,9 @@ function setupEventListeners() {
     saveExplorationPrompt(elements.explorationPromptInput.value);
   });
   elements.explorationPromptReset.addEventListener("click", () => saveExplorationPrompt(null));
+  if (elements.promptModeSelect) {
+    elements.promptModeSelect.addEventListener("change", () => savePromptMode(elements.promptModeSelect.value));
+  }
 
   // Figures session filter
   elements.plotsFilterBtn.addEventListener("click", () => togglePlotsFilterMenu());
@@ -746,6 +792,28 @@ async function saveExplorationPrompt(prompt) {
   } finally {
     elements.explorationPromptSave.disabled = false;
     elements.explorationPromptReset.disabled = !state.explorationPromptIsCustom;
+  }
+}
+
+async function savePromptMode(mode) {
+  const previous = state.promptMode;
+  elements.promptModeSelect.disabled = true;
+  elements.promptModeStatus.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/settings/prompt-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to save prompt mode");
+    setPromptMode(data.prompt_mode);
+    elements.promptModeStatus.textContent = "Saved for this workspace.";
+  } catch (error) {
+    setPromptMode(previous);
+    elements.promptModeStatus.textContent = error.message;
+  } finally {
+    elements.promptModeSelect.disabled = false;
   }
 }
 

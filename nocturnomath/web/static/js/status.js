@@ -1,4 +1,4 @@
-import { elements } from "./state.js?v=20261117-1";
+import { elements, state } from "./state.js?v=20261117-2";
 
 // ============================================================================
 // Status Updaters
@@ -30,13 +30,18 @@ export function refreshSendButton() {
 export function updateAgentStatus(status) {
   agentStatus = status;
   elements.chatStatusBadge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
-  if (status === "thinking" || status === "probing" || status === "compacting") {
+  const busy = status === "thinking" || status === "probing" || status === "compacting";
+  elements.btnSend.disabled = state.exiting || !elements.modelSelect.value;
+  if (elements.sendBtnText) {
+    elements.sendBtnText.textContent = busy
+      ? (state.promptMode === "queue" ? "Queue" : "Steer")
+      : "Send";
+  }
+  if (busy) {
     elements.chatStatusBadge.style.color = "var(--blue)";
-    elements.btnSend.disabled = true;
     elements.btnInterrupt.classList.toggle("hidden", status === "compacting");
   } else {
     elements.chatStatusBadge.style.color = "var(--ink-soft)";
-    elements.btnSend.disabled = !elements.modelSelect.value;
     elements.btnInterrupt.classList.add("hidden");
   }
 }

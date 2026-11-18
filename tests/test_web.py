@@ -960,3 +960,117 @@ def test_documents_api_handles_nested_paths_and_empty_folders(session):
         outside = "/api/documents/..%2Fkb%2Fevidence.md"
         assert client.get(outside).status_code in (400, 404)
         assert client.put(outside, json={"text": "unsafe"}).status_code in (400, 404)
+
+
+def test_prompt_mode_setting_and_websocket_queue_steer_controls(session):
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    seen_queries = []
+
+    async def fake_query(text):
+        seen_queries.append(text)
+        if len(seen_queries) == 1:
+            entered_first.set()
+            await asyncio.to_thread(release_first.wait, 5)
+        await session.emit("assistant_text", text=f"reply:{text}")
+        await session.emit("turn_complete", full_text=f"reply:{text}")
+
+    session.query = fake_query
+
+    def recv_until(ws, predicate):
+        seen_events = []
+        while True:
+            event = ws.receive_json()
+            seen_events.append(event)
+            if predicate(event):
+                return event, seen_events
+
+    with (
+        TestClient(create_app(session)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        init = websocket.receive_json()
+        assert init["workspace"]["prompt_mode"] == "steer"
+        assert client.get("/api/workspace").json()["prompt_mode"] == "steer"
+        assert (
+            client.put(
+                "/api/settings/prompt-mode", json={"mode": "invalid"}
+            ).status_code
+            == 400
+        )
+
+        agent_id = init["workspace"]["agents"][0]["agent_id"]
+        websocket.send_json({"action": "query", "agent_id": agent_id, "text": "first"})
+        first_user = websocket.receive_json()
+        assert (first_user["type"], first_user["text"]) == ("user_message", "first")
+        assert entered_first.wait(timeout=5)
+
+        websocket.send_json(
+            {"action": "query", "agent_id": agent_id, "text": "steer-then-cancel"}
+        )
+        pending_evt, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert pending_evt["pending_prompts"] == [
+            {
+                "id": pending_evt["pending_prompts"][0]["id"],
+                "text": "steer-then-cancel",
+                "mode": "steer",
+            }
+        ]
+        first_id = pending_evt["pending_prompts"][0]["id"]
+
+        updated = client.put("/api/settings/prompt-mode", json={"mode": "queue"})
+        assert updated.status_code == 200
+        assert updated.json() == {"prompt_mode": "queue"}
+        assert session.workspace.read_config()["prompt_mode"] == "queue"
+
+        observed = []
+        while not (
+            any(e["type"] == "prompt_mode_changed" for e in observed)
+            and any(e["type"] == "pending_prompts_changed" for e in observed)
+        ):
+            observed.append(websocket.receive_json())
+        mode_evt = next(e for e in observed if e["type"] == "prompt_mode_changed")
+        assert mode_evt["prompt_mode"] == "queue"
+        updated_pending = next(
+            e for e in observed if e["type"] == "pending_prompts_changed"
+        )
+        assert updated_pending["pending_prompts"][0]["mode"] == "queue"
+
+        websocket.send_json(
+            {"action": "query", "agent_id": agent_id, "text": "keep-queued"}
+        )
+        two_pending, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert [item["text"] for item in two_pending["pending_prompts"]] == [
+            "steer-then-cancel",
+            "keep-queued",
+        ]
+
+        websocket.send_json(
+            {
+                "action": "cancel_pending_prompt",
+                "agent_id": agent_id,
+                "prompt_id": first_id,
+            }
+        )
+        after_cancel, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert [item["text"] for item in after_cancel["pending_prompts"]] == [
+            "keep-queued"
+        ]
+
+        release_first.set()
+        _, tail = recv_until(
+            websocket,
+            lambda e: (
+                e["type"] == "turn_complete"
+                and e.get("full_text") == "reply:keep-queued"
+            ),
+        )
+        user_messages = [e["text"] for e in tail if e["type"] == "user_message"]
+        assert user_messages == ["keep-queued"]
+        assert seen_queries == ["first", "keep-queued"]

@@ -378,3 +378,40 @@
 .prompt-input::placeholder { color: var(--ink-faint); }
 .prompt-input:focus { border-color: var(--blue); }
 .input-actions button { height: 44px; padding: 0 20px; }
+
+.pending-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.pending-prompt-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--sheet-sunk);
+  border: 1px solid var(--rule);
+  font-size: 0.78125rem;
+}
+.pending-prompt-mode {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--blue);
+}
+.pending-prompt-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.pending-prompt-cancel {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  line-height: 1.2;
+}
