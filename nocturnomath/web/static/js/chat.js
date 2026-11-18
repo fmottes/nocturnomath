@@ -285,11 +285,13 @@ export function appendNoteNotification(kind, text) {
   badge.className = "note-badge";
   badge.textContent = ({ evidence: "Evidence", thought: "Thought", evidence_struck: "Struck" })[kind] || kind;
 
-  const content = document.createElement("span");
-  content.textContent = text;
+  const content = document.createElement("div");
+  content.className = "note-body";
+  content.innerHTML = renderMarkdown(text);
+  highlightBlocks(content);
+  renderMath(content);
 
-  notif.appendChild(badge);
-  notif.appendChild(content);
+  notif.append(badge, content);
 
   elements.chatMessages.appendChild(notif);
   scrollChatToBottom();

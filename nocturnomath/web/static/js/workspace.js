@@ -1,8 +1,8 @@
 import { elements, state } from "./state.js?v=20261117-2";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261117-2";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261118-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -404,6 +404,12 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
   state.activeDoc = filePath;
   if (!quiet) setViewerTab(tab || tabForPath(filePath));
   elements.docPathLabel.textContent = filePath;
+  if (!quiet && state.documentPath !== filePath) {
+    state.documentPath = null;
+    state.documentContent = null;
+    elements.markdownContainer.replaceChildren();
+    elements.docMetaLabel.textContent = "";
+  }
 
   try {
     const res = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
@@ -434,6 +440,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     rewriteEmbeddedImageUrls(elements.markdownContainer, filePath);
     rewriteDocumentLinks(elements.markdownContainer, filePath);
     highlightBlocks(elements.markdownContainer);
+    if (filePath.endsWith(".md")) renderMath(elements.markdownContainer);
     if (anchor) {
       const target = [...elements.markdownContainer.querySelectorAll("[id]")]
         .find((element) => element.id === anchor);

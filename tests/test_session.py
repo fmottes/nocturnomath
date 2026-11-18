@@ -991,3 +991,23 @@ async def test_steer_during_active_turn_delivers_before_second_probe_without_res
     assert "Factor is 2" in steered_texts[0]
     assert "# Initial" not in steered_texts[0]
     assert session.kernel.executed_codes == ["x = 1", "print(x * 2)"]
+
+
+@pytest.mark.asyncio
+async def test_session_status_tracks_kernel_probing(session):
+    session._is_busy = True
+    await session.emit("status_change", status="thinking")
+    assert session.status == "thinking"
+
+    await session.emit("probe_start", probe_id="S001/P001", kernel_alive=True)
+    assert session.status == "probing"
+
+    await session.emit("probe_finish", probe_id="S001/P001", status="completed")
+    assert session.status == "thinking"
+
+    await session.emit("probe_start", probe_id="S001/P002", backend="slurm")
+    assert session.status == "thinking"
+
+    session._is_busy = False
+    await session.emit("status_change", status="idle")
+    assert session.status == "idle"

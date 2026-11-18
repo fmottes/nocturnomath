@@ -325,8 +325,17 @@
   letter-spacing: 0.1em;
 }
 .note-notification.evidence .note-badge { color: var(--ok); }
+.note-notification.thought .note-badge { color: var(--blue); }
 .note-notification.evidence_struck .note-badge { color: var(--warn); }
-.note-notification span:last-child { color: var(--ink); }
+.note-notification > span:last-child:not(.note-badge),
+.note-notification .note-body {
+  min-width: 0;
+  color: var(--ink);
+  line-height: 1.5;
+}
+.note-notification .note-body p { margin: 0; }
+.note-notification .note-body p + p { margin-top: 0.45em; }
+.note-notification .note-body code { font-family: var(--font-mono); font-size: 0.92em; }
 .note-notification.document .note-badge { color: var(--blue); }
 .document-notification-link {
   padding: 0;

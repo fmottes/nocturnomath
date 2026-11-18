@@ -1,11 +1,11 @@
 import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261117-2";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261030-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261117-1";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261117-2";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261118-1";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
-import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
+import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-1";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -251,6 +251,15 @@ function handleServerEvent(event) {
       current.is_busy = !["idle", "cancelled"].includes(event.status);
       current.status = event.status;
     }
+    if (event.type === "probe_start" && event.kernel_alive !== undefined && event.backend !== "slurm") {
+      current.kernel_alive = event.kernel_alive;
+      current.kernel_busy = true;
+      if (current.is_busy) current.status = "probing";
+    }
+    if (event.type === "probe_finish" && event.backend !== "slurm" && event.status !== "slurm-error") {
+      current.kernel_busy = false;
+      if (current.is_busy && current.status === "probing") current.status = "thinking";
+    }
     if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
       current.kernel_alive = true;
       current.kernel_busy = false;
@@ -313,6 +322,10 @@ function handleServerEvent(event) {
 
     case "probe_start":
       appendProbeStart(event.expected, event.code, event.probe_id, event.backend);
+      if (event.kernel_alive !== undefined && event.backend !== "slurm") {
+        updateKernelStatus(event.kernel_alive, true);
+        if (state.agents.get(event.agent_id)?.is_busy) updateAgentStatus("probing");
+      }
       break;
 
     case "probe_update":
@@ -320,7 +333,14 @@ function handleServerEvent(event) {
       // Preserve the web app's existing probe card contract: `output` includes
       // source paths and any guidance emitted alongside the raw kernel text.
       appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images, event.probe_id, event.status, event.backend);
-      if (event.type === "probe_finish") loadPlots();
+      if (event.type === "probe_finish") {
+        if (event.backend !== "slurm" && event.status !== "slurm-error") {
+          const current = state.agents.get(event.agent_id);
+          updateKernelStatus(current?.kernel_alive ?? true, false);
+          if (current?.is_busy) updateAgentStatus(current.status || "thinking");
+        }
+        loadPlots();
+      }
       break;
 
     case "record_changed":

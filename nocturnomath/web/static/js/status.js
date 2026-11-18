@@ -1,25 +1,35 @@
 import { elements, state } from "./state.js?v=20261117-2";
 
+let kernelAlive = true;
+let kernelBusy = false;
+let agentStatus = "idle";
+
+function syncInterruptButton() {
+  const agentInterruptible = agentStatus === "thinking" || agentStatus === "probing";
+  elements.btnInterrupt.classList.toggle(
+    "hidden",
+    !(kernelAlive && kernelBusy) && !agentInterruptible,
+  );
+}
+
 // ============================================================================
 // Status Updaters
 // ============================================================================
 export function updateKernelStatus(alive, busy) {
+  kernelAlive = Boolean(alive);
+  kernelBusy = Boolean(busy);
   if (!alive) {
     elements.kernelDot.className = "status-dot red";
     elements.kernelText.textContent = "Kernel dead";
-    elements.btnInterrupt.classList.add("hidden");
   } else if (busy) {
     elements.kernelDot.className = "status-dot busy";
     elements.kernelText.textContent = "Running code";
-    elements.btnInterrupt.classList.remove("hidden");
   } else {
     elements.kernelDot.className = "status-dot green";
     elements.kernelText.textContent = "Kernel ready";
-    elements.btnInterrupt.classList.add("hidden");
   }
+  syncInterruptButton();
 }
-
-let agentStatus = "idle";
 
 // Re-derive the Send button from the current status after the model
 // catalogue changes underneath it.
@@ -39,9 +49,8 @@ export function updateAgentStatus(status) {
   }
   if (busy) {
     elements.chatStatusBadge.style.color = "var(--blue)";
-    elements.btnInterrupt.classList.toggle("hidden", status === "compacting");
   } else {
     elements.chatStatusBadge.style.color = "var(--ink-soft)";
-    elements.btnInterrupt.classList.add("hidden");
   }
+  syncInterruptButton();
 }

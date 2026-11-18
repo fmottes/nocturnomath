@@ -179,6 +179,21 @@ class ExplorationSession:
     async def emit(self, event_type: str, **data):
         if event_type == "status_change":
             self.status = data["status"]
+        elif (
+            event_type == "probe_start"
+            and self._is_busy
+            and "kernel_alive" in data
+            and data.get("backend") != "slurm"
+        ):
+            self.status = "probing"
+        elif (
+            event_type == "probe_finish"
+            and self._is_busy
+            and self.status == "probing"
+            and data.get("backend") != "slurm"
+            and data.get("status") != "slurm-error"
+        ):
+            self.status = "thinking"
         payload = {"type": event_type, "timestamp": time.time(), **data}
         for subscriber in list(self.event_subscribers):
             try:
