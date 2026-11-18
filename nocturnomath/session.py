@@ -602,15 +602,18 @@ class ExplorationSession:
             ]
         }
 
-    def document_context(self) -> tuple[str, dict[str, str]]:
+    def document_context(
+        self, *, sent: Mapping[str, str] | None = None
+    ) -> tuple[str, dict[str, str]]:
         """Build document context and the contents to mark sent after submission."""
+        baseline = self._sent_documents if sent is None else sent
         sections = []
         sent_documents = {}
         for document in self.list_documents():
             if not document["included"]:
                 continue
             content = self.workspace.read_document(document["name"])["content"]
-            if self._sent_documents.get(document["name"]) == content:
+            if baseline.get(document["name"]) == content:
                 continue
             sent_documents[document["name"]] = content
             sections.append(f"### {document['name']}\n\n{content.rstrip()}\n")
@@ -956,20 +959,30 @@ class ExplorationSession:
         self._turn_selection = (provider, turn_raw_model, turn_effort)
         try:
             prior_records = self.workspace.current_records()
-            # When switching providers mid-chat, capture the prior transcript recap
-            # before logging the new user message so it is never duplicated.
-            if self._active_provider is not None and provider != self._active_provider:
-                self._resume_prefix = (
+            switching_provider = (
+                self._active_provider is not None and provider != self._active_provider
+            )
+            rebuilding_threadless = (
+                not switching_provider
+                and self._sdk_session_id is None
+                and self._session_initialized
+            )
+            resetting_context = switching_provider or rebuilding_threadless
+            turn_resume_prefix = (
+                (
                     self.workspace.recap(
                         prior_records, kernel_preserved=not self._kernel_notice
                     )
                     if prior_records
                     else None
                 )
-                self._sdk_session_id = None
-                self._active_provider = None
-                self._sent_documents = {}
-                self.context_usage = None
+                if resetting_context
+                else self._resume_prefix
+            )
+            base_sent_documents: Mapping[str, str] = (
+                {} if resetting_context else self._sent_documents
+            )
+            initial_resume_id = None if resetting_context else self._sdk_session_id
 
             # Snapshot the selection before yielding so changes made while this turn runs
             # apply to the next message.
@@ -984,15 +997,17 @@ class ExplorationSession:
                 nonlocal prompt_record_seq, prompt
                 prompt_record_seq = self._record_dirty_seq
                 document_prefix, sent_documents = (
-                    self.document_context() if slurm_probe_id is None else ("", {})
+                    self.document_context(sent=base_sent_documents)
+                    if slurm_probe_id is None
+                    else ("", {})
                 )
                 prefix = ""
-                resume_prefix = self._resume_prefix
+                resume_prefix = turn_resume_prefix
                 initialize_session = False
                 if resume_prefix:
                     prefix = self.opening_notes() + resume_prefix
                     initialize_session = True
-                elif not self._session_initialized:
+                elif not self._session_initialized or resetting_context:
                     prefix = self.opening_notes()
                     initialize_session = True
                 elif self._record_dirty:
@@ -1024,7 +1039,7 @@ class ExplorationSession:
             for attempt in range(2):
                 accepted = False
                 pending_session_id: str | None = None
-                resume_id = self._sdk_session_id
+                resume_id = initial_resume_id if attempt == 0 else self._sdk_session_id
 
                 def commit_prompt_state() -> bool:
                     nonlocal accepted
@@ -1039,7 +1054,12 @@ class ExplorationSession:
                     self._record_acked_seq = max(
                         self._record_acked_seq, prompt_record_seq
                     )
-                    self._sent_documents.update(sent_documents)
+                    if resetting_context:
+                        self._sdk_session_id = None
+                        self._sent_documents = dict(sent_documents)
+                        self.context_usage = None
+                    else:
+                        self._sent_documents.update(sent_documents)
                     self._active_provider = provider
                     self._owner_provider = provider
                     self._active_model = turn_catalogue_model
@@ -1207,6 +1227,8 @@ class ExplorationSession:
                             if prior_records
                             else None
                         )
+                        turn_resume_prefix = self._resume_prefix
+                        base_sent_documents = {}
                         prepare_prompt()
                         continue
                     raise RuntimeError(str(exc)) from exc

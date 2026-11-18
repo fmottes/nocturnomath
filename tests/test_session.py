@@ -1087,3 +1087,58 @@ async def test_recap_kernel_preserved_reflects_kernel_notice_and_provider_switch
         not in rebuild_prompt
     )
     assert "The kernel may no longer hold the state it had then" in rebuild_prompt
+
+
+@pytest.mark.asyncio
+async def test_failed_cross_provider_switch_preserves_thread_and_threadless_turn_rebuilds_context(
+    session,
+):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+    attach_backend(
+        session,
+        FakeBackend(provider="anthropic", session_id="ant-1"),
+        "anthropic",
+    )
+    assert await session.query("first") is True
+    assert session._sdk_session_id == "ant-1"
+    assert session._active_provider == "anthropic"
+    assert "inputs.md" in session._sent_documents
+
+    # A switch that fails before the new provider accepts the turn leaves the
+    # existing native thread, active provider, and sent documents intact.
+    session.model = "gpt-5.6-sol"
+    attach_backend(
+        session,
+        FakeBackend(provider="openai", fail_turn=RuntimeError("Codex unavailable")),
+        "openai",
+    )
+    assert await session.query("unaccepted switch") is False
+    assert session._sdk_session_id == "ant-1"
+    assert session._active_provider == "anthropic"
+    assert "inputs.md" in session._sent_documents
+
+    # A switch that executes a tool before crashing without SessionStarted has no
+    # native thread ID; the next turn rebuilds full context and documents.
+    class ToolThenDisconnectBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["list_documents"].handler({})
+            raise RuntimeError("disconnected before SessionStarted")
+            yield TurnStarted()
+
+    attach_backend(session, ToolThenDisconnectBackend(provider="openai"), "openai")
+    assert await session.query("partial switch") is False
+    assert session._sdk_session_id is None
+    assert session._active_provider == "openai"
+
+    working_openai = attach_backend(
+        session,
+        FakeBackend(provider="openai", session_id="oai-2"),
+        "openai",
+    )
+    assert await session.query("follow up in memory") is True
+    assert session._sdk_session_id == "oai-2"
+    rebuilt_prompt = working_openai.calls[-1].prompt
+    assert "# Evidence" in rebuilt_prompt
+    assert "Me: first" in rebuilt_prompt
+    assert "### inputs.md" in rebuilt_prompt
