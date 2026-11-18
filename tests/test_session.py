@@ -934,3 +934,60 @@ async def test_concurrent_record_dirty_and_non_hook_compaction_reload_labels(ses
         "The shared scientific record changed in another exploration."
         not in compacting_backend.calls[-1].prompt
     )
+
+
+@pytest.mark.asyncio
+async def test_steer_during_active_turn_delivers_before_second_probe_without_resending_initial_docs(
+    session,
+):
+    (session.workspace.documents_path / "initial.md").write_text("# Initial\n")
+    steered_texts = []
+
+    class SteeredTurnBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            yield SessionStarted("sdk-session")
+            by_name = {spec.name: spec for spec in tools}
+            first_run = await by_name["run"].handler(
+                {"code": "x = 1", "expected": "sets x"}
+            )
+            assert not first_run.get("is_error")
+            verdict = await by_name["verdict"].handler({"text": "x was set"})
+            assert not verdict.get("is_error")
+
+            session.enqueue_prompt("Now multiply x by 2", mode="steer")
+            session.workspace.create_document("Added", "Factor is 2")
+
+            steered = await by_name["run"].handler(
+                {"code": "print(x)", "expected": "1"}
+            )
+            assert not steered.get("is_error")
+            steered_texts.append(steered["content"][0]["text"])
+
+            third_run = await by_name["run"].handler(
+                {"code": "print(x * 2)", "expected": "2"}
+            )
+            assert not third_run.get("is_error")
+            assert "Probe S001/P002" in third_run["content"][0]["text"]
+            await by_name["verdict"].handler({"text": "x * 2 was computed"})
+
+            yield TextBlockDone("Done.")
+            yield TurnResult()
+
+    attach_backend(session, SteeredTurnBackend())
+    assert await session.query("Start") is True
+    assert len(steered_texts) == 1
+    assert "Now multiply x by 2" in steered_texts[0]
+    assert "Factor is 2" in steered_texts[0]
+    assert "# Initial" not in steered_texts[0]
+    assert session.kernel.executed_codes == ["x = 1", "print(x * 2)"]

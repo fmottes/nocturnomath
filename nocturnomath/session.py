@@ -7,6 +7,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,20 @@ from .tools import ToolSpec, build_tools
 from .workspace import Workspace
 
 logger = logging.getLogger("nocturnomath")
+
+PROMPT_MODES = ("steer", "queue")
+DEFAULT_PROMPT_MODE = "steer"
+
+
+@dataclass
+class PendingPrompt:
+    """A prompt submitted while the explorer is already working."""
+
+    id: str
+    text: str
+    mode: str
+    model: str | None = None
+    effort: str | None = None
 
 
 class ExplorationSession:
@@ -87,6 +102,12 @@ class ExplorationSession:
         self._record_dirty_seq = 0
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
+        self._pending_prompts: list[PendingPrompt] = []
+        self._deferred_model_effort: tuple[str | None, str | None] | None = None
+        self._last_pending_task: asyncio.Task[Any] | None = None
+        self._commit_turn_accepted: Callable[[], None] | None = None
+        self._draining_queries = False
+        self._prelogged_user_turn = False
         self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
@@ -139,6 +160,7 @@ class ExplorationSession:
             self._is_busy
             or self.kernel.busy
             or self._probe_operation_lock.locked()
+            or bool(self._pending_prompts)
             or (self._probe_task is not None and not self._probe_task.done())
             or (self._current_task is not None and not self._current_task.done())
         )
@@ -241,6 +263,8 @@ class ExplorationSession:
         self._record_dirty_seq = 0
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
+        self._pending_prompts = []
+        self._deferred_model_effort = None
         self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
@@ -328,6 +352,149 @@ class ExplorationSession:
                 raise ValueError("Enter a scientific prompt, or restore the default.")
         self.workspace.update_config(exploration_prompt=prompt)
         return self.exploration_prompt
+
+    @property
+    def prompt_mode(self) -> str:
+        mode = self.workspace.read_config().get("prompt_mode")
+        return mode if mode in PROMPT_MODES else DEFAULT_PROMPT_MODE
+
+    def set_prompt_mode(self, mode: str) -> str:
+        if mode not in PROMPT_MODES:
+            raise ValueError("Choose 'steer' or 'queue' for prompt delivery.")
+        self.workspace.update_config(prompt_mode=mode)
+        return mode
+
+    def pending_prompts_snapshot(self) -> list[dict[str, str]]:
+        """Serialize pending prompts without exposing backend model overrides."""
+        return [
+            {"id": item.id, "text": item.text, "mode": item.mode}
+            for item in self._pending_prompts
+        ]
+
+    def enqueue_prompt(
+        self,
+        text: str,
+        *,
+        mode: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> PendingPrompt:
+        """Schedule a prompt while this explorer is already working."""
+        resolved_mode = mode if mode in PROMPT_MODES else self.prompt_mode
+        prompt = PendingPrompt(
+            id=uuid.uuid4().hex,
+            text=text,
+            mode=resolved_mode,
+            model=model,
+            effort=effort,
+        )
+        self._pending_prompts.append(prompt)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._last_pending_task = loop.create_task(
+                self.emit(
+                    "pending_prompts_changed",
+                    pending_prompts=self.pending_prompts_snapshot(),
+                )
+            )
+        return prompt
+
+    async def remove_pending_prompt(self, prompt_id: str) -> bool:
+        """Remove one pending prompt if it has not been delivered yet."""
+        before = len(self._pending_prompts)
+        self._pending_prompts = [
+            item for item in self._pending_prompts if item.id != prompt_id
+        ]
+        if len(self._pending_prompts) == before:
+            return False
+        await self.emit(
+            "pending_prompts_changed",
+            pending_prompts=self.pending_prompts_snapshot(),
+        )
+        return True
+
+    async def clear_pending_prompts(self) -> None:
+        """Drop all pending prompts and notify listeners if any were present."""
+        had_pending = bool(self._pending_prompts)
+        self._pending_prompts.clear()
+        self._deferred_model_effort = None
+        if had_pending:
+            await self.emit("pending_prompts_changed", pending_prompts=[])
+
+    def pop_next_turn_prompts(self) -> list[PendingPrompt]:
+        """Pop the next queued turn, batching leading steer prompts together."""
+        if not self._pending_prompts:
+            return []
+        if self._pending_prompts[0].mode == "steer":
+            batch: list[PendingPrompt] = []
+            while self._pending_prompts and self._pending_prompts[0].mode == "steer":
+                batch.append(self._pending_prompts.pop(0))
+            return batch
+        return [self._pending_prompts.pop(0)]
+
+    async def consume_steer_message(self) -> dict[str, Any] | None:
+        """Consume any pending steer messages before starting the next probe."""
+        if not any(item.mode == "steer" for item in self._pending_prompts):
+            return None
+        # Yield briefly so ready assistant text arrives before logging user input.
+        await asyncio.sleep(0)
+        steered = [item for item in self._pending_prompts if item.mode == "steer"]
+        if not steered:
+            return None
+        self._pending_prompts = [
+            item for item in self._pending_prompts if item.mode != "steer"
+        ]
+        if self._commit_turn_accepted is not None:
+            self._commit_turn_accepted()
+
+        deferred_model, deferred_effort = self._deferred_model_effort or (None, None)
+        for item in steered:
+            if item.model is not None:
+                deferred_model = item.model
+                deferred_effort = item.effort
+            elif item.effort is not None:
+                deferred_effort = item.effort
+        if deferred_model is not None or deferred_effort is not None:
+            self._deferred_model_effort = (deferred_model, deferred_effort)
+
+        prefix = ""
+        if self._record_dirty:
+            prefix = self._record_reload_heading() + self.opening_notes()
+            self._record_dirty = False
+        document_prefix, sent_documents = self.document_context()
+        if sent_documents:
+            self._sent_documents.update(sent_documents)
+            prefix += document_prefix
+
+        for item in steered:
+            self.log_transcript("user", text=item.text)
+            await self.emit(
+                "user_message",
+                session_id=self.workspace.session_id,
+                text=item.text,
+            )
+        await self.emit(
+            "pending_prompts_changed",
+            pending_prompts=self.pending_prompts_snapshot(),
+        )
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Nothing ran: the user sent a new message while you were working. "
+                        "Do not call `verdict` for this unstarted probe. "
+                        "Read and address the user's message before starting the next probe "
+                        "(or reply without a probe if none is needed):\n\n"
+                        + prefix
+                        + "\n\n".join(item.text for item in steered)
+                    ),
+                }
+            ]
+        }
 
     def document_context(self) -> tuple[str, dict[str, str]]:
         """Build document context and the contents to mark sent after submission."""
@@ -427,6 +594,8 @@ class ExplorationSession:
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
         self._results_since_note = 0
+        self._pending_prompts = []
+        self._deferred_model_effort = None
         self._restore_pending_verdict(records)
         self.context_usage = next(
             (
@@ -477,6 +646,7 @@ class ExplorationSession:
         return replayed
 
     async def interrupt(self):
+        await self.clear_pending_prompts()
         if self.kernel.busy:
             self.kernel.interrupt()
             await self.emit("kernel_interrupted")
@@ -634,7 +804,10 @@ class ExplorationSession:
             prepare_prompt()
             await self.emit("status_change", status="thinking")
             if slurm_probe_id is None:
-                self.log_transcript("user", text=user_text)
+                if self._prelogged_user_turn:
+                    self._prelogged_user_turn = False
+                else:
+                    self.log_transcript("user", text=user_text)
             else:
                 self.log_transcript("slurm_review", probe_id=slurm_probe_id)
                 await self.emit("slurm_review", probe_id=slurm_probe_id)
@@ -685,78 +858,82 @@ class ExplorationSession:
                 tool_timeout_s = max(self.timeout_s, 600) + 60
 
                 try:
-                    async for event in backend.run_turn(
-                        prompt,
-                        system_prompt=build_system_prompt(self.exploration_prompt),
-                        tools=turn_tools,
-                        workspace_path=self.workspace_path,
-                        model=self.raw_model_id(self.model),
-                        effort=self.effort,
-                        auth=self.auth.get(provider),
-                        resume_session_id=resume_id,
-                        tool_timeout_s=tool_timeout_s,
-                    ):
-                        if isinstance(event, SessionStarted):
-                            if accepted:
-                                self._track_session_id(event.session_id, provider)
-                            else:
-                                pending_session_id = event.session_id
-                            continue
-                        if isinstance(event, TurnStarted):
+                    self._commit_turn_accepted = commit_progress
+                    try:
+                        async for event in backend.run_turn(
+                            prompt,
+                            system_prompt=build_system_prompt(self.exploration_prompt),
+                            tools=turn_tools,
+                            workspace_path=self.workspace_path,
+                            model=self.raw_model_id(self.model),
+                            effort=self.effort,
+                            auth=self.auth.get(provider),
+                            resume_session_id=resume_id,
+                            tool_timeout_s=tool_timeout_s,
+                        ):
+                            if isinstance(event, SessionStarted):
+                                if accepted:
+                                    self._track_session_id(event.session_id, provider)
+                                else:
+                                    pending_session_id = event.session_id
+                                continue
+                            if isinstance(event, TurnStarted):
+                                commit_progress()
+                                continue
                             commit_progress()
-                            continue
-                        commit_progress()
-                        if isinstance(event, TextDelta):
-                            await self.emit("assistant_delta", text=event.text)
-                        elif isinstance(event, CompactionNotice):
-                            await self._record_compaction(
-                                record_reloaded=backend.uses_compact_hook
-                            )
-                            if not backend.uses_compact_hook:
-                                self.mark_record_dirty(reason="compaction")
-                        elif isinstance(event, MessageUsage):
-                            self.log_transcript(
-                                "message_usage",
-                                message_id=event.message_id,
-                                model=event.model,
-                                usage=event.usage,
-                            )
-                        elif isinstance(event, TextBlockDone):
-                            accumulated_text.append(event.text)
-                            self.log_transcript("agent", text=event.text)
-                            await self.emit("assistant_text", text=event.text)
-                        elif isinstance(event, TurnResult):
-                            if any(
-                                value is not None
-                                for value in (
-                                    event.usage,
-                                    event.model_usage,
-                                    event.total_cost_usd,
-                                    event.duration_ms,
-                                    event.duration_api_ms,
-                                    event.num_turns,
+                            if isinstance(event, TextDelta):
+                                await self.emit("assistant_delta", text=event.text)
+                            elif isinstance(event, CompactionNotice):
+                                await self._record_compaction(
+                                    record_reloaded=backend.uses_compact_hook
                                 )
-                            ):
+                                if not backend.uses_compact_hook:
+                                    self.mark_record_dirty(reason="compaction")
+                            elif isinstance(event, MessageUsage):
                                 self.log_transcript(
-                                    "usage",
+                                    "message_usage",
+                                    message_id=event.message_id,
+                                    model=event.model,
                                     usage=event.usage,
-                                    model_usage=event.model_usage,
-                                    total_cost_usd=event.total_cost_usd,
-                                    duration_ms=event.duration_ms,
-                                    duration_api_ms=event.duration_api_ms,
-                                    num_turns=event.num_turns,
                                 )
-                            if event.context_usage is not None:
-                                self.context_usage = event.context_usage
-                                self.log_transcript(
-                                    "meta", context_usage=self.context_usage
-                                )
-                                await self.emit(
-                                    "context_usage_changed",
-                                    context_usage=self.context_usage,
-                                )
-                    commit_progress()
-                    break
+                            elif isinstance(event, TextBlockDone):
+                                accumulated_text.append(event.text)
+                                self.log_transcript("agent", text=event.text)
+                                await self.emit("assistant_text", text=event.text)
+                            elif isinstance(event, TurnResult):
+                                if any(
+                                    value is not None
+                                    for value in (
+                                        event.usage,
+                                        event.model_usage,
+                                        event.total_cost_usd,
+                                        event.duration_ms,
+                                        event.duration_api_ms,
+                                        event.num_turns,
+                                    )
+                                ):
+                                    self.log_transcript(
+                                        "usage",
+                                        usage=event.usage,
+                                        model_usage=event.model_usage,
+                                        total_cost_usd=event.total_cost_usd,
+                                        duration_ms=event.duration_ms,
+                                        duration_api_ms=event.duration_api_ms,
+                                        num_turns=event.num_turns,
+                                    )
+                                if event.context_usage is not None:
+                                    self.context_usage = event.context_usage
+                                    self.log_transcript(
+                                        "meta", context_usage=self.context_usage
+                                    )
+                                    await self.emit(
+                                        "context_usage_changed",
+                                        context_usage=self.context_usage,
+                                    )
+                        commit_progress()
+                        break
+                    finally:
+                        self._commit_turn_accepted = None
                 except SessionResumeError as exc:
                     if attempt == 0 and resume_id is not None and not accepted:
                         logger.warning(
@@ -791,15 +968,20 @@ class ExplorationSession:
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
+            await self.clear_pending_prompts()
             await self.emit("status_change", status="cancelled")
             raise
         except Exception as exc:
+            await self.clear_pending_prompts()
             logger.exception("Error during query execution")
             await self.emit("error", message=str(exc))
             return False
         finally:
+            self._prelogged_user_turn = False
+            self._commit_turn_accepted = None
             self._is_busy = False
-            await self.emit("status_change", status="idle")
+            if not (self._draining_queries and self._pending_prompts):
+                await self.emit("status_change", status="idle")
 
     def _track_session_id(
         self, session_id: str | None, provider: ProviderId | None = None
@@ -838,6 +1020,8 @@ class ExplorationSession:
         self._record_dirty_seq = 0
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
+        self._pending_prompts = []
+        self._deferred_model_effort = None
         self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort

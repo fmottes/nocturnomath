@@ -12,7 +12,7 @@ from typing import Any
 from . import slurm
 from .auth import PROVIDERS, AuthStore, ProviderId
 from .backends import DEFAULT_EFFORT, AgentBackend, default_backends
-from .session import ExplorationSession
+from .session import DEFAULT_PROMPT_MODE, ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
 
@@ -284,6 +284,23 @@ class Runtime:
             session._slurm_review_probe_id = None
             if session._current_task is asyncio.current_task():
                 session._current_task = None
+            if (
+                self._started
+                and not self.changing
+                and session._pending_prompts
+                and session._current_task is None
+            ):
+                agent_id = next(
+                    (
+                        aid
+                        for aid, candidate in self.agents.items()
+                        if candidate is session
+                    ),
+                    None,
+                )
+                session._current_task = asyncio.create_task(
+                    self._drain_pending_queries(session, agent_id)
+                )
             if key in self._slurm_review_attempts:
                 self._wake_slurm_monitor()
 
@@ -674,6 +691,7 @@ class Runtime:
             "kernel_busy": session.kernel.busy,
             "is_busy": session.has_active_query() or agent_id in self._changing_agents,
             "status": session.status,
+            "pending_prompts": session.pending_prompts_snapshot(),
             "documents": session.list_documents(),
             "folders": session.workspace.list_document_folders(),
             "documents_default": session.documents_default,
@@ -748,6 +766,7 @@ class Runtime:
                 "model_providers": self.model_providers,
                 "model_efforts": self.model_efforts,
                 "session_defaults": None,
+                "prompt_mode": DEFAULT_PROMPT_MODE,
                 "evidence_path": EVIDENCE_PATH,
                 "thoughts_path": THOUGHTS_PATH,
                 "plots": [],
@@ -779,6 +798,7 @@ class Runtime:
             "exploration_prompt": session.exploration_prompt,
             "exploration_prompt_is_custom": session.exploration_prompt_override
             is not None,
+            "prompt_mode": session.prompt_mode,
             "evidence_path": EVIDENCE_PATH,
             "thoughts_path": THOUGHTS_PATH,
             "kernel_alive": session.kernel.is_alive(),
@@ -874,24 +894,40 @@ class Runtime:
             raise
         finally:
             self._changing_agents.discard(agent_id)
+            if (
+                self._started
+                and not self.changing
+                and session._pending_prompts
+                and session._current_task is None
+            ):
+                session._current_task = asyncio.create_task(
+                    self._drain_pending_queries(session, agent_id)
+                )
             self._wake_slurm_monitor()
 
-    def start_query(
+    async def set_prompt_mode(self, mode: str) -> str:
+        """Persist workspace prompt delivery mode and update any still-pending prompts."""
+        session = self.require_session()
+        resolved = session.set_prompt_mode(mode)
+        for other in self.agents.values():
+            if (
+                other.workspace_path == session.workspace_path
+                and other._pending_prompts
+            ):
+                for item in other._pending_prompts:
+                    item.mode = resolved
+                await other.emit(
+                    "pending_prompts_changed",
+                    pending_prompts=other.pending_prompts_snapshot(),
+                )
+        return resolved
+
+    def _validate_query_model(
         self,
-        text: str,
+        session: ExplorationSession,
         model: str | None = None,
         effort: str | None = None,
-        agent_id: str | None = None,
     ):
-        if self.changing:
-            raise RuntimeError(
-                "The research environment is being prepared. Please wait."
-            )
-        if agent_id in self._changing_agents:
-            raise RuntimeError("This explorer is changing. Please wait.")
-        session = self.get_agent(agent_id)
-        if session.has_active_query():
-            raise RuntimeError("The agent is already running a query.")
         if model is None and session.model is None:
             raise ValueError("No model available.")
         if model is not None and model not in self.models:
@@ -905,6 +941,13 @@ class Runtime:
         if effort is not None and effort not in supported_efforts:
             raise ValueError("Choose an effort supported by the selected model.")
 
+    def _apply_query_model(
+        self,
+        session: ExplorationSession,
+        model: str | None = None,
+        effort: str | None = None,
+        agent_id: str | None = None,
+    ):
         metadata = {}
         if model is not None:
             session.model = model
@@ -923,10 +966,45 @@ class Runtime:
             metadata["effort"] = effort
         if metadata:
             session.log_transcript("meta", **metadata)
+
+    def _apply_deferred_model(self, session: ExplorationSession, agent_id: str | None):
+        if session._deferred_model_effort is None:
+            return
+        deferred_model, deferred_effort = session._deferred_model_effort
+        session._deferred_model_effort = None
+        try:
+            self._validate_query_model(session, deferred_model, deferred_effort)
+        except ValueError:
+            return
+        self._apply_query_model(session, deferred_model, deferred_effort, agent_id)
+
+    def start_query(
+        self,
+        text: str,
+        model: str | None = None,
+        effort: str | None = None,
+        agent_id: str | None = None,
+    ) -> str:
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        session = self.get_agent(agent_id)
+        if agent_id in self._changing_agents and session.status != "compacting":
+            raise RuntimeError("This explorer is changing. Please wait.")
+        self._validate_query_model(session, model, effort)
+        if session.has_active_query():
+            session.enqueue_prompt(
+                text, mode=session.prompt_mode, model=model, effort=effort
+            )
+            return "pending"
+
+        self._apply_query_model(session, model, effort, agent_id)
         # An accepted first message allocates its session before the UI sees it.
         session.activate_session()
         task = asyncio.create_task(self._run_query(session, text, agent_id))
         session._current_task = task
+        return "started"
 
     @property
     def current_task(self) -> asyncio.Task | None:
@@ -960,19 +1038,88 @@ class Runtime:
             )
         )
 
-    async def _run_query(
-        self, session: ExplorationSession, text: str, agent_id: str | None
+    async def _drain_pending_loop(
+        self, session: ExplorationSession, agent_id: str | None
     ):
+        while session._pending_prompts:
+            batch = session.pop_next_turn_prompts()
+            batch_model: str | None = None
+            batch_effort: str | None = None
+            for item in batch:
+                if item.model is not None:
+                    batch_model = item.model
+                    batch_effort = item.effort
+                elif item.effort is not None:
+                    batch_effort = item.effort
+            try:
+                self._validate_query_model(session, batch_model, batch_effort)
+            except ValueError as exc:
+                payload: dict[str, Any] = {"message": str(exc)}
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                await self.emit("error", payload)
+                await session.clear_pending_prompts()
+                break
+            self._apply_query_model(session, batch_model, batch_effort, agent_id)
+            session.activate_session()
+            if len(batch) > 1:
+                for item in batch:
+                    session.log_transcript("user", text=item.text)
+                session._prelogged_user_turn = True
+            for item in batch:
+                await session.emit(
+                    "user_message",
+                    session_id=session.workspace.session_id,
+                    text=item.text,
+                )
+            await session.emit(
+                "pending_prompts_changed",
+                pending_prompts=session.pending_prompts_snapshot(),
+            )
+            ok = await session.query("\n\n".join(item.text for item in batch))
+            session._prelogged_user_turn = False
+            self._apply_deferred_model(session, agent_id)
+            if ok is False:
+                await session.clear_pending_prompts()
+                break
+
+    async def _run_query_body(
+        self,
+        session: ExplorationSession,
+        agent_id: str | None,
+        initial_text: str | None = None,
+    ):
+        session._draining_queries = True
         try:
-            await session.query(text)
+            ok = True
+            if initial_text is not None:
+                ok = await session.query(initial_text)
+                self._apply_deferred_model(session, agent_id)
+            if ok is not False:
+                await self._drain_pending_loop(session, agent_id)
         except asyncio.CancelledError:
-            pass
+            await session.clear_pending_prompts()
         except Exception as exc:
+            await session.clear_pending_prompts()
             logger.exception("Query task failed")
             payload = {"message": str(exc)}
             if agent_id is not None:
                 payload["agent_id"] = agent_id
             await self.emit("error", payload)
         finally:
+            session._prelogged_user_turn = False
+            session._draining_queries = False
+            if not session._is_busy and session.status != "idle":
+                await session.emit("status_change", status="idle")
             if session._current_task is asyncio.current_task():
                 session._current_task = None
+
+    async def _run_query(
+        self, session: ExplorationSession, text: str, agent_id: str | None
+    ):
+        await self._run_query_body(session, agent_id, text)
+
+    async def _drain_pending_queries(
+        self, session: ExplorationSession, agent_id: str | None
+    ):
+        await self._run_query_body(session, agent_id)

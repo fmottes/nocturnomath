@@ -819,3 +819,87 @@ async def test_evidence_and_thought_tools_report_corrections(session):
     records = session.workspace.read_transcript(session.transcript_path)
     assert records[-1]["replaces"] == ["T001"]
     assert records[-1]["entry_id"] == "T002"
+
+
+@pytest.mark.asyncio
+async def test_steer_prompt_is_picked_up_before_next_probe_after_verdict(
+    session, monkeypatch
+):
+    sbatch_calls = []
+
+    def scheduler(argv, workspace, env=None):
+        if argv[0] == "sbatch":
+            sbatch_calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="999\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("nocturnomath.slurm._command", scheduler)
+    tools = tools_by_name(session)
+    await tools["run"].handler({"code": "print(1)", "expected": "1"})
+    assert session._pending_verdict == "1"
+
+    session.enqueue_prompt("Switch to log scale", mode="steer")
+    session.workspace.create_document("Hint", "Use base 10")
+
+    blocked = await tools["run"].handler({"code": "print(99)", "expected": "99"})
+    assert blocked["is_error"] is True
+    assert "verdict" in blocked["content"][0]["text"]
+    assert len(session._pending_prompts) == 1
+
+    await tools["verdict"].handler({"text": "Printed 1."})
+    events = []
+    session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
+
+    steered = await tools["run"].handler({"code": "print(99)", "expected": "99"})
+    assert not steered.get("is_error")
+    steered_text = steered["content"][0]["text"]
+    assert "Nothing ran" in steered_text
+    assert "Switch to log scale" in steered_text
+    assert "Use base 10" in steered_text
+    assert not (session.workspace.probes_path / "P002").exists()
+    assert session.kernel.executed_codes == ["print(1)"]
+    assert any(
+        record.get("kind") == "user" and record.get("text") == "Switch to log scale"
+        for record in session.workspace.current_records()
+    )
+    assert ("user_message", "Switch to log scale") in [
+        (kind, payload.get("text")) for kind, payload in events
+    ]
+    assert ("pending_prompts_changed", []) in [
+        (kind, payload.get("pending_prompts")) for kind, payload in events
+    ]
+
+    session.enqueue_prompt("Use GPU partition", mode="steer")
+    slurm_steered = await tools["submit_slurm"].handler(
+        {
+            "code": "print(2)",
+            "expected": "2",
+            "time_minutes": 1,
+            "cpus": 1,
+            "memory_gb": 1,
+        }
+    )
+    assert not slurm_steered.get("is_error")
+    assert "Use GPU partition" in slurm_steered["content"][0]["text"]
+    assert sbatch_calls == []
+
+    session.enqueue_prompt("Follow up later", mode="queue")
+    second = await tools["run"].handler({"code": "print(2)", "expected": "2"})
+    assert not second.get("is_error")
+    assert "Probe S001/P002" in second["content"][0]["text"]
+    await tools["verdict"].handler({"text": "Printed 2."})
+
+    slurm_ok = await tools["submit_slurm"].handler(
+        {
+            "code": "print(3)",
+            "expected": "3",
+            "time_minutes": 1,
+            "cpus": 1,
+            "memory_gb": 1,
+        }
+    )
+    assert not slurm_ok.get("is_error")
+    assert len(sbatch_calls) == 1
+    assert [p["text"] for p in session.pending_prompts_snapshot()] == [
+        "Follow up later"
+    ]

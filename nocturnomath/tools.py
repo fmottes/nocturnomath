@@ -147,6 +147,10 @@ def build_tools(session: "ExplorationSession"):
                 "is_error": True,
             }
 
+        steered = await session.consume_steer_message()
+        if steered is not None:
+            return steered
+
         if not expected and not retry_of:
             return {
                 "content": [
@@ -668,6 +672,9 @@ def build_tools(session: "ExplorationSession"):
     async def submit_slurm(args):
         if session._pending_verdict is not None:
             return failure("Give the last probe its verdict before submitting another.")
+        steered = await session.consume_steer_message()
+        if steered is not None:
+            return steered
         if session.kernel.busy or (
             session._probe_task and not session._probe_task.done()
         ):

@@ -159,10 +159,16 @@ EVENT_TYPES = [
     "workspace_updated",
     "context_compacted",
     "context_usage_changed",
+    "pending_prompts_changed",
 ]
 
 
-SILENT_EVENTS = ["assistant_delta", "status_change", "turn_complete"]
+SILENT_EVENTS = [
+    "assistant_delta",
+    "status_change",
+    "turn_complete",
+    "pending_prompts_changed",
+]
 
 
 @pytest.mark.parametrize(
@@ -801,3 +807,23 @@ async def test_pending_model_stays_bound_to_provider_across_auth_refresh(termina
     await terminal.run("/auth openai cli")
     assert terminal.app.pending_model is None
     assert "Dropped pending model openai/shared" in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_prompts_while_busy_are_scheduled_with_configured_mode(terminal):
+    terminal.session._is_busy = True
+
+    await terminal.run("steer me")
+    assert "Scheduled (steer, before next probe)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("steer me", "steer")]
+
+    terminal.session.set_prompt_mode("queue")
+    await terminal.run("queue me")
+    assert "Scheduled (queue, after current turn)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("steer me", "steer"), ("queue me", "queue")]

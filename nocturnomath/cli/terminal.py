@@ -284,6 +284,7 @@ class TerminalApp:
                 "status_change",
                 "turn_complete",
                 "context_usage_changed",
+                "pending_prompts_changed",
             ):
                 return
             if event_type == "assistant_text":
@@ -469,6 +470,9 @@ class TerminalApp:
         if isinstance(used, int) and isinstance(window, int) and window > 0:
             self.write(f"Context: {round(100 * used / window)}%", style="dim")
 
+    def _render_pending_prompts_changed(self, payload):
+        pass
+
     # ----------------------------------------------------------------- helpers
 
     def workspace_file(self, relative_path: str) -> Path:
@@ -571,12 +575,17 @@ class TerminalApp:
 
     async def run_query(self, text: str):
         try:
-            self.runtime.start_query(text, self.pending_model)
+            query_state = self.runtime.start_query(text, self.pending_model)
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return
         self.pending_model = None
         self.pending_model_provider = None
+        if query_state == "pending":
+            mode = self.runtime.session.prompt_mode if self.runtime.session else "steer"
+            when = "before next probe" if mode == "steer" else "after current turn"
+            self.write(f"Scheduled ({mode}, {when}).", style="dim")
+            return
         await self.runtime.wait_for_query()
         self.close_stream()
         self.clear_spinner()

@@ -594,3 +594,94 @@ async def test_out_of_order_auth_refresh_discards_stale_catalogue(session):
     assert runtime.auth.get("openai").method == "cli"
     assert runtime.models == ["fresh-cli-model"]
     assert runtime.model == "fresh-cli-model"
+
+
+@pytest.mark.asyncio
+async def test_steer_falls_back_to_immediate_followup_turn_when_no_probe_runs(session):
+    runtime = Runtime(session, backends=stub_backends())
+    runtime.start()
+    events = []
+    runtime.subscribe(lambda event_type, payload: events.append((event_type, payload)))
+
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    queries = []
+
+    async def query(text):
+        await session.emit("status_change", status="thinking")
+        try:
+            queries.append(text)
+            if len(queries) == 1:
+                first_entered.set()
+                await release_first.wait()
+        finally:
+            if not (session._draining_queries and session._pending_prompts):
+                await session.emit("status_change", status="idle")
+
+    session.query = query
+    assert runtime.start_query("first") == "started"
+    await first_entered.wait()
+
+    assert runtime.start_query("steer 1") == "pending"
+    assert runtime.start_query("steer 2") == "pending"
+    release_first.set()
+    await runtime.wait_for_query()
+
+    assert queries == ["first", "steer 1\n\nsteer 2"]
+    assert [payload["text"] for kind, payload in events if kind == "user_message"] == [
+        "steer 1",
+        "steer 2",
+    ]
+    assert [
+        payload["status"] for kind, payload in events if kind == "status_change"
+    ] == ["thinking", "thinking", "idle"]
+    assert not session.has_active_query()
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_runs_fifo_turns_applies_models_and_clears_on_interrupt(
+    session,
+):
+    runtime = Runtime(session, backends=stub_backends())
+    runtime.start()
+    runtime.models = ["sonnet", "opus"]
+    runtime.model_efforts = {"sonnet": ["low", "high"], "opus": ["high"]}
+    await runtime.set_prompt_mode("queue")
+
+    seen = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def query(text):
+        seen.append((text, session.model, session.effort))
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()
+
+    session.query = query
+    assert runtime.start_query("first", "sonnet", "low") == "started"
+    await entered.wait()
+
+    assert runtime.start_query("second", "opus", "high") == "pending"
+    assert runtime.start_query("third") == "pending"
+    release.set()
+    await runtime.wait_for_query()
+
+    assert seen == [
+        ("first", "sonnet", "low"),
+        ("second", "opus", "high"),
+        ("third", "opus", "high"),
+    ]
+
+    seen.clear()
+    entered.clear()
+    release.clear()
+    assert runtime.start_query("fourth") == "started"
+    await entered.wait()
+    assert runtime.start_query("drop 1") == "pending"
+    assert runtime.start_query("drop 2") == "pending"
+    await session.interrupt()
+    await runtime.wait_for_query()
+
+    assert session._pending_prompts == []
+    assert seen == [("fourth", "opus", "high")]
