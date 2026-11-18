@@ -8,7 +8,7 @@ Prefer plain code, explicit state, and small changes over abstractions, framewor
 
 ## Project Structure & Module Organization
 
-Package code lives in `nocturnomath/`. `session.py` coordinates Claude conversations, `runtime.py` handles shared orchestration, `workspace.py` owns artifacts, `notes.py` manages the scientific record, and `kernel.py` controls Jupyter. Interface adapters live in `cli/` and `web/`; browser assets are in `web/static/`. Tests and fixtures live in `tests/`.
+Package code lives in `nocturnomath/`. `session.py` coordinates model conversations, `runtime.py` handles shared orchestration, `backends/` drives the Anthropic (`claude`), OpenAI (`codex`), and Google (`agy`) CLIs without provider SDKs, `mcp_bridge.py` exposes local scientific tools over stdio MCP, `workspace.py` owns artifacts, `notes.py` manages the scientific record, and `kernel.py` controls Jupyter. Interface adapters live in `cli/` and `web/`; browser assets are in `web/static/`. Tests and fixtures live in `tests/`.
 
 Treat the generated `.nocturnomath/` workspace directory as runtime data. Do not commit sessions, probe output, knowledge-base entries, documents, or scratch files.
 
@@ -57,7 +57,7 @@ The default research interpreter is the workspace-local `.nocturnomath/venv`, ev
 
 ### Interface behavior
 
-Keep the interface quiet and focused on the scientific record. Derive the model catalogue from the Claude SDK at startup and show resolved model IDs. Do not invent a default or fallback model entry; when discovery returns nothing, show `No model available`. A selected model applies to the next message while preserving the conversation. Keep context enabled by default and place experimental controls in Settings rather than the primary workflow.
+Keep the interface quiet and focused on the scientific record. Discover the model catalogue concurrently across authenticated provider backends (Anthropic, OpenAI, Google) at startup and show resolved model IDs grouped by provider. Do not invent a default or fallback model entry; when discovery returns nothing, show `No model available`. A selected model applies to the next message while preserving the persistent kernel (rebuilding conversation context from the saved record when switching providers). Keep context enabled by default and place experimental controls in Settings rather than the primary workflow.
 
 Verify web behavior with backend/API checks and JavaScript syntax checks. Use browser checks only when they add real value.
 
