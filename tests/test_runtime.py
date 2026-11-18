@@ -1,9 +1,10 @@
 import asyncio
 import os
 import threading
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from conftest import FakeEnvironment, FakeKernel
 
 from nocturnomath.auth import AuthStore
 from nocturnomath.backends import ModelSpec, find_cli_executables
@@ -461,3 +462,135 @@ async def test_empty_model_discovery_clears_active_sessions_and_blocks_queries(s
     assert other.effort is None
     with pytest.raises(ValueError, match="No model available"):
         runtime.start_query("question")
+
+
+@pytest.mark.asyncio
+async def test_colliding_model_ids_stay_bound_to_their_provider_across_refreshes(
+    session,
+):
+    def shared_spec(provider, is_default=False):
+        return ModelSpec(
+            id="shared",
+            raw_id="shared",
+            provider=provider,
+            label="shared",
+            efforts=["low", "high"],
+            is_default=is_default,
+        )
+
+    anthropic = StubBackend(
+        "anthropic",
+        responses=[
+            [],
+            [shared_spec("anthropic", is_default=True)],
+            [],
+            [shared_spec("anthropic", is_default=True)],
+        ],
+    )
+    openai = StubBackend(
+        "openai",
+        responses=[
+            [shared_spec("openai", is_default=True)],
+            [shared_spec("openai")],
+            [shared_spec("openai")],
+            [shared_spec("openai")],
+        ],
+    )
+    runtime = Runtime(
+        session,
+        backends=stub_backends(anthropic=anthropic, openai=openai),
+    )
+
+    # First refresh: only OpenAI reports "shared".
+    await runtime.discover_models()
+    assert runtime.models == ["shared"]
+    assert runtime.model_providers["shared"] == "openai"
+    runtime.set_session_defaults("shared", "low")
+    assert session.workspace.read_config()["default_provider"] == "openai"
+
+    # Second refresh: Anthropic now reports "shared" first, so OpenAI's moves to
+    # "openai/shared". Active model and defaults stay on OpenAI rather than silently
+    # switching to Anthropic.
+    await runtime.discover_models()
+    assert runtime.models == ["shared", "openai/shared"]
+    assert runtime.model == "openai/shared"
+    assert session.model == "openai/shared"
+    assert session.default_model == "openai/shared"
+    assert session.default_provider == "openai"
+
+    # Third refresh: Anthropic drops "shared", so OpenAI returns to unqualified "shared".
+    await runtime.discover_models()
+    assert runtime.models == ["shared"]
+    assert runtime.model == "shared"
+    assert session.model == "shared"
+    assert session.default_model == "shared"
+
+    # Reopening a fresh runtime against saved workspace config ("default_model": "shared",
+    # "default_provider": "openai") resolves "openai/shared" even when Anthropic reports first.
+    reopened = Runtime(
+        backends=stub_backends(anthropic=anthropic, openai=openai),
+    )
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        reopened.open_workspace(session.workspace_path)
+    await reopened.discover_models()
+    assert reopened.models == ["shared", "openai/shared"]
+    assert reopened.model == "openai/shared"
+    assert reopened.session.model == "openai/shared"
+    reopened.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_auth_refresh_discards_stale_catalogue(session):
+    api_entered = asyncio.Event()
+    release_api = asyncio.Event()
+
+    class BlockingOpenAI(StubBackend):
+        async def discover_models(self, auth):
+            self.auth_seen.append(auth)
+            if auth.method == "api_key":
+                api_entered.set()
+                await release_api.wait()
+                return [
+                    ModelSpec(
+                        id="stale-api-model",
+                        raw_id="stale-api-model",
+                        provider="openai",
+                        label="stale-api-model",
+                        efforts=["high"],
+                        is_default=True,
+                    )
+                ]
+            return [
+                ModelSpec(
+                    id="fresh-cli-model",
+                    raw_id="fresh-cli-model",
+                    provider="openai",
+                    label="fresh-cli-model",
+                    efforts=["high"],
+                    is_default=True,
+                )
+            ]
+
+    runtime = Runtime(
+        session,
+        backends=stub_backends(openai=BlockingOpenAI("openai")),
+    )
+    stale_task = asyncio.create_task(
+        runtime.authenticate("openai", "api_key", "secret-key")
+    )
+    await api_entered.wait()
+
+    # Newer auth selection completes while the older API-key discovery is paused.
+    cli_auth = await runtime.authenticate("openai", "cli")
+    assert cli_auth["providers"]["openai"]["method"] == "cli"
+    assert runtime.models == ["fresh-cli-model"]
+
+    # Releasing the older paused discovery must not overwrite the newer CLI catalogue.
+    release_api.set()
+    await stale_task
+    assert runtime.auth.get("openai").method == "cli"
+    assert runtime.models == ["fresh-cli-model"]
+    assert runtime.model == "fresh-cli-model"

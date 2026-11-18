@@ -229,16 +229,32 @@ export function setModelCatalogue(
   // survives a catalogue refresh; otherwise follow the server's model.
   const currentModel = elements.modelSelect.value;
   const currentEffort = elements.effortSelect.value;
+  const currentProvider = state.modelProviders?.[currentModel] || null;
   state.models = models;
   state.modelLabels = labels;
   state.modelEfforts = modelEfforts;
   state.modelProviders = modelProviders;
-  const preferred = [currentModel, serverModel].find((model) => models.includes(model));
+  let resolvedCurrent = null;
+  if (
+    currentModel
+    && models.includes(currentModel)
+    && (!currentProvider || modelProviders[currentModel] === currentProvider)
+  ) {
+    resolvedCurrent = currentModel;
+  } else if (currentModel && currentProvider) {
+    const rawId = currentModel.startsWith(`${currentProvider}/`)
+      ? currentModel.slice(currentProvider.length + 1)
+      : currentModel;
+    resolvedCurrent = [`${currentProvider}/${rawId}`, rawId].find(
+      (candidate) => models.includes(candidate) && modelProviders[candidate] === currentProvider,
+    ) || null;
+  }
+  const preferred = resolvedCurrent || (models.includes(serverModel) ? serverModel : null);
   fillModelSelect(elements.modelSelect, models, labels, preferred, modelProviders);
   setEffortForModel(
     elements.effortSelect,
     elements.modelSelect.value,
-    currentModel === elements.modelSelect.value ? currentEffort : serverEffort,
+    resolvedCurrent && resolvedCurrent === elements.modelSelect.value ? currentEffort : serverEffort,
   );
   if (state.sessionDefaults) setSessionDefaults(state.sessionDefaults);
 }

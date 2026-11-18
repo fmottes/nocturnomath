@@ -123,6 +123,7 @@ class TerminalApp:
         self.initial_python = python
         self.credential_reader = credential_reader
         self.pending_model: str | None = None
+        self.pending_model_provider: str | None = None
         self.status = "idle"
         self.stopped = False
         self._interrupt_task: asyncio.Task | None = None
@@ -575,6 +576,7 @@ class TerminalApp:
             self.error(str(exc))
             return
         self.pending_model = None
+        self.pending_model_provider = None
         await self.runtime.wait_for_query()
         self.close_stream()
         self.clear_spinner()
@@ -694,6 +696,7 @@ class TerminalApp:
             )
             return True
         self.pending_model = argument
+        self.pending_model_provider = runtime.model_providers.get(argument)
         self.write(f"Using {argument} from the next message.")
         return True
 
@@ -752,13 +755,20 @@ class TerminalApp:
         selected = auth["providers"][provider]
         self.write(f"Selected {selected['title']}: {selected['label']}.")
         self.write("Credentials will be checked on your next message.", style="dim")
-        models = self.runtime.models
-        if self.pending_model and self.pending_model not in models:
-            self.write(
-                f"Dropped pending model {self.pending_model}: not in the new catalogue.",
-                style="dim",
+        if self.pending_model:
+            resolved = self.runtime.resolve_model(
+                self.pending_model, self.pending_model_provider
             )
-            self.pending_model = None
+            if resolved is None:
+                self.write(
+                    f"Dropped pending model {self.pending_model}: not in the new catalogue.",
+                    style="dim",
+                )
+                self.pending_model = None
+                self.pending_model_provider = None
+            else:
+                self.pending_model = resolved
+                self.pending_model_provider = self.runtime.model_providers.get(resolved)
         self.check_model(self.runtime.model)
         return True
 

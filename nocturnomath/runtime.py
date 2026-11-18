@@ -61,6 +61,9 @@ class Runtime:
         self.model_efforts: dict[str, list[str]] = {}
         self._provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
         self._models_discovered = False
+        self._auth_revision = 0
+        self._discovery_seq = 0
+        self._published_discovery_seq = 0
         self.sdk_default_model: str | None = None
         self.timeout_s = session.timeout_s if session else timeout_s
         self.image_cap = session.image_cap if session else image_cap
@@ -92,6 +95,7 @@ class Runtime:
     @auth.setter
     def auth(self, auth: AuthStore):
         self._auth = auth
+        self._auth_revision += 1
         for session in self.agents.values():
             session.auth = auth
 
@@ -285,13 +289,21 @@ class Runtime:
 
     async def discover_models(self):
         """Read model catalogues concurrently across all available provider CLIs."""
+        self._discovery_seq += 1
+        run_seq = self._discovery_seq
+        auth_rev = self._auth_revision
+        auth_snapshot = {provider: self.auth.get(provider) for provider in PROVIDERS}
         results = await asyncio.gather(
             *(
-                self.backends[provider].discover_models(self.auth.get(provider))
+                self.backends[provider].discover_models(auth_snapshot[provider])
                 for provider in PROVIDERS
             ),
             return_exceptions=True,
         )
+        if auth_rev != self._auth_revision or run_seq < self._published_discovery_seq:
+            return
+        self._published_discovery_seq = run_seq
+
         models: list[str] = []
         model_labels: dict[str, str] = {}
         model_providers: dict[str, ProviderId] = {}
@@ -321,6 +333,18 @@ class Runtime:
                 if spec.is_default:
                     provider_defaults.append(spec_id)
 
+        previous_providers = dict(self.model_providers)
+        previous_raw_ids = dict(self.model_raw_ids)
+
+        def previous_selection(
+            model_id: str | None, fallback_provider: ProviderId | None = None
+        ) -> tuple[str | None, ProviderId | None]:
+            if model_id and model_id in previous_providers:
+                return previous_raw_ids.get(model_id, model_id), previous_providers[
+                    model_id
+                ]
+            return model_id, fallback_provider
+
         self.models = models
         self.model_labels = model_labels
         self.model_providers = model_providers
@@ -331,7 +355,11 @@ class Runtime:
         self.sdk_default_model = (
             provider_defaults[0] if provider_defaults else models[0] if models else None
         )
-        self.model = self._select_model(self.model or self.startup_default_model)
+        if self.model is not None:
+            model_pref, model_prov = previous_selection(self.model)
+            self.model = self._select_model(model_pref, model_prov)
+        else:
+            self.model = self._select_model(self.startup_default_model)
         self.effort = self._select_effort(self.model, self.effort)
         if self.agents:
             for session in self.agents.values():
@@ -341,26 +369,56 @@ class Runtime:
                 self._apply_workspace_defaults()
             else:
                 for session in self.agents.values():
-                    session.default_model = self._select_model(session.default_model)
+                    def_pref, def_prov = previous_selection(
+                        session.default_model, session.default_provider
+                    )
+                    session.default_model = self._select_model(def_pref, def_prov)
+                    session.default_provider = self.model_providers.get(
+                        session.default_model or ""
+                    )
                     session.default_effort = self._select_effort(
                         session.default_model, session.default_effort
                     )
-                    session.model = self._select_model(session.model)
+                    sess_pref, sess_prov = previous_selection(session.model)
+                    session.model = self._select_model(sess_pref, sess_prov)
                     session.effort = self._select_effort(session.model, session.effort)
         self._wake_slurm_monitor()
 
-    def _select_model(self, preferred: str | None) -> str | None:
-        if preferred in self.models:
-            return preferred
-        if isinstance(preferred, str) and "/" in preferred:
-            provider, _, raw = preferred.partition("/")
+    def resolve_model(
+        self, preferred: str | None, preferred_provider: ProviderId | None = None
+    ) -> str | None:
+        if not preferred or not self.models:
+            return None
+        explicit_provider: ProviderId | None = None
+        explicit_raw = preferred
+        if "/" in preferred:
+            prefix, _, rest = preferred.partition("/")
+            if prefix in PROVIDERS:
+                explicit_provider = prefix
+                explicit_raw = rest
+        target_provider = preferred_provider or explicit_provider
+        target_raw = explicit_raw if explicit_provider else preferred
+        if target_provider is not None:
+            if (
+                preferred in self.models
+                and self.model_providers.get(preferred) == target_provider
+            ):
+                return preferred
             for spec_id in self.models:
                 if (
-                    self.model_providers.get(spec_id) == provider
-                    and self.model_raw_ids.get(spec_id) == raw
+                    self.model_providers.get(spec_id) == target_provider
+                    and self.model_raw_ids.get(spec_id) == target_raw
                 ):
                     return spec_id
-        return self.sdk_default_model
+            return None
+        return preferred if preferred in self.models else None
+
+    def _select_model(
+        self, preferred: str | None, preferred_provider: ProviderId | None = None
+    ) -> str | None:
+        return (
+            self.resolve_model(preferred, preferred_provider) or self.sdk_default_model
+        )
 
     def _select_effort(self, model: str | None, preferred: str | None) -> str | None:
         levels = self.model_efforts.get(model or "", [])
@@ -371,53 +429,52 @@ class Runtime:
         return levels[0] if levels else None
 
     def _apply_workspace_defaults(self):
-        session = self.require_session()
-        config = session.workspace.read_config()
-        configured_model = config.get("default_model")
-        model_preference = (
-            configured_model
-            if isinstance(configured_model, str)
-            else self.startup_default_model
+        default_model, default_effort, default_provider = self._workspace_defaults(
+            self.require_session()
         )
-        default_model = self._select_model(model_preference)
-        configured_effort = config.get("default_effort")
-        effort_preference = (
-            configured_effort
-            if isinstance(configured_effort, str)
-            else self.startup_default_effort
-        )
-        default_effort = self._select_effort(default_model, effort_preference)
         for session in self.agents.values():
-            self._apply_defaults_to(session, default_model, default_effort)
+            self._apply_defaults_to(
+                session, default_model, default_effort, default_provider
+            )
         self.model = default_model
         self.effort = default_effort
         self._workspace_defaults_pending = False
 
     @staticmethod
     def _apply_defaults_to(
-        session: ExplorationSession, model: str | None, effort: str | None
+        session: ExplorationSession,
+        model: str | None,
+        effort: str | None,
+        provider: ProviderId | None = None,
     ):
         session.default_model = model
         session.default_effort = effort
+        session.default_provider = provider
         session.model = model
         session.effort = effort
 
     def _workspace_defaults(
         self, session: ExplorationSession
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, ProviderId | None]:
         config = session.workspace.read_config()
-        model = self._select_model(
-            config.get("default_model")
-            if isinstance(config.get("default_model"), str)
-            else self.startup_default_model
-        )
+        configured_model = config.get("default_model")
+        if isinstance(configured_model, str):
+            model_preference: str | None = configured_model
+            configured_provider = config.get("default_provider")
+            provider_preference: ProviderId | None = (
+                configured_provider if configured_provider in PROVIDERS else None
+            )
+        else:
+            model_preference = self.startup_default_model
+            provider_preference = None
+        model = self._select_model(model_preference, provider_preference)
         effort = self._select_effort(
             model,
             config.get("default_effort")
             if isinstance(config.get("default_effort"), str)
             else self.startup_default_effort,
         )
-        return model, effort
+        return model, effort, self.model_providers.get(model or "")
 
     def set_session_defaults(self, model: str, effort: str | None):
         session = self.require_session()
@@ -428,10 +485,12 @@ class Runtime:
             raise ValueError("Choose an effort supported by the selected model.")
         if supported and effort is None:
             raise ValueError("Choose an effort supported by the selected model.")
-        session.set_session_defaults(model, effort)
+        provider = self.model_providers.get(model)
+        session.set_session_defaults(model, effort, provider=provider)
         for other in self.agents.values():
             other.default_model = model
             other.default_effort = effort
+            other.default_provider = provider
 
     def reset_session(self):
         """Start a session with the workspace's configured defaults."""
@@ -450,6 +509,7 @@ class Runtime:
         """
         self.require_all_idle("change authentication")
         self.auth.set(provider, method, credential)
+        self._auth_revision += 1
         await self.discover_models()
         return self.auth.public(self._provider_models)
 
@@ -581,8 +641,12 @@ class Runtime:
             self.primary_agent_id = agent_id
             self.session = session
         if self.models:
-            default_model, default_effort = self._workspace_defaults(session)
-            self._apply_defaults_to(session, default_model, default_effort)
+            default_model, default_effort, default_provider = self._workspace_defaults(
+                session
+            )
+            self._apply_defaults_to(
+                session, default_model, default_effort, default_provider
+            )
         self._subscribe_to_agent(agent_id, session)
         return agent_id
 

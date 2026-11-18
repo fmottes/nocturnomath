@@ -56,6 +56,7 @@ class ExplorationSession:
         self.effort = effort or DEFAULT_EFFORT
         self.default_model = model
         self.default_effort: str | None = self.effort
+        self.default_provider: ProviderId | None = None
         self.timeout_s = timeout_s
         self.image_cap = image_cap
         self.auth = auth or AuthStore()
@@ -296,11 +297,20 @@ class ExplorationSession:
         )
         return self.documents_default
 
-    def set_session_defaults(self, model: str, effort: str | None):
+    def set_session_defaults(
+        self,
+        model: str,
+        effort: str | None,
+        provider: ProviderId | None = None,
+    ):
         """Persist the model and effort applied when the next session starts."""
         self.default_model = model
         self.default_effort = effort
-        self.workspace.update_config(default_model=model, default_effort=effort)
+        self.default_provider = provider
+        updates: dict[str, Any] = {"default_model": model, "default_effort": effort}
+        if provider is not None:
+            updates["default_provider"] = provider
+        self.workspace.update_config(**updates)
 
     @property
     def exploration_prompt_override(self) -> str | None:

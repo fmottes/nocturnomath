@@ -750,3 +750,54 @@ async def test_auth_drops_pending_model_when_catalogue_becomes_empty(terminal):
     output = terminal.output()
     assert terminal.app.pending_model is None
     assert "Dropped pending model sonnet" in output
+
+
+@pytest.mark.asyncio
+async def test_pending_model_stays_bound_to_provider_across_auth_refresh(terminal):
+    from nocturnomath.backends import ModelSpec
+
+    def shared(provider):
+        return ModelSpec(
+            id="shared",
+            raw_id="shared",
+            provider=provider,
+            label="shared",
+            efforts=["high"],
+            is_default=True,
+        )
+
+    class CollidingBackend:
+        def __init__(self, provider, responses):
+            self.provider = provider
+            self.uses_compact_hook = provider == "anthropic"
+            self.responses = list(responses)
+
+        async def discover_models(self, auth):
+            return (
+                self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+            )
+
+    terminal.runtime.backends = {
+        "anthropic": CollidingBackend(
+            "anthropic", [[], [shared("anthropic")], [shared("anthropic")]]
+        ),
+        "openai": CollidingBackend(
+            "openai", [[shared("openai")], [shared("openai")], []]
+        ),
+        "google": CollidingBackend("google", [[]]),
+    }
+    await terminal.runtime.discover_models()
+    assert terminal.runtime.models == ["shared"]
+    await terminal.run("/model shared")
+    assert terminal.app.pending_model == "shared"
+    assert terminal.app.pending_model_provider == "openai"
+
+    terminal.app.credential_reader = lambda _prompt: "sk-ant-token"
+    await terminal.run("/auth anthropic subscription")
+    assert terminal.runtime.models == ["shared", "openai/shared"]
+    assert terminal.app.pending_model == "openai/shared"
+    assert terminal.app.pending_model_provider == "openai"
+
+    await terminal.run("/auth openai cli")
+    assert terminal.app.pending_model is None
+    assert "Dropped pending model openai/shared" in terminal.output()
