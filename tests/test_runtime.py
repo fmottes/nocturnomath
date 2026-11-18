@@ -1444,3 +1444,119 @@ async def test_manual_resume_and_replace_agent_restore_saved_chat_model_and_same
     assert replaced.model == "gpt-5.4"
     assert replaced.effort == "high"
     assert runtime.model == "gpt-5.4"
+
+
+@pytest.mark.asyncio
+async def test_partial_refresh_and_unavailable_resume_use_owner_then_workspace_default(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+    from nocturnomath.session import ExplorationSession
+
+    claude_spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="claude-sonnet-5",
+        efforts=["medium"],
+        is_default=True,
+    )
+    openai_spec = ModelSpec(
+        id="gpt-5.4",
+        raw_id="gpt-5.4",
+        provider="openai",
+        label="GPT-5.4",
+        efforts=["medium", "high"],
+    )
+    gemini_spec = ModelSpec(
+        id="gemini-4-carbon",
+        raw_id="gemini-4-carbon",
+        provider="google",
+        label="Gemini 4 Carbon",
+        efforts=["medium", "high"],
+    )
+
+    class ActiveOpenAI(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    def make_session(**kwargs):
+        with (
+            patch("nocturnomath.session.Kernel", FakeKernel),
+            patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+        ):
+            return ExplorationSession(**kwargs)
+
+    runtime = Runtime(
+        session,
+        session_factory=make_session,
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic",
+                responses=[[claude_spec], [claude_spec], [claude_spec]],
+            ),
+            openai=ActiveOpenAI(
+                "openai",
+                responses=[[openai_spec], [openai_spec], []],
+            ),
+            google=StubBackend(
+                "google",
+                responses=[[gemini_spec], [], [gemini_spec]],
+            ),
+        ),
+    )
+
+    # 1. Initial discovery + save Gemini as workspace default + run a turn on OpenAI.
+    await runtime.discover_models()
+    runtime.set_session_defaults("gemini-4-carbon", "medium", provider="google")
+    assert (
+        runtime.start_query("turn on openai", "gpt-5.4", "high", provider="openai")
+        == "started"
+    )
+    await runtime.wait_for_query()
+    assert session._active_provider == "openai"
+    assert (session.model, session.effort) == ("gpt-5.4", "high")
+
+    # 2. Unsent Google selection disappears while OpenAI owner + Claude remain:
+    # falls back to chat owner (OpenAI) first.
+    session.model = "gemini-4-carbon"
+    session.effort = "medium"
+    await runtime.discover_models()
+    assert (session.model, session.effort) == ("gpt-5.4", "high")
+    assert (runtime.model, runtime.effort) == ("gpt-5.4", "high")
+
+    # 3. OpenAI disappears while Claude (sdk_default_model) and configured workspace
+    # default Gemini remain: falls back to workspace default (Gemini), not Claude.
+    await runtime.discover_models()
+    assert (session.model, session.effort) == ("gemini-4-carbon", "medium")
+    assert (runtime.model, runtime.effort) == ("gemini-4-carbon", "medium")
+
+    # 4. Manual resume of S001 (OpenAI unavailable) from a tab on Claude falls back
+    # to the configured workspace default rather than keeping Claude.
+    runtime.reset_session()
+    session.model = "claude-sonnet-5"
+    session.effort = "medium"
+    runtime.model = "claude-sonnet-5"
+    runtime.effort = "medium"
+
+    resumed = runtime.resume_session("S001")
+    assert (session.model, session.effort) == ("gemini-4-carbon", "medium")
+    assert (runtime.model, runtime.effort) == ("gemini-4-carbon", "medium")
+    assert (resumed["model"], resumed["effort"]) == ("gemini-4-carbon", "medium")
+
+    runtime.reset_session()
+    runtime.session.model = "claude-sonnet-5"
+    runtime.session.effort = "medium"
+    runtime.model = "claude-sonnet-5"
+    runtime.effort = "medium"
+
+    _, replaced_data, _ = runtime.replace_agent(runtime.primary_agent_id, "S001")
+    replaced = runtime.session
+    assert (replaced.model, replaced.effort) == ("gemini-4-carbon", "medium")
+    assert (runtime.model, runtime.effort) == ("gemini-4-carbon", "medium")
+    assert (replaced_data["model"], replaced_data["effort"]) == (
+        "gemini-4-carbon",
+        "medium",
+    )

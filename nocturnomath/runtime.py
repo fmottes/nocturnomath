@@ -594,7 +594,26 @@ class Runtime:
                     session.default_model = default_model
                     session.default_provider = default_provider
                     session.default_effort = default_effort
-                    if session.model is None:
+                    resolved_current: str | None = None
+                    if session.model is not None:
+                        sess_pref, sess_prov = previous_selection(session.model)
+                        if sess_prov is not None:
+                            resolved_current = self.resolve_model(sess_pref, sess_prov)
+                            if resolved_current is None:
+                                prov_models = self._provider_models.get(sess_prov, [])
+                                if prov_models:
+                                    resolved_current = (
+                                        self._provider_default_models.get(sess_prov)
+                                        or prov_models[0]
+                                    )
+                        else:
+                            resolved_current = self.resolve_model(sess_pref, None)
+                    if resolved_current is not None:
+                        session.model = resolved_current
+                        session.effort = self._select_effort(
+                            session.model, session.effort
+                        )
+                    else:
                         owner_provider = (
                             session._active_provider or session._owner_provider
                         )
@@ -613,12 +632,6 @@ class Runtime:
                         else:
                             session.model = default_model
                             session.effort = default_effort
-                    else:
-                        sess_pref, sess_prov = previous_selection(session.model)
-                        session.model = self._select_model(sess_pref, sess_prov)
-                        session.effort = self._select_effort(
-                            session.model, session.effort
-                        )
                 if self.session is not None:
                     self.model = self.session.model
                     self.effort = self.session.effort
@@ -686,8 +699,13 @@ class Runtime:
             self._apply_defaults_to(
                 session, default_model, default_effort, default_provider
             )
-        self.model = default_model
-        self.effort = default_effort
+            self._apply_resumed_owner_model(session)
+        if self.session is not None:
+            self.model = self.session.model
+            self.effort = self.session.effort
+        else:
+            self.model = default_model
+            self.effort = default_effort
         self._workspace_defaults_pending = False
 
     @staticmethod
@@ -805,6 +823,13 @@ class Runtime:
         """Resume a recorded chat onto the active explorer and restore its owner model."""
         session = self.require_session()
         data = session.resume_session(session_id, restore_kernel)
+        if self.models or self._models_discovered:
+            default_model, default_effort, default_provider = self._workspace_defaults(
+                session
+            )
+            self._apply_defaults_to(
+                session, default_model, default_effort, default_provider
+            )
         self._apply_resumed_owner_model(session)
         self.model = session.model
         self.effort = session.effort
@@ -1064,6 +1089,13 @@ class Runtime:
         except Exception:
             replacement.shutdown()
             raise
+        if self.models or self._models_discovered:
+            default_model, default_effort, default_provider = self._workspace_defaults(
+                replacement
+            )
+            self._apply_defaults_to(
+                replacement, default_model, default_effort, default_provider
+            )
         self._apply_resumed_owner_model(replacement)
         self._unsubscribe_agent(agent_id)
         old.shutdown()
