@@ -460,18 +460,17 @@ class GoogleBackend:
             stderr=stderr,
         )
         if effort:
-            with suppress(RuntimeError):
-                await self._rpc(
-                    proc,
-                    messages,
-                    "session/set_config_option",
-                    {
-                        "sessionId": session_id,
-                        "configId": "thought_level",
-                        "value": effort,
-                    },
-                    stderr=stderr,
-                )
+            await self._rpc(
+                proc,
+                messages,
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": "thought_level",
+                    "value": effort,
+                },
+                stderr=stderr,
+            )
 
     async def run_turn(
         self,

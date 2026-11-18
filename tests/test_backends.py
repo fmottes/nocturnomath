@@ -927,3 +927,53 @@ async def test_terminate_process_drains_paused_stdout_after_sigkill():
             proc.kill()
             await proc.wait()
         await stderr.close()
+
+
+@pytest.mark.asyncio
+async def test_google_backend_surfaces_rejected_effort_in_fallback_config(tmp_path):
+    log_path = tmp_path / "google_config_log.json"
+    fake = _write_fake_cli(
+        tmp_path / "agy",
+        f"""
+import json, os, sys
+log_path = {str(log_path)!r}
+methods = json.loads(open(log_path).read()) if os.path.exists(log_path) else []
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    methods.append(method)
+    open(log_path, "w").write(json.dumps(methods))
+    if method == "initialize":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"protocolVersion": 1}}}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": "agy-cfg"}}}}), flush=True)
+    elif method == "session/set_model":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "error": {{"code": -32601, "message": "set_model unsupported"}}}}), flush=True)
+    elif method == "session/set_config_option":
+        if msg["params"]["configId"] == "model":
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+        elif msg["params"]["configId"] == "thought_level":
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "error": {{"code": -32602, "message": "Unsupported thought_level: high"}}}}), flush=True)
+""",
+    )
+    backend = GoogleBackend(cli_path=fake)
+    auth = ProviderAuth("google", "cli")
+
+    with pytest.raises(RuntimeError, match="Unsupported thought_level: high"):
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=auth,
+        ):
+            pass
+
+    seen_methods = json.loads(log_path.read_text())
+    assert "session/set_model" in seen_methods
+    assert seen_methods.count("session/set_config_option") == 2
+    assert "session/prompt" not in seen_methods
