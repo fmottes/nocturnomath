@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, SecretStr
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from ..auth import ProviderId
+from ..backends import AgentBackend
 from ..session import ExplorationSession
 from .runtime import WebRuntime
 
@@ -90,7 +92,8 @@ class ExplorationPromptRequest(BaseModel):
 
 
 class AuthRequest(BaseModel):
-    method: Literal["claude_code", "subscription", "api_key"]
+    provider: Literal["anthropic", "openai", "google"]
+    method: Literal["cli", "subscription", "api_key"]
     credential: SecretStr | None = None
 
 
@@ -105,6 +108,7 @@ def create_app(
     navigator_root: Path | str = ".",
     python: str | None = None,
     session_factory: Callable[..., ExplorationSession] = ExplorationSession,
+    backends: Mapping[ProviderId, AgentBackend] | None = None,
 ) -> FastAPI:
     """Build the dashboard without opening a workspace until the user chooses one."""
     runtime = WebRuntime(
@@ -115,6 +119,7 @@ def create_app(
         image_cap=image_cap,
         navigator_root=navigator_root,
         session_factory=session_factory,
+        backends=backends,
     )
 
     initial_python = python
@@ -310,10 +315,11 @@ def create_app(
 
     def auth_payload():
         return {
-            "auth": runtime.auth.public(),
+            "auth": runtime.auth.public(runtime._provider_models),
             "model": runtime.session.model if runtime.session else runtime.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,
+            "model_providers": runtime.model_providers,
             "model_efforts": runtime.model_efforts,
             "effort": runtime.session.effort if runtime.session else runtime.effort,
             "session_defaults": (
@@ -338,13 +344,17 @@ def create_app(
             else None
         )
         try:
-            await runtime.authenticate(auth_request.method, credential)
+            await runtime.authenticate(
+                auth_request.provider, auth_request.method, credential
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         data = auth_payload()
-        await runtime.broadcast("auth_changed", data)
+        await runtime.broadcast(
+            "auth_changed", {"provider": auth_request.provider, **data}
+        )
         return data
 
     @app.post("/api/exit")

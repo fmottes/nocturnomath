@@ -1,4 +1,4 @@
-import { elements, state } from "./state.js?v=20261016-3";
+import { elements, state } from "./state.js?v=20261117-1";
 import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
 import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
@@ -45,6 +45,7 @@ export function applyWorkspace(ws) {
     selected?.model || ws.model,
     ws.model_efforts || {},
     selected?.effort || ws.effort,
+    ws.model_providers || {},
   );
   setSessionDefaults(ws.session_defaults);
   setExplorationPrompt(ws.exploration_prompt, ws.exploration_prompt_is_custom);
@@ -100,22 +101,88 @@ export function showLanding(ws) {
   renderRecentWorkspaces();
 }
 
+const PROVIDER_ORDER = ["anthropic", "openai", "google"];
+const PROVIDER_TITLES = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+};
+
 export function setAuthStatus(auth) {
   if (!auth) return;
   state.auth = auth;
-  const label = auth.label || "Claude authentication";
-  elements.btnAuth.textContent = label;
-  elements.btnAuthLanding.textContent = label;
-  elements.authSummary.textContent = `Current: ${label}.${auth.note ? ` ${auth.note}` : ""}`;
-  elements.authCurrent.textContent = `Current: ${label}`;
-  elements.authNote.textContent = auth.note || "";
-  elements.authNote.classList.toggle("hidden", !auth.note);
+  const label = auth.label || "Model provider authentication";
+  elements.btnAuth.textContent = "Auth";
+  elements.btnAuth.title = label;
+  elements.btnAuthLanding.textContent = "Auth";
+  elements.btnAuthLanding.title = label;
+
+  const providers = auth.providers || {};
+  const lines = PROVIDER_ORDER
+    .map((id) => providers[id])
+    .filter(Boolean)
+    .map((info) => {
+      const title = info.title || PROVIDER_TITLES[info.provider] || info.provider;
+      const count = Number.isInteger(info.models_count)
+        ? ` (${info.models_count} ${info.models_count === 1 ? "model" : "models"})`
+        : "";
+      const note = info.note ? ` — ${info.note}` : "";
+      return `${title}: ${info.label}${count}${note}`;
+    });
+  elements.authSummary.textContent = lines.length
+    ? lines.join(" · ")
+    : `Current: ${label}`;
+
+  const activeProvider = elements.authProvider?.value || "anthropic";
+  const active = providers[activeProvider];
+  elements.authCurrent.textContent = active
+    ? `Current (${active.title || PROVIDER_TITLES[activeProvider] || activeProvider}): ${active.label}`
+    : `Current: ${label}`;
+  const noteText = active?.note || "";
+  elements.authNote.textContent = noteText;
+  elements.authNote.classList.toggle("hidden", !noteText);
 }
 
-function fillModelSelect(select, models, labels, preferred) {
-  select.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
-  if (!models.length) select.add(new Option("No model available", ""));
-  select.disabled = !models.length;
+function fillModelSelect(select, models, labels, preferred, providers = {}) {
+  if (!models.length) {
+    select.replaceChildren(new Option("No model available", ""));
+    select.disabled = true;
+    select.value = "";
+    return;
+  }
+
+  const grouped = new Map();
+  const ungrouped = [];
+  for (const model of models) {
+    const provider = providers[model];
+    if (provider) {
+      if (!grouped.has(provider)) grouped.set(provider, []);
+      grouped.get(provider).push(model);
+    } else {
+      ungrouped.push(model);
+    }
+  }
+
+  const orderedProviders = [
+    ...PROVIDER_ORDER.filter((provider) => grouped.has(provider)),
+    ...[...grouped.keys()].filter((provider) => !PROVIDER_ORDER.includes(provider)),
+  ];
+
+  const nodes = [];
+  for (const provider of orderedProviders) {
+    const group = document.createElement("optgroup");
+    group.label = PROVIDER_TITLES[provider] || provider;
+    for (const model of grouped.get(provider)) {
+      group.appendChild(new Option(labels[model] || model, model));
+    }
+    nodes.push(group);
+  }
+  for (const model of ungrouped) {
+    nodes.push(new Option(labels[model] || model, model));
+  }
+
+  select.replaceChildren(...nodes);
+  select.disabled = false;
   select.value = models.includes(preferred) ? preferred : models[0] || "";
 }
 
@@ -139,7 +206,13 @@ export function setActiveModelAndEffort(model, effort) {
 export function setSessionDefaults(defaults) {
   state.sessionDefaults = defaults || null;
   const preferredModel = defaults?.model || state.models[0] || "";
-  fillModelSelect(elements.defaultModelSelect, state.models, state.modelLabels, preferredModel);
+  fillModelSelect(
+    elements.defaultModelSelect,
+    state.models,
+    state.modelLabels,
+    preferredModel,
+    state.modelProviders,
+  );
   setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value, defaults?.effort);
   elements.sessionDefaultsSave.disabled = !state.models.length;
 }
@@ -150,6 +223,7 @@ export function setModelCatalogue(
   serverModel = null,
   modelEfforts = {},
   serverEffort = null,
+  modelProviders = {},
 ) {
   // The dropdown decides the model of the next message, so an unsent choice
   // survives a catalogue refresh; otherwise follow the server's model.
@@ -158,8 +232,9 @@ export function setModelCatalogue(
   state.models = models;
   state.modelLabels = labels;
   state.modelEfforts = modelEfforts;
+  state.modelProviders = modelProviders;
   const preferred = [currentModel, serverModel].find((model) => models.includes(model));
-  fillModelSelect(elements.modelSelect, models, labels, preferred);
+  fillModelSelect(elements.modelSelect, models, labels, preferred, modelProviders);
   setEffortForModel(
     elements.effortSelect,
     elements.modelSelect.value,

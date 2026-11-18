@@ -10,58 +10,101 @@ from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from nocturnomath.prompt import DEFAULT_EXPLORATION_PROMPT, RUNTIME_PROMPT
+from nocturnomath.backends import ModelSpec
+from nocturnomath.prompt import (
+    DEFAULT_EXPLORATION_PROMPT,
+    RUNTIME_PROMPT,
+    build_system_prompt,
+)
 from nocturnomath.session import ExplorationSession
 from nocturnomath.web import create_app
 
 
+class FakeWebBackend:
+    def __init__(self, provider, models=None, error=None):
+        self.provider = provider
+        self.uses_compact_hook = provider == "anthropic"
+        self.models = list(models or [])
+        self.error = error
+        self.auth_seen = []
+        self.turn_calls = 0
+
+    async def discover_models(self, auth):
+        self.auth_seen.append(auth)
+        if self.error is not None:
+            raise self.error
+        return list(self.models)
+
+    async def run_turn(self, *args, **kwargs):
+        self.turn_calls += 1
+        if False:
+            yield None
+
+    async def compact(self, *args, **kwargs):
+        return None
+
+
 @pytest.fixture(autouse=True)
-def sdk_model_catalog():
+def backend_model_catalog():
+    backends = {
+        "anthropic": FakeWebBackend(
+            "anthropic",
+            models=[
+                ModelSpec(
+                    id="claude-opus-5",
+                    raw_id="claude-opus-5",
+                    provider="anthropic",
+                    label="claude-opus-5",
+                    efforts=["low", "medium", "high", "xhigh", "max"],
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="claude-sonnet-5",
+                    efforts=["low", "medium", "high", "xhigh"],
+                ),
+            ],
+        ),
+        "openai": FakeWebBackend(
+            "openai",
+            models=[
+                ModelSpec(
+                    id="gpt-6",
+                    raw_id="gpt-6",
+                    provider="openai",
+                    label="gpt-6",
+                    efforts=["low", "medium", "high", "ultra"],
+                    is_default=True,
+                )
+            ],
+        ),
+        "google": FakeWebBackend("google", models=[]),
+    }
     with (
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
-        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
+        patch("nocturnomath.runtime.default_backends", return_value=backends),
     ):
-        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-            return_value={
-                "models": [
-                    {
-                        "value": "default",
-                        "displayName": "Default (recommended)",
-                        "resolvedModel": "claude-opus-5",
-                        "supportedEffortLevels": [
-                            "low",
-                            "medium",
-                            "high",
-                            "xhigh",
-                            "max",
-                        ],
-                    },
-                    {
-                        "value": "sonnet",
-                        "displayName": "Sonnet",
-                        "resolvedModel": "claude-sonnet-5",
-                        "supportedEffortLevels": [
-                            "low",
-                            "medium",
-                            "high",
-                            "xhigh",
-                        ],
-                    },
-                ]
-            }
-        )
-        yield sdk
+        yield backends
 
 
-def test_startup_discovers_models_without_querying(sdk_model_catalog):
+def test_startup_discovers_models_without_querying(backend_model_catalog):
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
-        assert snapshot["models"] == ["claude-opus-5", "claude-sonnet-5"]
+        assert snapshot["models"] == ["claude-opus-5", "claude-sonnet-5", "gpt-6"]
         assert snapshot["model_labels"]["claude-sonnet-5"] == "claude-sonnet-5"
+        assert snapshot["model_providers"] == {
+            "claude-opus-5": "anthropic",
+            "claude-sonnet-5": "anthropic",
+            "gpt-6": "openai",
+        }
         assert snapshot["model"] == "claude-opus-5"
         assert snapshot["effort"] == "high"
         assert snapshot["model_efforts"]["claude-opus-5"][-1] == "max"
-        sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
+        assert all(
+            backend.turn_calls == 0 for backend in backend_model_catalog.values()
+        )
 
 
 def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
@@ -121,15 +164,25 @@ def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
         assert sum(record["kind"] == "user" for record in records) == 1
 
 
-def test_startup_uses_first_model_when_sdk_has_no_resolved_default(sdk_model_catalog):
-    sdk_model_catalog.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-        return_value={
-            "models": [
-                {"value": "sonnet", "resolvedModel": "claude-sonnet-5"},
-                {"value": "opus", "resolvedModel": "claude-opus-5"},
-            ]
-        }
-    )
+def test_startup_uses_first_model_when_backend_has_no_explicit_default(
+    backend_model_catalog,
+):
+    backend_model_catalog["anthropic"].models = [
+        ModelSpec(
+            id="claude-sonnet-5",
+            raw_id="claude-sonnet-5",
+            provider="anthropic",
+            label="claude-sonnet-5",
+        ),
+        ModelSpec(
+            id="claude-opus-5",
+            raw_id="claude-opus-5",
+            provider="anthropic",
+            label="claude-opus-5",
+        ),
+    ]
+    backend_model_catalog["openai"].models = []
+    backend_model_catalog["google"].models = []
 
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
@@ -148,7 +201,7 @@ def test_startup_opens_the_dashboard_in_a_new_tab():
 
 
 def test_authentication_can_be_changed_before_opening_a_workspace(
-    sdk_model_catalog,
+    backend_model_catalog,
 ):
     with (
         TestClient(create_app()) as client,
@@ -157,43 +210,97 @@ def test_authentication_can_be_changed_before_opening_a_workspace(
         websocket.receive_json()
         response = client.post(
             "/api/auth",
-            json={"method": "subscription", "credential": "oauth-secret"},
+            json={
+                "provider": "anthropic",
+                "method": "subscription",
+                "credential": "oauth-secret",
+            },
         )
         event = websocket.receive_json()
 
         assert response.status_code == 200
-        assert response.json()["auth"]["method"] == "subscription"
-        assert response.json()["models"] == [
+        payload = response.json()
+        assert payload["auth"]["providers"]["anthropic"]["method"] == "subscription"
+        assert payload["models"] == [
             "claude-opus-5",
             "claude-sonnet-5",
+            "gpt-6",
         ]
-        assert response.json()["model"] == "claude-opus-5"
+        assert payload["model"] == "claude-opus-5"
         assert "oauth-secret" not in response.text
         assert event["type"] == "auth_changed"
-        assert event["auth"]["method"] == "subscription"
+        assert event["provider"] == "anthropic"
+        assert event["auth"]["providers"]["anthropic"]["method"] == "subscription"
         assert "oauth-secret" not in repr(event)
 
-        options = sdk_model_catalog.call_args.args[0]
-        assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
-        assert options.env["ANTHROPIC_API_KEY"] == ""
+        seen_env = backend_model_catalog["anthropic"].auth_seen[-1].sdk_env()
+        assert seen_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
+        assert seen_env["ANTHROPIC_API_KEY"] == ""
+
+        openai_response = client.post(
+            "/api/auth",
+            json={
+                "provider": "openai",
+                "method": "api_key",
+                "credential": "openai-secret",
+            },
+        )
+        openai_event = websocket.receive_json()
+        assert openai_response.status_code == 200
+        assert (
+            openai_response.json()["auth"]["providers"]["openai"]["method"] == "api_key"
+        )
+        assert "openai-secret" not in openai_response.text
+        assert openai_event["provider"] == "openai"
+        assert "openai-secret" not in repr(openai_event)
+        assert (
+            backend_model_catalog["openai"].auth_seen[-1].sdk_env()["OPENAI_API_KEY"]
+            == "openai-secret"
+        )
 
 
 def test_authentication_rejects_missing_secrets_and_foreign_origins():
     with TestClient(create_app()) as client:
-        missing = client.post("/api/auth", json={"method": "api_key"})
+        missing = client.post(
+            "/api/auth", json={"provider": "openai", "method": "api_key"}
+        )
         assert missing.status_code == 400
         assert "API key" in missing.json()["detail"]
 
+        disallowed = client.post(
+            "/api/auth",
+            json={
+                "provider": "google",
+                "method": "subscription",
+                "credential": "secret",
+            },
+        )
+        assert disallowed.status_code == 400
+        assert "secret" not in disallowed.text
+
         foreign = client.post(
             "/api/auth",
-            json={"method": "api_key", "credential": "secret"},
+            json={
+                "provider": "anthropic",
+                "method": "api_key",
+                "credential": "secret",
+            },
             headers={"Origin": "https://elsewhere.example"},
         )
         assert foreign.status_code == 403
 
         for body in (
-            {"method": "secret-invalid-method", "credential": "secret"},
-            {"method": "api_key", "credential": {"key": "secret"}},
+            {
+                "provider": "anthropic",
+                "method": "secret-invalid-method",
+                "credential": "secret",
+            },
+            {"provider": "invalid", "method": "cli", "credential": "secret"},
+            {
+                "provider": "openai",
+                "method": "api_key",
+                "credential": {"key": "secret"},
+            },
         ):
             invalid = client.post("/api/auth", json=body)
             assert invalid.status_code == 422
@@ -206,6 +313,9 @@ def test_authentication_ui_is_served_without_embedding_credentials():
         page = client.get("/").text
         assert 'id="btn-auth-landing"' in page
         assert 'id="auth-modal"' in page
+        assert 'id="auth-provider"' in page
+        assert 'value="openai"' in page
+        assert 'value="google"' in page
         assert 'type="password"' in page
         external_scripts = re.findall(
             r'<script\b[^>]*src="https://[^>]+></script>', page
@@ -215,14 +325,14 @@ def test_authentication_ui_is_served_without_embedding_credentials():
         assert all('crossorigin="anonymous"' in tag for tag in external_scripts)
 
 
-def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
-    sdk_model_catalog.return_value.__aenter__.side_effect = RuntimeError(
-        "SDK unavailable"
-    )
+def test_model_discovery_failure_has_no_fallback(backend_model_catalog):
+    for backend in backend_model_catalog.values():
+        backend.error = RuntimeError("CLI unavailable")
     with TestClient(create_app(model="custom-model")) as client:
         snapshot = client.get("/api/workspace").json()
         assert snapshot["models"] == []
         assert snapshot["model"] is None
+        assert snapshot["model_providers"] == {}
 
 
 NoopKernel = FakeKernel
@@ -596,7 +706,7 @@ def test_scientific_prompt_is_saved_per_project_and_runtime_rules_stay_fixed(
             "exploration_prompt": "Check the signal.",
             "exploration_prompt_is_custom": True,
         }
-        assert session._client_options().system_prompt == (
+        assert build_system_prompt(session.exploration_prompt) == (
             "Check the signal.\n\n" + RUNTIME_PROMPT.strip() + "\n"
         )
         assert (
@@ -691,7 +801,11 @@ def test_busy_http_mutations_return_conflict(session):
         assert (
             client.post(
                 "/api/auth",
-                json={"method": "api_key", "credential": "secret"},
+                json={
+                    "provider": "anthropic",
+                    "method": "api_key",
+                    "credential": "secret",
+                },
             ).status_code
             == 409
         )

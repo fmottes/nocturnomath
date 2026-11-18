@@ -1,4 +1,4 @@
-import { elements, state } from "./state.js?v=20261016-3";
+import { elements, state } from "./state.js?v=20261117-1";
 import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261030-1";
 
 // ============================================================================
@@ -250,7 +250,7 @@ function renderRecords(records, isBusy = false) {
         break;
 
       case "compaction":
-        appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
+        appendSystemMessage("This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing.");
         break;
 
       case "packages_installed":

@@ -45,7 +45,7 @@
           <span class="brand-icon landing-brand-icon" aria-hidden="true"></span>
         </div>
         <div class="landing-actions">
-          <button class="btn btn-xs btn-ghost" id="btn-auth-landing" type="button">Claude</button>
+          <button class="btn btn-xs btn-ghost" id="btn-auth-landing" type="button">Auth</button>
           <button class="btn btn-xs btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
         </div>
       </div>
@@ -108,7 +108,7 @@
       <!-- Controls & Status -->
       <div class="header-right">
         <button class="btn btn-sm btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
-        <button class="btn btn-sm btn-ghost" id="btn-auth" type="button">Claude</button>
+        <button class="btn btn-sm btn-ghost" id="btn-auth" type="button">Auth</button>
         <button class="btn btn-sm btn-ghost" id="btn-settings" type="button">Settings</button>
         <button class="btn btn-sm btn-danger-outline hidden" id="btn-interrupt" title="Interrupt running probe" type="button">
           <span>Interrupt</span>
@@ -281,9 +281,9 @@
           <button class="modal-close" id="settings-close" aria-label="Close settings" type="button">&times;</button>
         </div>
         <div class="modal-body">
-          <h4>Claude authentication</h4>
+          <h4>Model providers</h4>
           <p id="auth-summary" class="modal-help"></p>
-          <button class="btn btn-outline" id="btn-auth-settings" type="button">Change Claude login</button>
+          <button class="btn btn-outline" id="btn-auth-settings" type="button">Configure provider logins</button>
           <h4>New session defaults</h4>
           <form id="session-defaults-form" class="settings-card session-defaults-form">
             <div class="session-default-fields">
@@ -391,21 +391,29 @@
   <div class="modal-backdrop hidden" id="auth-modal">
     <div class="modal-dialog">
       <div class="modal-header">
-        <h3>Claude authentication</h3>
-        <button class="modal-close" id="auth-modal-close" aria-label="Close Claude authentication" type="button">&times;</button>
+        <h3>Model provider authentication</h3>
+        <button class="modal-close" id="auth-modal-close" aria-label="Close provider authentication" type="button">&times;</button>
       </div>
       <div class="modal-body">
         <p class="modal-help">
-          By default Nocturnomath uses whatever Claude Code is already signed in with. A token or key entered here is passed only to the Claude CLI, stays in memory until the app stops, and is checked on your next message.
+          By default Nocturnomath uses each installed CLI's existing login (Claude Code, Codex, Antigravity). A token or API key entered here is passed only to that provider's CLI, stays in memory until the app stops, and is checked on your next message.
         </p>
         <p class="modal-help hidden" id="auth-note"></p>
         <form id="auth-form">
           <div class="form-group">
+            <label for="auth-provider">Provider</label>
+            <select id="auth-provider" class="form-input">
+              <option value="anthropic">Anthropic</option>
+              <option value="openai">OpenAI</option>
+              <option value="google">Google</option>
+            </select>
+          </div>
+          <div class="form-group">
             <label for="auth-method">Authentication method</label>
             <select id="auth-method" class="form-input">
-              <option value="claude_code">Claude Code (automatic)</option>
+              <option value="cli">Claude CLI (automatic)</option>
               <option value="subscription">Claude subscription</option>
-              <option value="api_key">Claude API key</option>
+              <option value="api_key">Anthropic API key</option>
             </select>
           </div>
           <div class="form-group" id="auth-credential-group">
@@ -471,7 +479,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261030-1"></script>
+  <script type="module" src="/static/js/main.js?v=20261117-1"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

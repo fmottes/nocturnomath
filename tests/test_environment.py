@@ -32,12 +32,20 @@ def test_environment_does_not_inherit_app_python_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "/app/packages")
     monkeypatch.setenv("VIRTUAL_ENV", "/app/venv")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+    monkeypatch.setenv("CODEX_API_KEY", "codex-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     with patch.object(ResearchEnvironment, "command", return_value="3.12"):
         env = ResearchEnvironment(tmp_path, "/other/venv/bin/python")
     values = env.process_env()
     assert "PYTHONPATH" not in values
     assert "ANTHROPIC_API_KEY" not in values
+    assert "CODEX_API_KEY" not in values
+    assert "OPENAI_API_KEY" not in values
+    assert "GEMINI_API_KEY" not in values
+    assert "GOOGLE_API_KEY" not in values
     assert "SSH_AUTH_SOCK" not in values
     assert values["VIRTUAL_ENV"] == "/other/venv"
     assert values["PATH"].split(":")[0] == "/other/venv/bin"

@@ -339,8 +339,11 @@ async def test_model_needs_a_catalogue_and_applies_to_the_next_message(terminal)
 
     terminal.runtime.models = ["sonnet"]
     terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
+    terminal.runtime.model_providers = {"sonnet": "anthropic"}
     await terminal.run("/model")
-    assert "claude-sonnet-5" in terminal.output()
+    model_list_output = terminal.output()
+    assert "claude-sonnet-5" in model_list_output
+    assert "[Anthropic]" in model_list_output
 
     await terminal.run("/model haiku")
     assert "Choose a model from the catalogue" in terminal.output()
@@ -373,34 +376,56 @@ async def test_auth_command_reads_secrets_outside_command_history(terminal):
     terminal.app.credential_reader = lambda prompt: prompts.append(prompt) or "secret"
 
     async def discover_models():
-        terminal.runtime.models = ["sonnet"]
-        terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
+        terminal.runtime.models = ["sonnet", "gpt-6"]
+        terminal.runtime.model_labels = {
+            "sonnet": "claude-sonnet-5",
+            "gpt-6": "gpt-6",
+        }
+        terminal.runtime.model_providers = {
+            "sonnet": "anthropic",
+            "gpt-6": "openai",
+        }
         return True
 
     terminal.runtime.discover_models = discover_models
     terminal.session._sdk_session_id = "resumed-session"
     terminal.app.pending_model = "sonnet"
 
-    await terminal.run("/auth subscription")
+    await terminal.run("/auth anthropic subscription")
     output = terminal.output()
-    assert terminal.runtime.auth.method == "subscription"
-    assert terminal.runtime.auth.credential == "secret"
+    assert terminal.runtime.auth.get("anthropic").method == "subscription"
+    assert terminal.runtime.auth.get("anthropic").credential == "secret"
     assert terminal.session._sdk_session_id == "resumed-session"
     assert terminal.app.pending_model == "sonnet"
     assert prompts and "setup-token" in prompts[0]
     assert "secret" not in output
-    assert "Selected Claude subscription" in output
+    assert "Selected Anthropic: Claude subscription." in output
     assert "checked on your next message" in output
 
+    terminal.app.credential_reader = lambda prompt: (
+        prompts.append(prompt) or "openai-secret"
+    )
+    await terminal.run("/auth openai api-key")
+    openai_output = terminal.output()
+    assert terminal.runtime.auth.get("openai").method == "api_key"
+    assert terminal.runtime.auth.get("openai").credential == "openai-secret"
+    assert "openai-secret" not in openai_output
+    assert "Selected OpenAI: OpenAI API key." in openai_output
+
     await terminal.run("/auth status")
-    assert "Claude subscription" in terminal.output()
+    status_output = terminal.output()
+    assert "Claude subscription" in status_output
+    assert "OpenAI API key" in status_output
 
     terminal.app.credential_reader = lambda prompt: pytest.fail(
-        "Claude Code login must not prompt for a secret"
+        "CLI login must not prompt for a secret"
     )
-    await terminal.run("/auth claude-code")
-    assert terminal.runtime.auth.method == "claude_code"
-    assert "Claude Code (automatic)" in terminal.output()
+    await terminal.run("/auth anthropic cli")
+    assert terminal.runtime.auth.get("anthropic").method == "cli"
+    assert "Claude CLI (automatic)" in terminal.output()
+
+    await terminal.run("/auth google subscription")
+    assert "Use /auth google <cli|api-key>." in terminal.output()
 
 
 @pytest.mark.asyncio
@@ -410,10 +435,10 @@ async def test_auth_prompt_can_be_abandoned_with_eof(terminal):
 
     terminal.app.credential_reader = abandon
     terminal.runtime.discover_models = lambda: pytest.fail("must not re-authenticate")
-    previous = terminal.runtime.auth
+    previous = terminal.runtime.auth.get("google")
 
-    assert await terminal.run("/auth api-key") is True
-    assert terminal.runtime.auth is previous
+    assert await terminal.run("/auth google api-key") is True
+    assert terminal.runtime.auth.get("google") is previous
     assert "Authentication unchanged" in terminal.output()
 
 
@@ -440,7 +465,7 @@ async def test_manual_compaction_uses_shared_runtime_and_renders_notice(terminal
     terminal.session.compact = compact
     await terminal.run("/compact")
     output = terminal.output()
-    assert "Claude compacted this chat" in output
+    assert "Chat context compacted" in output
     assert "Context: 2%" in output
     assert "[context_compacted]" not in output
 
@@ -600,8 +625,12 @@ def test_bottom_toolbar_reports_the_live_state(terminal):
     resting = terminal.app.bottom_toolbar()
     assert "kernel ready" in resting
     assert f"model {terminal.session.model}" in resting
+    assert "auth cli" in resting
     assert "chat new" in resting
     assert resting.endswith("idle")
+
+    terminal.runtime.auth.set("openai", "api_key", "openai-secret")
+    assert "auth openai:api_key" in terminal.app.bottom_toolbar()
 
     terminal.session.activate_session()
     terminal.app.pending_model = "sonnet"
@@ -646,14 +675,30 @@ def test_completer_suggests_command_arguments(completer, terminal):
     assert complete(completer, "/context") == []
     assert [text for text, _ in complete(completer, "/auth ")] == [
         "status",
+        "anthropic",
+        "openai",
+        "google",
+    ]
+    assert [text for text, _ in complete(completer, "/auth anthropic ")] == [
+        "cli",
         "subscription",
         "api-key",
-        "claude-code",
+    ]
+    assert [text for text, _ in complete(completer, "/auth openai ")] == [
+        "cli",
+        "api-key",
+    ]
+    assert [text for text, _ in complete(completer, "/auth google ")] == [
+        "cli",
+        "api-key",
     ]
 
     terminal.runtime.models = ["sonnet", "opus"]
     terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
-    assert complete(completer, "/model son") == [("sonnet", "claude-sonnet-5")]
+    terminal.runtime.model_providers = {"sonnet": "anthropic"}
+    assert complete(completer, "/model son") == [
+        ("sonnet", "Anthropic · claude-sonnet-5")
+    ]
 
     terminal.session.log_transcript("user", text="how large is the effect?")
     resumable = dict(complete(completer, "/resume "))

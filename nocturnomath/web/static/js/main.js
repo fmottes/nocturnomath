@@ -1,8 +1,8 @@
-import { elements, state } from "./state.js?v=20261016-3";
+import { elements, state } from "./state.js?v=20261117-1";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261117-1";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261030-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261030-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261117-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
 import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
@@ -259,10 +259,15 @@ function handleServerEvent(event) {
       break;
     }
 
-    case "auth_changed":
+    case "auth_changed": {
       applyAuthChange(event);
-      appendSystemMessage(`Claude authentication changed to ${event.auth?.label || "the selected method"}.`);
+      const changed = event.provider ? event.auth?.providers?.[event.provider] : null;
+      const summary = changed
+        ? `${changed.title} authentication changed to ${changed.label}.`
+        : `Authentication changed to ${event.auth?.label || "the selected method"}.`;
+      appendSystemMessage(summary);
       break;
+    }
 
     case "user_message":
       if (event.session_id && state.agents.has(event.agent_id)) {
@@ -340,7 +345,7 @@ function handleServerEvent(event) {
       break;
 
     case "context_compacted":
-      appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
+      appendSystemMessage("This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing.");
       break;
 
     case "session_reset":
@@ -414,6 +419,13 @@ function setupEventListeners() {
   elements.btnCompact.addEventListener("click", compactExplorer);
   [elements.btnAuth, elements.btnAuthLanding, elements.btnAuthSettings].forEach((button) => {
     button.addEventListener("click", openAuthModal);
+  });
+  elements.authProvider.addEventListener("change", () => {
+    elements.authCredential.value = "";
+    elements.authError.textContent = "";
+    elements.authError.classList.add("hidden");
+    populateAuthMethods(elements.authProvider.value);
+    updateAuthForm();
   });
   elements.authMethod.addEventListener("change", updateAuthForm);
   elements.authModalClose.addEventListener("click", closeAuthModal);
@@ -681,6 +693,7 @@ function applyAuthChange(data) {
     data.model,
     data.model_efforts || {},
     data.effort,
+    data.model_providers || {},
   );
   if (data.session_defaults) setSessionDefaults(data.session_defaults);
   refreshSendButton();
@@ -732,8 +745,71 @@ async function saveExplorationPrompt(prompt) {
   }
 }
 
+const AUTH_PROVIDER_METHODS = {
+  anthropic: [
+    {
+      value: "cli",
+      label: "Claude CLI (automatic)",
+      help: "Use whatever Claude Code is already signed in with on this machine.",
+    },
+    {
+      value: "subscription",
+      label: "Claude subscription",
+      credentialLabel: "Subscription token",
+      placeholder: "Token from claude setup-token",
+      help: "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.",
+    },
+    {
+      value: "api_key",
+      label: "Anthropic API key",
+      credentialLabel: "API key",
+      placeholder: "sk-ant-api…",
+      help: "Create a key in the Anthropic Console. API usage is billed separately from a subscription.",
+    },
+  ],
+  openai: [
+    {
+      value: "cli",
+      label: "Codex CLI (automatic)",
+      help: "Use whatever Codex CLI is already signed in with on this machine.",
+    },
+    {
+      value: "api_key",
+      label: "OpenAI API key",
+      credentialLabel: "API key",
+      placeholder: "sk-…",
+      help: "Create an OpenAI API key. It overrides environment keys only for the Codex CLI launched by Nocturnomath.",
+    },
+  ],
+  google: [
+    {
+      value: "cli",
+      label: "Antigravity CLI (automatic)",
+      help: "Use whatever Antigravity (`agy`) is already signed in with on this machine.",
+    },
+    {
+      value: "api_key",
+      label: "Google Gemini API key",
+      credentialLabel: "Gemini API key",
+      placeholder: "AIza…",
+      help: "Create a Gemini API key in Google AI Studio. It runs in an isolated Antigravity state directory while keeping your local login untouched.",
+    },
+  ],
+};
+
+function populateAuthMethods(provider) {
+  const methods = AUTH_PROVIDER_METHODS[provider] || AUTH_PROVIDER_METHODS.anthropic;
+  elements.authMethod.replaceChildren(...methods.map((item) => new Option(item.label, item.value)));
+  const currentMethod = state.auth?.providers?.[provider]?.method || "cli";
+  elements.authMethod.value = methods.some((item) => item.value === currentMethod)
+    ? currentMethod
+    : methods[0].value;
+}
+
 function openAuthModal() {
-  elements.authMethod.value = state.auth?.method || "claude_code";
+  const provider = state.modelProviders[elements.modelSelect.value] || "anthropic";
+  elements.authProvider.value = AUTH_PROVIDER_METHODS[provider] ? provider : "anthropic";
+  populateAuthMethods(elements.authProvider.value);
   elements.authCredential.value = "";
   elements.authError.textContent = "";
   elements.authError.classList.add("hidden");
@@ -748,20 +824,25 @@ function closeAuthModal() {
 }
 
 function updateAuthForm() {
-  const method = elements.authMethod.value;
-  elements.authCredentialGroup.classList.toggle("hidden", method === "claude_code");
-  elements.authCredential.required = method !== "claude_code";
-  if (method === "subscription") {
-    elements.authCredentialLabel.textContent = "Subscription token";
-    elements.authCredential.placeholder = "Token from claude setup-token";
-    elements.authHelp.textContent = "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.";
-  } else if (method === "api_key") {
-    elements.authCredentialLabel.textContent = "API key";
-    elements.authCredential.placeholder = "sk-ant-api…";
-    elements.authHelp.textContent = "Create a key in the Claude Console. API usage is billed separately from a subscription.";
-  } else {
-    elements.authHelp.textContent = "Use whatever Claude Code is already signed in with, exactly as the Agent SDK would on its own.";
+  const provider = elements.authProvider.value || "anthropic";
+  const method = elements.authMethod.value || "cli";
+  const methods = AUTH_PROVIDER_METHODS[provider] || AUTH_PROVIDER_METHODS.anthropic;
+  const spec = methods.find((item) => item.value === method) || methods[0];
+  const needsSecret = method !== "cli";
+  elements.authCredentialGroup.classList.toggle("hidden", !needsSecret);
+  elements.authCredential.required = needsSecret;
+  if (needsSecret) {
+    elements.authCredentialLabel.textContent = spec.credentialLabel || "Credential";
+    elements.authCredential.placeholder = spec.placeholder || "";
   }
+  elements.authHelp.textContent = spec.help || "";
+  const providerInfo = state.auth?.providers?.[provider];
+  elements.authCurrent.textContent = providerInfo
+    ? `Current (${providerInfo.title}): ${providerInfo.label}`
+    : "";
+  const noteText = providerInfo?.note || "";
+  elements.authNote.textContent = noteText;
+  elements.authNote.classList.toggle("hidden", !noteText);
 }
 
 async function submitAuth(event) {
@@ -769,9 +850,10 @@ async function submitAuth(event) {
   elements.authSubmit.disabled = true;
   elements.authSubmit.textContent = "Applying…";
   elements.authError.classList.add("hidden");
-  const method = elements.authMethod.value;
-  const body = { method };
-  if (method !== "claude_code") body.credential = elements.authCredential.value;
+  const provider = elements.authProvider.value || "anthropic";
+  const method = elements.authMethod.value || "cli";
+  const body = { provider, method };
+  if (method !== "cli") body.credential = elements.authCredential.value;
   try {
     const response = await fetch("/api/auth", {
       method: "POST",
@@ -779,7 +861,7 @@ async function submitAuth(event) {
       body: JSON.stringify(body),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to authenticate with Claude");
+    if (!response.ok) throw new Error(data.detail || "Unable to update authentication");
     applyAuthChange(data);
     elements.authCredential.value = "";
     elements.authModal.classList.add("hidden");

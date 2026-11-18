@@ -34,6 +34,7 @@ export const state = {
   auth: null,
   models: [],
   modelLabels: {},
+  modelProviders: {},
   modelEfforts: {},
   sessionDefaults: null,
 };
@@ -79,6 +80,7 @@ export const elements = {
   authModalClose: document.getElementById("auth-modal-close"),
   authModalCancel: document.getElementById("auth-modal-cancel"),
   authForm: document.getElementById("auth-form"),
+  authProvider: document.getElementById("auth-provider"),
   authMethod: document.getElementById("auth-method"),
   authCredentialGroup: document.getElementById("auth-credential-group"),
   authCredentialLabel: document.getElementById("auth-credential-label"),

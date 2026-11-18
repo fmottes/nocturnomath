@@ -24,6 +24,7 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
+from ..auth import PROVIDER_METHODS, PROVIDER_TITLES, PROVIDERS
 from ..runtime import Runtime
 from .common import add_session_arguments
 from .completion import CommandCompleter
@@ -32,6 +33,15 @@ logger = logging.getLogger("nocturnomath.cli")
 
 ASSET_PREFIX = "/api/asset?path="
 OUTPUT_LINE_CAP = 60
+
+_CREDENTIAL_PROMPTS = {
+    ("anthropic", "subscription"): (
+        "Claude subscription token (from `claude setup-token`): "
+    ),
+    ("anthropic", "api_key"): "Anthropic API key: ",
+    ("openai", "api_key"): "OpenAI API key: ",
+    ("google", "api_key"): "Google Gemini API key: ",
+}
 
 COMMANDS = [
     ("/help", "", "list these commands"),
@@ -44,8 +54,8 @@ COMMANDS = [
     ("/model", "[name]", "show the catalogue, or use a model from the next message"),
     (
         "/auth",
-        "[status|subscription|api-key|claude-code]",
-        "show or change Claude login",
+        "[status|<provider> <method>]",
+        "show or change model provider logins",
     ),
     ("/compact", "", "compact the current chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
@@ -212,10 +222,11 @@ class TerminalApp:
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model or 'No model available'}", style="dim")
             self.write(f"effort: {session.effort}", style="dim")
-            auth = self.runtime.auth.public()
-            self.write(f"Claude auth: {auth['label']}", style="dim")
-            if auth["note"]:
-                self.write(auth["note"], style="dim")
+            auth = self.runtime.auth.public(self.runtime._provider_models)
+            self.write(f"auth: {auth['label']}", style="dim")
+            for info in auth["providers"].values():
+                if info["note"]:
+                    self.write(info["note"], style="dim")
             self.write(
                 f"next transcript: {session.transcript_path} "
                 "(created with first message)",
@@ -240,9 +251,15 @@ class TerminalApp:
             model += f" → {self.pending_model}"
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
+        custom_auth = [
+            f"{provider}:{self.runtime.auth.get(provider).method}"
+            for provider in PROVIDERS
+            if self.runtime.auth.get(provider).method != "cli"
+        ]
+        auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
         return (
             f"kernel {kernel} · model {model} · effort {session.effort} · "
-            f"auth {self.runtime.auth.method} · chat {chat} · {self.status}"
+            f"auth {auth_summary} · chat {chat} · {self.status}"
         )
 
     def show_help(self):
@@ -436,7 +453,7 @@ class TerminalApp:
 
     def _render_context_compacted(self, payload):
         self.write(
-            "Claude compacted this chat. The current scientific record was reloaded."
+            "Chat context compacted. The current scientific record was reloaded."
         )
 
     def _render_context_usage_changed(self, payload):
@@ -653,7 +670,11 @@ class TerminalApp:
                     f"{self.pending_model} applies from the next message.", style="dim"
                 )
             for name in runtime.models:
-                self.write(f"  {name} ({runtime.model_labels.get(name, name)})")
+                provider = runtime.model_providers.get(name)
+                tag = (
+                    f"[{PROVIDER_TITLES.get(provider, provider)}] " if provider else ""
+                )
+                self.write(f"  {tag}{name} ({runtime.model_labels.get(name, name)})")
             if not runtime.models:
                 self.write("The model catalogue is unavailable.", style="dim")
             return True
@@ -672,41 +693,59 @@ class TerminalApp:
         return True
 
     async def _command_auth(self, argument: str) -> bool:
-        choice = argument or "status"
-        if choice == "status":
-            auth = self.runtime.auth.public()
-            self.write(f"Claude authentication: {auth['label']}")
-            if auth["note"]:
-                self.write(auth["note"], style="dim")
+        parts = argument.split()
+        if not parts or parts == ["status"]:
+            auth = self.runtime.auth.public(self.runtime._provider_models)
+            self.write(f"Authentication: {auth['label']}")
+            for provider in PROVIDERS:
+                info = auth["providers"][provider]
+                count = info["models_count"]
+                count_text = (
+                    f" ({count} {'model' if count == 1 else 'models'})"
+                    if count is not None
+                    else ""
+                )
+                self.write(f"  {info['title']}: {info['label']}{count_text}")
+                if info["note"]:
+                    self.write(f"    {info['note']}", style="dim")
             self.write(
-                "Use /auth subscription, /auth api-key, or /auth claude-code to change it.",
+                "Use /auth <anthropic|openai|google> <cli|subscription|api-key> to change a provider.",
                 style="dim",
             )
             return True
-        methods = {
-            "subscription": "subscription",
-            "api-key": "api_key",
-            "claude-code": "claude_code",
-        }
-        if choice not in methods:
-            self.error("Use /auth subscription, /auth api-key, or /auth claude-code.")
-            return True
-        self.require_idle("change Claude authentication")
-        method = methods[choice]
-        credential = None
-        if method != "claude_code":
-            prompt = (
-                "Claude subscription token (from `claude setup-token`): "
-                if method == "subscription"
-                else "Claude API key: "
+        if len(parts) != 2:
+            self.error(
+                "Use /auth status or /auth <anthropic|openai|google> <cli|subscription|api-key>."
             )
+            return True
+        provider = parts[0].lower()
+        if provider not in PROVIDER_METHODS:
+            self.error("Choose a provider: anthropic, openai, or google.")
+            return True
+        method = "api_key" if parts[1] == "api-key" else parts[1]
+        if method not in PROVIDER_METHODS[provider]:
+            choices = "|".join(
+                "api-key" if key == "api_key" else key
+                for key in PROVIDER_METHODS[provider]
+            )
+            self.error(f"Use /auth {provider} <{choices}>.")
+            return True
+        self.require_idle("change authentication")
+        credential = None
+        if method != "cli":
+            prompt = _CREDENTIAL_PROMPTS[(provider, method)]
             try:
                 credential = await asyncio.to_thread(self.credential_reader, prompt)
             except EOFError:
                 self.write("Authentication unchanged.", style="dim")
                 return True
-        auth = await self.runtime.authenticate(method, credential)
-        self.write(f"Selected {auth['label']}.")
+        try:
+            auth = await self.runtime.authenticate(provider, method, credential)
+        except ValueError as exc:
+            self.error(str(exc))
+            return True
+        selected = auth["providers"][provider]
+        self.write(f"Selected {selected['title']}: {selected['label']}.")
         self.write("Credentials will be checked on your next message.", style="dim")
         models = self.runtime.models
         if self.pending_model and models and self.pending_model not in models:
