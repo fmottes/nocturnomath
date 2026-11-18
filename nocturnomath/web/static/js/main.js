@@ -1,11 +1,11 @@
 import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261118-1";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261118-2";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
-import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-1";
+import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-2";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -131,19 +131,46 @@ function renderPendingPrompts(prompts = []) {
 function applyExplorer(agent, repaint = false) {
   if (!agent?.agent_id) return;
   const prior = state.agents.get(agent.agent_id) || {};
-  state.agents.set(agent.agent_id, { ...prior, ...agent });
+  const merged = {
+    ...prior,
+    ...agent,
+    modelProvider: agent.model !== undefined
+      ? (state.modelProviders[agent.model] || agent.modelProvider || prior.modelProvider || null)
+      : (prior.modelProvider || null),
+  };
+  let resolvedDraft = null;
+  if (merged.draftModel || merged.draftRawModel) {
+    resolvedDraft = resolveCatalogueModel(
+      merged.draftRawModel || merged.draftModel,
+      merged.draftProvider,
+    );
+    if (resolvedDraft) {
+      merged.draftModel = resolvedDraft;
+      merged.draftProvider = state.modelProviders[resolvedDraft] || merged.draftProvider || null;
+      merged.draftRawModel = rawModelId(resolvedDraft, merged.draftProvider);
+    } else if (state.models.length) {
+      merged.draftModel = null;
+      merged.draftProvider = null;
+      merged.draftRawModel = null;
+      merged.draftEffort = null;
+    }
+  }
+  state.agents.set(agent.agent_id, merged);
   if (agent.agent_id === state.activeAgentId) {
-    setSessionId(agent.session_id);
-    setActiveModelAndEffort(agent.draftModel || agent.model, agent.draftEffort || agent.effort);
-    setContextUsage(agent.context_usage);
-    updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
-    updateAgentStatus(agent.is_busy && (!agent.status || agent.status === "idle")
-      ? "thinking" : (agent.status || "idle"));
-    renderPendingPrompts(state.agents.get(agent.agent_id)?.pending_prompts || []);
+    setSessionId(merged.session_id);
+    setActiveModelAndEffort(
+      resolvedDraft || merged.model,
+      resolvedDraft ? (merged.draftEffort || merged.effort) : merged.effort,
+    );
+    setContextUsage(merged.context_usage);
+    updateKernelStatus(merged.kernel_alive, merged.kernel_busy);
+    updateAgentStatus(merged.is_busy && (!merged.status || merged.status === "idle")
+      ? "thinking" : (merged.status || "idle"));
+    renderPendingPrompts(merged.pending_prompts || []);
     if (agent.documents) refreshDocuments();
     if (repaint) {
-      restoreChat(agent.records || [], agent.kernel_busy);
-      restoreExplorerView(state.agents.get(agent.agent_id));
+      restoreChat(merged.records || [], merged.kernel_busy);
+      restoreExplorerView(merged);
     }
   }
   renderExplorerTabs();
@@ -171,10 +198,19 @@ async function selectExplorer(agentId) {
 function installExplorers(agents = [], preserveView = true) {
   if (preserveView) saveExplorerView();
   const previous = preserveView ? state.agents : new Map();
-  state.agents = new Map(agents.map((agent) => [
-    agent.agent_id,
-    { ...(previous.get(agent.agent_id) || {}), ...agent },
-  ]));
+  state.agents = new Map(agents.map((agent) => {
+    const prior = previous.get(agent.agent_id) || {};
+    return [
+      agent.agent_id,
+      {
+        ...prior,
+        ...agent,
+        modelProvider: agent.model
+          ? (state.modelProviders[agent.model] || prior.modelProvider || null)
+          : null,
+      },
+    ];
+  }));
   if (!state.agents.has(state.activeAgentId)) state.activeAgentId = agents[0]?.agent_id || null;
   if (state.activeAgentId) applyExplorer(state.agents.get(state.activeAgentId), true);
   renderExplorerTabs();
@@ -407,10 +443,19 @@ function handleServerEvent(event) {
 
     case "session_reset":
       if (state.agents.has(event.agent_id)) {
-        state.agents.get(event.agent_id).context_usage = null;
-        state.agents.get(event.agent_id).session_id = event.session_id;
-        state.agents.get(event.agent_id).can_compact = false;
-        state.agents.get(event.agent_id).pending_prompts = [];
+        Object.assign(state.agents.get(event.agent_id), {
+          context_usage: null,
+          session_id: event.session_id,
+          can_compact: false,
+          pending_prompts: [],
+          model: event.model,
+          modelProvider: state.modelProviders[event.model] || null,
+          effort: event.effort,
+          draftModel: null,
+          draftProvider: null,
+          draftRawModel: null,
+          draftEffort: null,
+        });
       }
       renderPendingPrompts([]);
       setContextUsage(null);
@@ -570,18 +615,21 @@ function setupEventListeners() {
     const agent = state.agents.get(state.activeAgentId);
     if (agent) agent.draftText = elements.promptInput.value;
   });
+  const recordModelDraft = () => {
+    const agent = state.agents.get(state.activeAgentId);
+    if (!agent) return;
+    const selected = elements.modelSelect.value;
+    const provider = state.modelProviders[selected] || null;
+    agent.draftModel = selected;
+    agent.draftProvider = provider;
+    agent.draftRawModel = rawModelId(selected, provider);
+    agent.draftEffort = elements.effortSelect.value || null;
+  };
   elements.modelSelect.addEventListener("change", () => {
     setEffortForModel(elements.effortSelect, elements.modelSelect.value);
-    const agent = state.agents.get(state.activeAgentId);
-    if (agent) {
-      agent.draftModel = elements.modelSelect.value;
-      agent.draftEffort = elements.effortSelect.value || null;
-    }
+    recordModelDraft();
   });
-  elements.effortSelect.addEventListener("change", () => {
-    const agent = state.agents.get(state.activeAgentId);
-    if (agent) agent.draftEffort = elements.effortSelect.value || null;
-  });
+  elements.effortSelect.addEventListener("change", recordModelDraft);
   elements.defaultModelSelect.addEventListener("change", () => {
     setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value);
   });

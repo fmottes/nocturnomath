@@ -2,7 +2,7 @@ import { elements, state } from "./state.js?v=20261117-2";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261118-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261118-2";
 
 // ============================================================================
 // Workspace & Files Management
@@ -188,20 +188,70 @@ function fillModelSelect(select, models, labels, preferred, providers = {}) {
   select.value = models.includes(preferred) ? preferred : models[0] || "";
 }
 
+export function rawModelId(model, provider = null) {
+  if (!model) return null;
+  if (provider && model.startsWith(`${provider}/`)) {
+    return model.slice(provider.length + 1);
+  }
+  const slash = model.indexOf("/");
+  if (slash > 0 && PROVIDER_ORDER.includes(model.slice(0, slash))) {
+    return model.slice(slash + 1);
+  }
+  return model;
+}
+
+export function resolveCatalogueModel(
+  rawOrCatalogueId,
+  provider = null,
+  models = state.models,
+  modelProviders = state.modelProviders,
+) {
+  if (!rawOrCatalogueId || !models.length) return null;
+  let targetProvider = provider;
+  if (!targetProvider) {
+    const slash = rawOrCatalogueId.indexOf("/");
+    if (slash > 0 && PROVIDER_ORDER.includes(rawOrCatalogueId.slice(0, slash))) {
+      targetProvider = rawOrCatalogueId.slice(0, slash);
+    }
+  }
+  if (!targetProvider) {
+    return models.includes(rawOrCatalogueId) ? rawOrCatalogueId : null;
+  }
+  if (
+    models.includes(rawOrCatalogueId)
+    && modelProviders[rawOrCatalogueId] === targetProvider
+  ) {
+    return rawOrCatalogueId;
+  }
+  const raw = rawModelId(rawOrCatalogueId, targetProvider);
+  for (const candidate of [`${targetProvider}/${raw}`, raw]) {
+    if (models.includes(candidate) && modelProviders[candidate] === targetProvider) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function chooseEffort(efforts, preferred = null) {
+  if (!efforts.length) return null;
+  if (efforts.includes(preferred)) return preferred;
+  if (efforts.includes("high")) return "high";
+  return efforts[0] || null;
+}
+
 export function setEffortForModel(select, model, preferred = null) {
   const efforts = state.modelEfforts[model] || [];
   select.replaceChildren(...efforts.map((effort) => new Option(effort, effort)));
   if (!efforts.length) select.add(new Option("No effort setting", ""));
   select.disabled = !efforts.length;
-  select.value = efforts.includes(preferred)
-    ? preferred
-    : efforts.includes("high")
-      ? "high"
-      : efforts[0] || "";
+  select.value = chooseEffort(efforts, preferred) || "";
 }
 
 export function setActiveModelAndEffort(model, effort) {
   if (state.models.includes(model)) elements.modelSelect.value = model;
+  else if (state.models.length && !state.models.includes(elements.modelSelect.value)) {
+    elements.modelSelect.value = state.models[0];
+  }
   setEffortForModel(elements.effortSelect, elements.modelSelect.value, effort);
 }
 
@@ -229,27 +279,48 @@ export function setModelCatalogue(
 ) {
   // The dropdown decides the model of the next message, so an unsent choice
   // survives a catalogue refresh; otherwise follow the server's model.
+  const previousProviders = state.modelProviders || {};
   const currentModel = elements.modelSelect.value;
   const currentEffort = elements.effortSelect.value;
-  const currentProvider = state.modelProviders?.[currentModel] || null;
+  const currentProvider = previousProviders[currentModel] || null;
   state.models = models;
   state.modelLabels = labels;
   state.modelEfforts = modelEfforts;
   state.modelProviders = modelProviders;
-  let resolvedCurrent = null;
-  if (
-    currentModel
-    && models.includes(currentModel)
-    && (!currentProvider || modelProviders[currentModel] === currentProvider)
-  ) {
-    resolvedCurrent = currentModel;
-  } else if (currentModel && currentProvider) {
-    const rawId = currentModel.startsWith(`${currentProvider}/`)
-      ? currentModel.slice(currentProvider.length + 1)
-      : currentModel;
-    resolvedCurrent = [`${currentProvider}/${rawId}`, rawId].find(
-      (candidate) => models.includes(candidate) && modelProviders[candidate] === currentProvider,
-    ) || null;
+  const resolvedCurrent = resolveCatalogueModel(
+    currentModel,
+    currentProvider,
+    models,
+    modelProviders,
+  );
+  for (const agent of state.agents.values()) {
+    if (agent.draftModel || agent.draftRawModel) {
+      const draftProv = agent.draftProvider || previousProviders[agent.draftModel] || null;
+      const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv);
+      const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders);
+      if (resolvedDraft) {
+        agent.draftModel = resolvedDraft;
+        agent.draftProvider = modelProviders[resolvedDraft] || draftProv;
+        agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider);
+        agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
+      } else if (models.length) {
+        agent.draftModel = null;
+        agent.draftProvider = null;
+        agent.draftRawModel = null;
+        agent.draftEffort = null;
+      }
+    }
+    if (agent.model) {
+      const modelProv = agent.modelProvider || previousProviders[agent.model] || null;
+      const resolvedAgentModel = resolveCatalogueModel(
+        rawModelId(agent.model, modelProv),
+        modelProv,
+        models,
+        modelProviders,
+      );
+      agent.model = resolvedAgentModel || (models.includes(serverModel) ? serverModel : models[0] || null);
+      agent.modelProvider = agent.model ? (modelProviders[agent.model] || null) : null;
+    }
   }
   const preferred = resolvedCurrent || (models.includes(serverModel) ? serverModel : null);
   fillModelSelect(elements.modelSelect, models, labels, preferred, modelProviders);
