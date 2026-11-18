@@ -604,6 +604,8 @@ class TerminalApp:
 
     async def _command_new(self, argument: str) -> bool:
         self.require_idle("start a new session")
+        self.pending_model = None
+        self.pending_model_provider = None
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -666,10 +668,11 @@ class TerminalApp:
             self.error("Name a chat to resume, such as /resume S001.")
             return True
         self.require_idle("resume")
-        session = self.runtime.session
         data = await self.runtime.transition(
-            session.resume_session, ids[0], restore_kernel
+            self.runtime.resume_session, ids[0], restore_kernel
         )
+        self.pending_model = None
+        self.pending_model_provider = None
         await self.runtime.emit("session_resumed", data)
         return True
 

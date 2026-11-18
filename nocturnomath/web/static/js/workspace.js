@@ -276,6 +276,7 @@ export function setModelCatalogue(
   modelEfforts = {},
   serverEffort = null,
   modelProviders = {},
+  agentModels = null,
 ) {
   // The dropdown decides the model of the next message, so an unsent choice
   // survives a catalogue refresh; otherwise follow the server's model.
@@ -310,7 +311,12 @@ export function setModelCatalogue(
         agent.draftEffort = null;
       }
     }
-    if (agent.model) {
+    if (agentModels && Object.prototype.hasOwnProperty.call(agentModels, agent.agent_id)) {
+      const serverAgent = agentModels[agent.agent_id];
+      agent.model = serverAgent.model;
+      agent.effort = serverAgent.effort;
+      agent.modelProvider = agent.model ? (modelProviders[agent.model] || null) : null;
+    } else if (agent.model) {
       const modelProv = agent.modelProvider || previousProviders[agent.model] || null;
       const resolvedAgentModel = resolveCatalogueModel(
         rawModelId(agent.model, modelProv),

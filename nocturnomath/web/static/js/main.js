@@ -485,7 +485,13 @@ function handleServerEvent(event) {
     case "session_resumed":
       if (state.agents.has(event.agent_id)) {
         Object.assign(state.agents.get(event.agent_id), {
-          draftText: "", scrollTop: 0, followChat: true,
+          draftText: "",
+          scrollTop: 0,
+          followChat: true,
+          draftModel: null,
+          draftProvider: null,
+          draftRawModel: null,
+          draftEffort: null,
         });
       }
       applyExplorer(event);
@@ -816,6 +822,7 @@ function applyAuthChange(data) {
     data.model_efforts || {},
     data.effort,
     data.model_providers || {},
+    data.agent_models || null,
   );
   if (data.session_defaults) setSessionDefaults(data.session_defaults);
   refreshSendButton();

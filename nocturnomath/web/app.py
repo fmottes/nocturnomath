@@ -328,6 +328,10 @@ def create_app(
             "model_providers": runtime.model_providers,
             "model_efforts": runtime.model_efforts,
             "effort": runtime.session.effort if runtime.session else runtime.effort,
+            "agent_models": {
+                agent_id: {"model": agent.model, "effort": agent.effort}
+                for agent_id, agent in runtime.agents.items()
+            },
             "session_defaults": (
                 {
                     "model": runtime.session.default_model,
@@ -694,9 +698,9 @@ def create_app(
     @app.post("/api/session/resume")
     async def resume_session(request: SessionResumeRequest):
         try:
-            session = active_session()
+            active_session()
             data = await runtime.transition(
-                session.resume_session, request.id, request.restore_kernel
+                runtime.resume_session, request.id, request.restore_kernel
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -704,8 +708,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        await runtime.broadcast("session_resumed", data)
-        return {"status": "ok", **data}
+        payload = {"agent_id": runtime.primary_agent_id, **data}
+        await runtime.broadcast("session_resumed", payload)
+        return {"status": "ok", **payload}
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

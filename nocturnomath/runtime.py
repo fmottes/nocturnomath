@@ -586,6 +586,16 @@ class Runtime:
     def _select_model(
         self, preferred: str | None, preferred_provider: ProviderId | None = None
     ) -> str | None:
+        if preferred_provider is not None:
+            resolved = self.resolve_model(preferred, preferred_provider)
+            if resolved is not None:
+                return resolved
+            provider_models = self._provider_models.get(preferred_provider, [])
+            if provider_models:
+                return (
+                    self._provider_default_models.get(preferred_provider)
+                    or provider_models[0]
+                )
         return (
             self.resolve_model(preferred, preferred_provider) or self.sdk_default_model
         )
@@ -719,6 +729,17 @@ class Runtime:
         self.model = session.model
         self.effort = session.effort
 
+    def resume_session(
+        self, session_id: str, restore_kernel: bool = False
+    ) -> dict[str, Any]:
+        """Resume a recorded chat onto the active explorer and restore its owner model."""
+        session = self.require_session()
+        data = session.resume_session(session_id, restore_kernel)
+        self._apply_resumed_owner_model(session)
+        self.model = session.model
+        self.effort = session.effort
+        return {**data, "model": session.model, "effort": session.effort}
+
     async def authenticate(
         self, provider: ProviderId, method: str, credential: str | None = None
     ) -> dict[str, Any]:
@@ -827,6 +848,19 @@ class Runtime:
             except Exception as exc:
                 logger.error(f"Error in runtime subscriber: {exc}")
 
+    def _apply_resumed_owner_model(self, session: ExplorationSession) -> None:
+        owner_provider = session._active_provider or session._owner_provider
+        if owner_provider is None:
+            return
+        owner_model, owner_effort = self._select_provider_model(
+            owner_provider,
+            session._active_model,
+            session._active_effort,
+        )
+        if owner_model is not None:
+            session.model = owner_model
+            session.effort = owner_effort
+
     def create_agent(
         self,
         workspace_path: Path | str | None = None,
@@ -868,30 +902,14 @@ class Runtime:
                 session, default_model, default_effort, default_provider
             )
             if session_id is not None:
-                owner_provider = session._active_provider or session._owner_provider
-                if owner_provider is not None:
-                    owner_model, owner_effort = self._select_provider_model(
-                        owner_provider,
-                        session._active_model,
-                        session._active_effort,
-                    )
-                    if owner_model is not None:
-                        session.model = owner_model
-                        session.effort = owner_effort
+                self._apply_resumed_owner_model(session)
         elif session_id is not None:
             owner_provider = session._active_provider or session._owner_provider
             if owner_provider is not None and (
                 session.model is None
                 or session.provider_for_model(session.model) != owner_provider
             ):
-                owner_model, owner_effort = self._select_provider_model(
-                    owner_provider,
-                    session._active_model,
-                    session._active_effort,
-                )
-                if owner_model is not None:
-                    session.model = owner_model
-                    session.effort = owner_effort
+                self._apply_resumed_owner_model(session)
         self._subscribe_to_agent(agent_id, session)
         return agent_id
 
@@ -966,16 +984,22 @@ class Runtime:
             model_providers=self.model_providers,
             model_raw_ids=self.model_raw_ids,
         )
+        replacement.default_model = old.default_model
+        replacement.default_effort = old.default_effort
+        replacement.default_provider = old.default_provider
         try:
             data = replacement.resume_session(session_id, restore_kernel)
         except Exception:
             replacement.shutdown()
             raise
+        self._apply_resumed_owner_model(replacement)
         self._unsubscribe_agent(agent_id)
         old.shutdown()
         self.agents[agent_id] = replacement
         if self.primary_agent_id == agent_id:
             self.session = replacement
+            self.model = replacement.model
+            self.effort = replacement.effort
         self._subscribe_to_agent(agent_id, replacement)
         return agent_id, {**self.agent_snapshot(agent_id), **data}, False
 

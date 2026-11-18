@@ -1344,3 +1344,100 @@ async def test_active_chat_falls_back_to_workspace_default_after_empty_then_part
     assert runtime.models == ["claude-sonnet-5"]
     assert session.model == "claude-sonnet-5"
     assert runtime.model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_manual_resume_and_replace_agent_restore_saved_chat_model_and_same_provider_fallback(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+    from nocturnomath.session import ExplorationSession
+
+    claude_spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="claude-sonnet-5",
+        efforts=["medium"],
+        is_default=True,
+    )
+    oai_preview = ModelSpec(
+        id="gpt-5.4-preview",
+        raw_id="gpt-5.4-preview",
+        provider="openai",
+        label="GPT-5.4 Preview",
+        efforts=["medium", "high"],
+    )
+    oai_stable = ModelSpec(
+        id="gpt-5.4",
+        raw_id="gpt-5.4",
+        provider="openai",
+        label="GPT-5.4",
+        efforts=["medium", "high"],
+    )
+
+    class ActiveOpenAI(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    def make_session(**kwargs):
+        with (
+            patch("nocturnomath.session.Kernel", FakeKernel),
+            patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+        ):
+            return ExplorationSession(**kwargs)
+
+    runtime = Runtime(
+        session,
+        session_factory=make_session,
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic",
+                responses=[[claude_spec], [claude_spec]],
+            ),
+            openai=ActiveOpenAI(
+                "openai",
+                responses=[[oai_preview], [oai_stable]],
+            ),
+        ),
+    )
+
+    await runtime.discover_models()
+    assert (
+        runtime.start_query(
+            "run on openai preview", "gpt-5.4-preview", "high", provider="openai"
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    # Reset onto workspace default (Claude), then verify manual resume and
+    # replace_agent both restore the chat's OpenAI model and effort.
+    runtime.reset_session()
+    assert session.model == "claude-sonnet-5"
+
+    resumed = runtime.resume_session("S001")
+    assert (session.model, session.effort) == ("gpt-5.4-preview", "high")
+    assert (runtime.model, runtime.effort) == ("gpt-5.4-preview", "high")
+    assert (resumed["model"], resumed["effort"]) == ("gpt-5.4-preview", "high")
+
+    runtime.reset_session()
+    assert runtime.session.model == "claude-sonnet-5"
+
+    _, replaced_data, _ = runtime.replace_agent(runtime.primary_agent_id, "S001")
+    replaced = runtime.session
+    assert (replaced.model, replaced.effort) == ("gpt-5.4-preview", "high")
+    assert (runtime.model, runtime.effort) == ("gpt-5.4-preview", "high")
+    assert (replaced_data["model"], replaced_data["effort"]) == (
+        "gpt-5.4-preview",
+        "high",
+    )
+
+    # Refresh catalogue without gpt-5.4-preview: active model falls back within
+    # OpenAI (gpt-5.4), not across providers to claude-sonnet-5.
+    await runtime.discover_models()
+    assert replaced.model == "gpt-5.4"
+    assert replaced.effort == "high"
+    assert runtime.model == "gpt-5.4"
