@@ -1074,3 +1074,149 @@ def test_prompt_mode_setting_and_websocket_queue_steer_controls(session):
         user_messages = [e["text"] for e in tail if e["type"] == "user_message"]
         assert user_messages == ["keep-queued"]
         assert seen_queries == ["first", "keep-queued"]
+
+
+def test_websocket_query_and_defaults_keep_provider_when_catalogue_collides(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    shared_openai = ModelSpec(
+        id="shared",
+        raw_id="shared",
+        provider="openai",
+        label="shared",
+        efforts=["low", "high"],
+        is_default=True,
+    )
+    shared_anthropic = ModelSpec(
+        id="shared",
+        raw_id="shared",
+        provider="anthropic",
+        label="shared",
+        efforts=["low", "high"],
+    )
+
+    class RecordingBackend(FakeWebBackend):
+        def __init__(self, provider, models=None):
+            super().__init__(provider, models=models)
+            self.calls = []
+
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            self.turn_calls += 1
+            self.calls.append((prompt, model, effort))
+            yield SessionStarted(f"{self.provider}-1")
+            yield TextBlockDone(f"{self.provider}:{model}")
+            yield TurnResult()
+
+    anthropic = RecordingBackend("anthropic", models=[])
+    openai = RecordingBackend("openai", models=[shared_openai])
+    backend_model_catalog["anthropic"] = anthropic
+    backend_model_catalog["openai"] = openai
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        init = websocket.receive_json()
+        assert init["workspace"]["is_open"] is False
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        ws_updated = websocket.receive_json()
+        assert ws_updated["type"] == "workspace_updated"
+        assert ws_updated["workspace"]["models"] == ["shared"]
+        assert ws_updated["workspace"]["model_providers"] == {"shared": "openai"}
+        agent_id = ws_updated["workspace"]["agents"][0]["agent_id"]
+
+        # Publish a colliding "shared" from Anthropic so OpenAI's moves to "openai/shared".
+        anthropic.models = [shared_anthropic]
+        assert (
+            client.post(
+                "/api/auth", json={"provider": "anthropic", "method": "cli"}
+            ).status_code
+            == 200
+        )
+        auth_evt = websocket.receive_json()
+        assert auth_evt["type"] == "auth_changed"
+        assert auth_evt["models"] == ["shared", "openai/shared"]
+        assert auth_evt["model_providers"] == {
+            "shared": "anthropic",
+            "openai/shared": "openai",
+        }
+
+        # Submit a stale-catalogue payload targeting OpenAI's "shared": must go to OpenAI.
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "hello openai",
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            }
+        )
+        while True:
+            event = websocket.receive_json()
+            assert event["type"] != "error", event
+            if event["type"] == "turn_complete":
+                break
+        assert anthropic.turn_calls == 0
+        assert len(openai.calls) == 1
+        assert openai.calls[0][1:] == ("shared", "high")
+        assert client.app.state.runtime.get_agent(agent_id).model == "openai/shared"
+
+        # Session defaults with the same stale OpenAI payload also resolve to "openai/shared".
+        defaults_res = client.post(
+            "/api/session/defaults",
+            json={
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            },
+        )
+        assert defaults_res.status_code == 200
+        assert defaults_res.json()["session_defaults"] == {
+            "model": "openai/shared",
+            "effort": "high",
+        }
+        assert workspace.joinpath(".nocturnomath/config.json").exists()
+        assert client.app.state.runtime.get_agent(agent_id).default_provider == "openai"
+
+        # Drain idle status before testing removed provider rejection.
+        while client.app.state.runtime.get_agent(agent_id).has_active_query():
+            pass
+
+        # If OpenAI drops "shared", the stale OpenAI payload must error instead of hitting Anthropic.
+        openai.models = []
+        assert (
+            client.post(
+                "/api/auth", json={"provider": "openai", "method": "cli"}
+            ).status_code
+            == 200
+        )
+        while websocket.receive_json()["type"] != "auth_changed":
+            pass
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "should be rejected",
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            }
+        )
+        err = websocket.receive_json()
+        while err["type"] != "error":
+            err = websocket.receive_json()
+        assert "Choose a model from the model selector." in err["message"]
+        assert anthropic.turn_calls == 0

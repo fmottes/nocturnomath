@@ -493,21 +493,65 @@ class Runtime:
         )
         return model, effort, self.model_providers.get(model or "")
 
-    def set_session_defaults(self, model: str, effort: str | None):
-        session = self.require_session()
-        if model not in self.models:
+    def _resolve_requested_model(
+        self,
+        model: str | None,
+        *,
+        provider: ProviderId | None = None,
+        raw_model: str | None = None,
+    ) -> str | None:
+        if model is None:
+            if raw_model is not None:
+                raise ValueError("Choose a model from the model selector.")
+            return None
+        if provider is None:
+            if raw_model is None:
+                return model
+            if not self._models_discovered and not self.model_providers:
+                return model
+            if model not in self.models:
+                if self._models_discovered and not self.models:
+                    raise ValueError("No model available.")
+                raise ValueError("Choose a model from the model selector.")
+            if self.model_raw_ids.get(model, model) != raw_model:
+                raise ValueError("Choose a model from the model selector.")
+            return model
+        if provider not in PROVIDERS:
             raise ValueError("Choose a model from the model selector.")
-        supported = self.model_efforts.get(model, [])
+        if not self._models_discovered and not self.model_providers:
+            return model
+        resolved = self.resolve_model(raw_model or model, provider)
+        if resolved is None:
+            if self._models_discovered and not self.models:
+                raise ValueError("No model available.")
+            raise ValueError("Choose a model from the model selector.")
+        return resolved
+
+    def set_session_defaults(
+        self,
+        model: str,
+        effort: str | None,
+        *,
+        provider: ProviderId | None = None,
+        raw_model: str | None = None,
+    ):
+        session = self.require_session()
+        resolved_model = self._resolve_requested_model(
+            model, provider=provider, raw_model=raw_model
+        )
+        if resolved_model is None or resolved_model not in self.models:
+            raise ValueError("Choose a model from the model selector.")
+        supported = self.model_efforts.get(resolved_model, [])
         if effort is not None and effort not in supported:
             raise ValueError("Choose an effort supported by the selected model.")
         if supported and effort is None:
             raise ValueError("Choose an effort supported by the selected model.")
-        provider = self.model_providers.get(model)
-        session.set_session_defaults(model, effort, provider=provider)
+        resolved_provider = self.model_providers.get(resolved_model)
+        session.set_session_defaults(resolved_model, effort, provider=resolved_provider)
         for other in self.agents.values():
-            other.default_model = model
+            other.default_model = resolved_model
             other.default_effort = effort
-            other.default_provider = provider
+            other.default_provider = resolved_provider
 
     def reset_session(self):
         """Start a session with the workspace's configured defaults."""
@@ -973,6 +1017,9 @@ class Runtime:
         model: str | None = None,
         effort: str | None = None,
         agent_id: str | None = None,
+        *,
+        provider: ProviderId | None = None,
+        raw_model: str | None = None,
     ) -> str:
         if self.changing:
             raise RuntimeError(
@@ -982,10 +1029,13 @@ class Runtime:
         session = self.get_agent(agent_id)
         if changing_id in self._changing_agents and session.status != "compacting":
             raise RuntimeError("This explorer is changing. Please wait.")
-        self._validate_query_model(session, model, effort)
+        resolved_model = self._resolve_requested_model(
+            model, provider=provider, raw_model=raw_model
+        )
+        self._validate_query_model(session, resolved_model, effort)
         if session.has_active_query():
             session.enqueue_prompt(
-                text, mode=session.prompt_mode, model=model, effort=effort
+                text, mode=session.prompt_mode, model=resolved_model, effort=effort
             )
             if (
                 not session._is_busy
@@ -997,7 +1047,7 @@ class Runtime:
                 )
             return "pending"
 
-        self._apply_query_model(session, model, effort, agent_id)
+        self._apply_query_model(session, resolved_model, effort, agent_id)
         session.bind_next_turn()
         # An accepted first message allocates its session before the UI sees it.
         session.activate_session()

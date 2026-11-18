@@ -575,7 +575,9 @@ class TerminalApp:
 
     async def run_query(self, text: str):
         try:
-            query_state = self.runtime.start_query(text, self.pending_model)
+            query_state = self.runtime.start_query(
+                text, self.pending_model, provider=self.pending_model_provider
+            )
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return

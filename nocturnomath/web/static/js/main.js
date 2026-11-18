@@ -586,12 +586,16 @@ function setupEventListeners() {
     e.preventDefault();
     const text = elements.promptInput.value.trim();
     if (!text) return;
-    if (!elements.modelSelect.value) return;
+    const selectedModel = elements.modelSelect.value;
+    if (!selectedModel) return;
+    const selectedProvider = state.modelProviders[selectedModel] || null;
 
     sendWs("query", {
       agent_id: state.activeAgentId,
       text,
-      model: elements.modelSelect.value,
+      model: selectedModel,
+      provider: selectedProvider,
+      raw_model: rawModelId(selectedModel, selectedProvider),
       effort: elements.effortSelect.value || null,
     });
     elements.promptInput.value = "";
@@ -822,11 +826,15 @@ async function saveSessionDefaults(event) {
   elements.sessionDefaultsSave.disabled = true;
   elements.sessionDefaultsStatus.textContent = "Saving…";
   try {
+    const selectedModel = elements.defaultModelSelect.value;
+    const selectedProvider = state.modelProviders[selectedModel] || null;
     const response = await fetch("/api/session/defaults", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: elements.defaultModelSelect.value,
+        model: selectedModel,
+        provider: selectedProvider,
+        raw_model: rawModelId(selectedModel, selectedProvider),
         effort: elements.defaultEffortSelect.value || null,
       }),
     });

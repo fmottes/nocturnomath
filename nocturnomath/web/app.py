@@ -85,6 +85,8 @@ class DocumentsDefaultRequest(BaseModel):
 class SessionDefaultsRequest(BaseModel):
     model: str
     effort: str | None = None
+    provider: Literal["anthropic", "openai", "google"] | None = None
+    raw_model: str | None = None
 
 
 class ExplorationPromptRequest(BaseModel):
@@ -603,7 +605,12 @@ def create_app(
     @app.post("/api/session/defaults")
     async def set_session_defaults(defaults: SessionDefaultsRequest):
         try:
-            runtime.set_session_defaults(defaults.model, defaults.effort)
+            runtime.set_session_defaults(
+                defaults.model,
+                defaults.effort,
+                provider=defaults.provider,
+                raw_model=defaults.raw_model,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
@@ -824,7 +831,12 @@ def create_app(
                         )
                         continue
                     model = data.get("model")
-                    if model is not None and model not in runtime.models:
+                    provider = data.get("provider")
+                    raw_model = data.get("raw_model")
+                    if any(
+                        value is not None and not isinstance(value, str)
+                        for value in (model, provider, raw_model)
+                    ):
                         await runtime.broadcast(
                             "error",
                             {
@@ -834,10 +846,7 @@ def create_app(
                         )
                         continue
                     effort = data.get("effort")
-                    target_model = model or session.model
-                    if effort is not None and effort not in runtime.model_efforts.get(
-                        target_model or "", []
-                    ):
+                    if effort is not None and not isinstance(effort, str):
                         await runtime.broadcast(
                             "error",
                             {
@@ -847,7 +856,14 @@ def create_app(
                         )
                         continue
                     try:
-                        query_state = runtime.start_query(text, model, effort, agent_id)
+                        query_state = runtime.start_query(
+                            text,
+                            model,
+                            effort,
+                            agent_id,
+                            provider=provider,
+                            raw_model=raw_model,
+                        )
                     except (RuntimeError, ValueError) as exc:
                         await runtime.broadcast(
                             "error", {"agent_id": agent_id, "message": str(exc)}
