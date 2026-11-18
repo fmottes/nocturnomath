@@ -1169,3 +1169,81 @@ async def test_saved_session_defaults_recover_after_empty_discovery_on_reset(ses
     runtime2.reset_session()
     assert (session.model, session.effort) == ("gpt-5.4", "high")
     assert (runtime2.model, runtime2.effort) == ("gpt-5.4", "high")
+
+
+@pytest.mark.asyncio
+async def test_superseded_discovery_does_not_overwrite_backend_cli_path(
+    session, tmp_path
+):
+    import sys
+
+    from nocturnomath.backends.anthropic import AnthropicBackend
+
+    started_flag = tmp_path / "first_started"
+    release_flag = tmp_path / "first_release"
+
+    cli_first = tmp_path / "claude-first"
+    cli_first.write_text(
+        f"""#!{sys.executable}
+import json, pathlib, sys, time
+req = json.loads(sys.stdin.readline())
+pathlib.Path({str(started_flag)!r}).write_text("started")
+release = pathlib.Path({str(release_flag)!r})
+while not release.exists():
+    time.sleep(0.01)
+print(json.dumps({{
+    "type": "control_response",
+    "response": {{
+        "request_id": req["request_id"],
+        "subtype": "success",
+        "response": {{"models": [{{"value": "claude-old", "displayName": "Claude Old"}}]}},
+    }},
+}}), flush=True)
+"""
+    )
+    cli_first.chmod(0o700)
+
+    cli_second = tmp_path / "claude-second"
+    cli_second.write_text(
+        f"""#!{sys.executable}
+import json, sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({{
+    "type": "control_response",
+    "response": {{
+        "request_id": req["request_id"],
+        "subtype": "success",
+        "response": {{"models": [{{"value": "claude-new", "displayName": "Claude New"}}]}},
+    }},
+}}), flush=True)
+"""
+    )
+    cli_second.chmod(0o700)
+
+    backend = AnthropicBackend()
+    runtime = Runtime(session, backends=stub_backends(anthropic=backend))
+    calls = [[cli_first], [cli_second]]
+
+    with patch(
+        "nocturnomath.backends.anthropic.claude_cli_candidates",
+        side_effect=lambda: calls.pop(0),
+    ):
+        task1 = asyncio.create_task(runtime.discover_models())
+        try:
+            async with asyncio.timeout(5):
+                while not started_flag.exists():
+                    await asyncio.sleep(0.01)
+
+            await runtime.authenticate("anthropic", "api_key", "sk-new")
+            assert runtime.models == ["claude-new"]
+            assert backend.cli_path == cli_second
+
+            release_flag.write_text("go")
+            await task1
+        finally:
+            release_flag.write_text("go")
+            if not task1.done():
+                await task1
+
+    assert runtime.models == ["claude-new"]
+    assert backend.cli_path == cli_second

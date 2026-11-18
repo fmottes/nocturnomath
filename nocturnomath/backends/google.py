@@ -10,8 +10,8 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import AsyncIterator, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +187,14 @@ class GoogleBackend:
             self._api_key_dir = None
             self._api_key_secret = None
 
+    @staticmethod
+    def _write_api_settings(api_dir: Path) -> None:
+        cli_dir = api_dir / "antigravity-cli"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        (cli_dir / "settings.json").write_text(
+            json.dumps({"modelProvider": "gemini"}) + "\n", encoding="utf-8"
+        )
+
     def _prepare_env_and_flags(
         self, auth: ProviderAuth
     ) -> tuple[dict[str, str], list[str]]:
@@ -199,11 +207,7 @@ class GoogleBackend:
                     prefix="nocturnomath-agy-"
                 )
                 self._api_key_secret = auth.credential
-                cli_dir = Path(self._api_key_dir.name) / "antigravity-cli"
-                cli_dir.mkdir(parents=True, exist_ok=True)
-                (cli_dir / "settings.json").write_text(
-                    json.dumps({"modelProvider": "gemini"}) + "\n", encoding="utf-8"
-                )
+                self._write_api_settings(Path(self._api_key_dir.name))
                 if not self._atexit_registered:
                     atexit.register(self._cleanup_api_dir)
                     self._atexit_registered = True
@@ -336,61 +340,90 @@ class GoogleBackend:
                 stderr=stderr,
             )
 
-    async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
+    async def discover_models_staged(
+        self, auth: ProviderAuth
+    ) -> tuple[list[ModelSpec], Callable[[], None]]:
+        def commit_auth_dir() -> None:
+            self._prepare_env_and_flags(auth)
+
         candidates = agy_cli_candidates()
         if not candidates:
-            return []
-        env, flags = self._prepare_env_and_flags(auth)
-        for candidate in candidates:
-            proc: asyncio.subprocess.Process | None = None
-            stderr: StderrCollector | None = None
-            try:
-                async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                    with tempfile.TemporaryDirectory(
-                        prefix="nocturnomath-agy-cwd-"
-                    ) as isolated_cwd:
-                        proc = await asyncio.create_subprocess_exec(
-                            str(candidate),
-                            "acp",
-                            *flags,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            cwd=isolated_cwd,
-                            env=env,
-                        )
-                        stderr = StderrCollector(proc.stderr)
-                        messages = JsonMessageStream(proc.stdout)
-                        await self._initialize_acp(proc, messages, auth, stderr)
-                        session_info = await self._rpc(
-                            proc,
-                            messages,
-                            "session/new",
-                            {"cwd": isolated_cwd, "mcpServers": []},
-                            stderr=stderr,
-                        )
-                        models_state = session_info.get("models") or {}
-                        available = models_state.get("availableModels") or []
-                        current_model_id = models_state.get("currentModelId")
-                        specs, slug_map = _parse_gemini_models(
-                            available, current_model_id=current_model_id
-                        )
-                        self._slug_map.update(slug_map)
-                        if specs:
-                            self.cli_path = candidate
-                            return specs
-            except Exception as exc:
-                logger.warning(
-                    "Google Antigravity model discovery with %s failed: %s",
-                    candidate,
-                    exc,
-                )
-            finally:
-                if proc is not None:
-                    await terminate_process(proc, stderr)
-                elif stderr is not None:
-                    await stderr.close()
-        return []
+            return [], commit_auth_dir
+        env = {**os.environ, **auth.sdk_env()}
+        base_flags = ["--include-default-customizations=false"]
+        with (
+            tempfile.TemporaryDirectory(prefix="nocturnomath-agy-")
+            if auth.method == "api_key"
+            else nullcontext()
+        ) as probe_dir:
+            flags = list(base_flags)
+            if probe_dir is not None:
+                self._write_api_settings(Path(probe_dir))
+                flags.extend(["--gemini-dir", probe_dir])
+            for candidate in candidates:
+                proc: asyncio.subprocess.Process | None = None
+                stderr: StderrCollector | None = None
+                try:
+                    async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
+                        with tempfile.TemporaryDirectory(
+                            prefix="nocturnomath-agy-cwd-"
+                        ) as isolated_cwd:
+                            proc = await asyncio.create_subprocess_exec(
+                                str(candidate),
+                                "acp",
+                                *flags,
+                                stdin=asyncio.subprocess.PIPE,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                cwd=isolated_cwd,
+                                env=env,
+                            )
+                            stderr = StderrCollector(proc.stderr)
+                            messages = JsonMessageStream(proc.stdout)
+                            await self._initialize_acp(proc, messages, auth, stderr)
+                            session_info = await self._rpc(
+                                proc,
+                                messages,
+                                "session/new",
+                                {"cwd": isolated_cwd, "mcpServers": []},
+                                stderr=stderr,
+                            )
+                            models_state = session_info.get("models") or {}
+                            available = models_state.get("availableModels") or []
+                            current_model_id = models_state.get("currentModelId")
+                            specs, slug_map = _parse_gemini_models(
+                                available, current_model_id=current_model_id
+                            )
+                            if specs:
+
+                                def commit(
+                                    chosen: Path = candidate,
+                                    discovered_slugs: dict[
+                                        tuple[str, str], str
+                                    ] = slug_map,
+                                ) -> None:
+                                    commit_auth_dir()
+                                    self._slug_map.update(discovered_slugs)
+                                    self.cli_path = chosen
+
+                                return specs, commit
+                except Exception as exc:
+                    logger.warning(
+                        "Google Antigravity model discovery with %s failed: %s",
+                        candidate,
+                        exc,
+                    )
+                finally:
+                    if proc is not None:
+                        await terminate_process(proc, stderr)
+                    elif stderr is not None:
+                        await stderr.close()
+        return [], commit_auth_dir
+
+    async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
+        specs, commit = await self.discover_models_staged(auth)
+        commit()
+        return specs
 
     async def _configure_model(
         self,

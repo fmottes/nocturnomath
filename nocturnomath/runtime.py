@@ -11,7 +11,7 @@ from typing import Any
 
 from . import slurm
 from .auth import PROVIDERS, AuthStore, ProviderId
-from .backends import DEFAULT_EFFORT, AgentBackend, default_backends
+from .backends import DEFAULT_EFFORT, AgentBackend, ModelSpec, default_backends
 from .session import DEFAULT_PROMPT_MODE, ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
@@ -312,11 +312,18 @@ class Runtime:
         run_seq = self._discovery_seq
         auth_rev = self._auth_revision
         auth_snapshot = {provider: self.auth.get(provider) for provider in PROVIDERS}
+
+        async def probe_provider(
+            provider: ProviderId,
+        ) -> tuple[list[ModelSpec], Callable[[], None]]:
+            backend = self.backends[provider]
+            staged = getattr(backend, "discover_models_staged", None)
+            if callable(staged):
+                return await staged(auth_snapshot[provider])
+            return await backend.discover_models(auth_snapshot[provider]), lambda: None
+
         results = await asyncio.gather(
-            *(
-                self.backends[provider].discover_models(auth_snapshot[provider])
-                for provider in PROVIDERS
-            ),
+            *(probe_provider(provider) for provider in PROVIDERS),
             return_exceptions=True,
         )
         if auth_rev != self._auth_revision or run_seq < self._published_discovery_seq:
@@ -336,7 +343,9 @@ class Runtime:
             if isinstance(result, BaseException):
                 logger.warning("Could not discover %s models: %s", provider, result)
                 continue
-            for spec in result:
+            specs, commit = result
+            commit()
+            for spec in specs:
                 spec_id = spec.id
                 if spec_id in seen:
                     spec_id = f"{spec.provider}/{spec.raw_id}"

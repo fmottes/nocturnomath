@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -262,7 +262,9 @@ class AnthropicBackend:
             or f"Claude CLI exited before completing initialization (status {rc})."
         )
 
-    async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
+    async def discover_models_staged(
+        self, auth: ProviderAuth
+    ) -> tuple[list[ModelSpec], Callable[[], None]]:
         env = {**os.environ, **auth.sdk_env()}
         for candidate in claude_cli_candidates():
             proc: asyncio.subprocess.Process | None = None
@@ -294,14 +296,20 @@ class AnthropicBackend:
                         proc, read_jsonl(proc.stdout), req_id, stderr
                     )
                     if not _has_claude_credentials(resp, auth, env):
-                        self.cli_path = candidate
-                        return []
+
+                        def commit(chosen: Path = candidate) -> None:
+                            self.cli_path = chosen
+
+                        return [], commit
                     raw_models = resp.get("models")
                     entries = raw_models if isinstance(raw_models, list) else []
                     models = _parse_models(entries)
                     if models:
-                        self.cli_path = candidate
-                        return models
+
+                        def commit(chosen: Path = candidate) -> None:
+                            self.cli_path = chosen
+
+                        return models, commit
                     logger.warning(
                         "Claude CLI at %s reported no usable models", candidate
                     )
@@ -314,7 +322,12 @@ class AnthropicBackend:
                     await terminate_process(proc, stderr)
                 elif stderr is not None:
                     await stderr.close()
-        return []
+        return [], lambda: None
+
+    async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
+        models, commit = await self.discover_models_staged(auth)
+        commit()
+        return models
 
     def _build_turn_cmd(
         self,
