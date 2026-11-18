@@ -831,3 +831,96 @@ async def test_steer_fallback_batch_not_duplicated_and_respects_provider_switch(
         "batch msg two",
         "third turn",
     ]
+
+
+@pytest.mark.asyncio
+async def test_prompt_queued_during_background_probe_task_drains_when_finished(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    seen = []
+
+    class RecordingBackend(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            seen.append(prompt)
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("ran queued prompt")
+            yield TurnResult()
+
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=RecordingBackend("anthropic"))
+    )
+    release_bg = asyncio.Event()
+
+    async def bg_probe():
+        await release_bg.wait()
+
+    bg_task = asyncio.create_task(bg_probe())
+    session._probe_task = bg_task
+
+    assert session._is_busy is False
+    assert session._current_task is None
+    assert runtime.start_query("wait for background task") == "pending"
+    assert session.has_active_query() is True
+    assert session.pending_prompts_snapshot()[0]["mode"] == "queue"
+
+    release_bg.set()
+    await bg_task
+    await runtime.wait_for_query()
+
+    assert len(seen) == 1
+    assert seen[0].endswith("wait for background task")
+    assert session._probe_task is None
+    assert session._pending_prompts == []
+    assert session.has_active_query() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_submitted_during_failed_turn_error_broadcast_is_cleared(
+    session,
+):
+    from nocturnomath.backends import ModelSpec
+
+    class FailingBackend(StubBackend):
+        def __init__(self):
+            super().__init__("anthropic")
+            self.fail = True
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="test",
+                    raw_id="test",
+                    provider="anthropic",
+                    label="test",
+                    is_default=True,
+                )
+            ]
+
+        async def run_turn(self, prompt, **kwargs):
+            if self.fail:
+                raise RuntimeError("boom")
+            from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+            yield SessionStarted("ant-1")
+            yield TextBlockDone(f"ok:{prompt}")
+            yield TurnResult()
+
+    backend = FailingBackend()
+    runtime = Runtime(session, backends=stub_backends(anthropic=backend))
+    runtime.start()
+
+    async def on_event(event_type, payload):
+        if event_type == "error" and payload.get("message") == "boom":
+            runtime.start_query("raced prompt")
+
+    runtime.subscribe(on_event)
+    assert runtime.start_query("will fail") == "started"
+    await runtime.wait_for_query()
+
+    assert session._pending_prompts == []
+    assert session.has_active_query() is False
+    backend.fail = False
+    assert runtime.start_query("after recovery") == "started"
+    await runtime.wait_for_query()

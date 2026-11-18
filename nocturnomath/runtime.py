@@ -978,14 +978,23 @@ class Runtime:
             raise RuntimeError(
                 "The research environment is being prepared. Please wait."
             )
+        changing_id = agent_id if agent_id is not None else self.primary_agent_id
         session = self.get_agent(agent_id)
-        if agent_id in self._changing_agents and session.status != "compacting":
+        if changing_id in self._changing_agents and session.status != "compacting":
             raise RuntimeError("This explorer is changing. Please wait.")
         self._validate_query_model(session, model, effort)
         if session.has_active_query():
             session.enqueue_prompt(
                 text, mode=session.prompt_mode, model=model, effort=effort
             )
+            if (
+                not session._is_busy
+                and changing_id not in self._changing_agents
+                and (session._current_task is None or session._current_task.done())
+            ):
+                session._current_task = asyncio.create_task(
+                    self._wait_and_drain_pending(session, agent_id)
+                )
             return "pending"
 
         self._apply_query_model(session, model, effort, agent_id)
@@ -1029,7 +1038,7 @@ class Runtime:
 
     async def _drain_pending_loop(
         self, session: ExplorationSession, agent_id: str | None
-    ):
+    ) -> bool:
         while session._pending_prompts:
             batch = session.pop_next_turn_prompts()
             batch_model: str | None = None
@@ -1067,7 +1076,7 @@ class Runtime:
                     payload["agent_id"] = agent_id
                 await self.emit("error", payload)
                 await session.clear_pending_prompts()
-                break
+                return False
             self._apply_query_model(session, batch_model, batch_effort, agent_id)
             session.activate_session()
             for item in batch:
@@ -1089,7 +1098,36 @@ class Runtime:
                 session._pending_user_logs = None
             if ok is False:
                 await session.clear_pending_prompts()
+                return False
+        return True
+
+    async def _wait_and_drain_pending(
+        self, session: ExplorationSession, agent_id: str | None
+    ):
+        try:
+            while True:
+                probe_task = session._probe_task
+                if probe_task is not None:
+                    if not probe_task.done():
+                        await asyncio.gather(probe_task, return_exceptions=True)
+                    if session._probe_task is probe_task and probe_task.done():
+                        session._probe_task = None
+                    if probe_task is not session._probe_task:
+                        continue
+                if session._probe_operation_lock.locked():
+                    async with session._probe_operation_lock:
+                        pass
+                    continue
+                if session.kernel.busy:
+                    await asyncio.sleep(0.02)
+                    continue
                 break
+        except asyncio.CancelledError:
+            await session.clear_pending_prompts()
+            if session._current_task is asyncio.current_task():
+                session._current_task = None
+            return
+        await self._run_query_body(session, agent_id)
 
     async def _run_query_body(
         self,
@@ -1097,16 +1135,30 @@ class Runtime:
         agent_id: str | None,
         initial_text: str | None = None,
     ):
+        failed = False
         session._draining_queries = True
         try:
             ok = True
             if initial_text is not None:
                 ok = await session.query(initial_text)
-            if ok is not False:
-                await self._drain_pending_loop(session, agent_id)
+            if ok is False:
+                failed = True
+            else:
+                while session._pending_prompts:
+                    if not await self._drain_pending_loop(session, agent_id):
+                        failed = True
+                        break
+                    if (
+                        not session._pending_prompts
+                        and not session._is_busy
+                        and session.status != "idle"
+                    ):
+                        await session.emit("status_change", status="idle")
         except asyncio.CancelledError:
+            failed = True
             await session.clear_pending_prompts()
         except Exception as exc:
+            failed = True
             await session.clear_pending_prompts()
             logger.exception("Query task failed")
             payload = {"message": str(exc)}
@@ -1120,6 +1172,13 @@ class Runtime:
                 await session.emit("status_change", status="idle")
             if session._current_task is asyncio.current_task():
                 session._current_task = None
+            if session._pending_prompts:
+                if not failed and not self.changing and session._current_task is None:
+                    session._current_task = asyncio.create_task(
+                        self._drain_pending_queries(session, agent_id)
+                    )
+                else:
+                    await session.clear_pending_prompts()
 
     async def _run_query(
         self, session: ExplorationSession, text: str, agent_id: str | None

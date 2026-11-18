@@ -97,6 +97,16 @@ def builds_machinery(code: str) -> bool:
 def build_tools(session: "ExplorationSession"):
     """Create the exploration and scientific record tools for a session."""
 
+    def track_probe_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        session._probe_task = task
+
+        def clear(done: asyncio.Task[Any]) -> None:
+            if session._probe_task is done:
+                session._probe_task = None
+
+        task.add_done_callback(clear)
+        return task
+
     def serialize_probe_operation(handler):
         @wraps(handler)
         async def guarded(args):
@@ -276,8 +286,9 @@ def build_tools(session: "ExplorationSession"):
             code_path=code_path,
             kernel_alive=session.kernel.is_alive(),
         )
-        execution = asyncio.create_task(asyncio.to_thread(execute_and_save))
-        session._probe_task = execution
+        execution = track_probe_task(
+            asyncio.create_task(asyncio.to_thread(execute_and_save))
+        )
         try:
             text, images, kernel_note, plot_paths, status = await asyncio.shield(
                 execution
@@ -573,8 +584,9 @@ def build_tools(session: "ExplorationSession"):
             session._probe_task and not session._probe_task.done()
         ):
             return failure("An operation is still running.")
-        task = asyncio.create_task(asyncio.to_thread(session.kernel.restart))
-        session._probe_task = task
+        task = track_probe_task(
+            asyncio.create_task(asyncio.to_thread(session.kernel.restart))
+        )
         try:
             await asyncio.shield(task)
         finally:
@@ -612,10 +624,11 @@ def build_tools(session: "ExplorationSession"):
             session._probe_task and not session._probe_task.done()
         ):
             return failure("An operation is still running.")
-        task = asyncio.create_task(
-            asyncio.to_thread(session.install_packages, args["packages"])
+        task = track_probe_task(
+            asyncio.create_task(
+                asyncio.to_thread(session.install_packages, args["packages"])
+            )
         )
-        session._probe_task = task
         try:
             status, output, message = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -680,24 +693,27 @@ def build_tools(session: "ExplorationSession"):
         ):
             return failure("An operation is still running.")
         session.activate_session()
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                slurm.submit,
-                session,
-                args["code"],
-                args["expected"],
-                args["time_minutes"],
-                args["cpus"],
-                args["memory_gb"],
-                args.get("partition", ""),
-                args.get("gpus", 0),
-                args.get("account", ""),
-                args.get("qos", ""),
-                args.get("result_files", []),
-                correction_of=args.get("correction_of", session._slurm_review_probe_id),
+        task = track_probe_task(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    slurm.submit,
+                    session,
+                    args["code"],
+                    args["expected"],
+                    args["time_minutes"],
+                    args["cpus"],
+                    args["memory_gb"],
+                    args.get("partition", ""),
+                    args.get("gpus", 0),
+                    args.get("account", ""),
+                    args.get("qos", ""),
+                    args.get("result_files", []),
+                    correction_of=args.get(
+                        "correction_of", session._slurm_review_probe_id
+                    ),
+                )
             )
         )
-        session._probe_task = task
         try:
             probe_id, job_id = await asyncio.shield(task)
         except asyncio.CancelledError:
