@@ -528,12 +528,18 @@ class Runtime:
                         owner_provider = (
                             session._active_provider or session._owner_provider
                         )
-                        if owner_provider is not None:
-                            session.model, session.effort = self._select_provider_model(
+                        owner_model, owner_effort = (
+                            self._select_provider_model(
                                 owner_provider,
                                 session._active_model,
                                 session._active_effort,
                             )
+                            if owner_provider is not None
+                            else (None, None)
+                        )
+                        if owner_model is not None:
+                            session.model = owner_model
+                            session.effort = owner_effort
                         else:
                             session.model = default_model
                             session.effort = default_effort
@@ -864,22 +870,28 @@ class Runtime:
             if session_id is not None:
                 owner_provider = session._active_provider or session._owner_provider
                 if owner_provider is not None:
-                    session.model, session.effort = self._select_provider_model(
+                    owner_model, owner_effort = self._select_provider_model(
                         owner_provider,
                         session._active_model,
                         session._active_effort,
                     )
+                    if owner_model is not None:
+                        session.model = owner_model
+                        session.effort = owner_effort
         elif session_id is not None:
             owner_provider = session._active_provider or session._owner_provider
             if owner_provider is not None and (
                 session.model is None
                 or session.provider_for_model(session.model) != owner_provider
             ):
-                session.model, session.effort = self._select_provider_model(
+                owner_model, owner_effort = self._select_provider_model(
                     owner_provider,
                     session._active_model,
                     session._active_effort,
                 )
+                if owner_model is not None:
+                    session.model = owner_model
+                    session.effort = owner_effort
         self._subscribe_to_agent(agent_id, session)
         return agent_id
 

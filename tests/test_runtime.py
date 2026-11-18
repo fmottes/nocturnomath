@@ -1286,3 +1286,61 @@ async def test_discovery_commit_failure_is_isolated_per_provider(session):
     assert runtime.models == ["claude-sonnet-5"]
     assert runtime.model == "claude-sonnet-5"
     assert session.model == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_active_chat_falls_back_to_workspace_default_after_empty_then_partial_discovery(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    anthropic_spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="claude-sonnet-5",
+        efforts=["medium"],
+        is_default=True,
+    )
+    openai_spec = ModelSpec(
+        id="gpt-5.4",
+        raw_id="gpt-5.4",
+        provider="openai",
+        label="GPT-5.4",
+        efforts=["high"],
+    )
+
+    class ActiveOpenAI(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    runtime = Runtime(
+        session,
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic",
+                responses=[[anthropic_spec], [], [anthropic_spec]],
+            ),
+            openai=ActiveOpenAI("openai", responses=[[openai_spec], [], []]),
+        ),
+    )
+
+    await runtime.discover_models()
+    assert (
+        runtime.start_query("run on openai", "gpt-5.4", "high", provider="openai")
+        == "started"
+    )
+    await runtime.wait_for_query()
+    assert session._active_provider == "openai"
+
+    await runtime.discover_models()
+    assert runtime.models == []
+    assert session.model is None
+    assert runtime.model is None
+
+    await runtime.discover_models()
+    assert runtime.models == ["claude-sonnet-5"]
+    assert session.model == "claude-sonnet-5"
+    assert runtime.model == "claude-sonnet-5"
