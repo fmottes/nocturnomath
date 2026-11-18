@@ -28,6 +28,9 @@ class StubBackend:
             return self.responses.pop(0)
         return self.responses[0]
 
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
+
     async def run_turn(self, *args, **kwargs):
         if False:
             yield None

@@ -19,6 +19,11 @@ def tools(session):
     return {tool.name: tool for tool in session.tools}
 
 
+class _StagedDiscoveryMixin:
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
+
+
 @pytest.fixture(autouse=True)
 def research_environment():
     with (
@@ -863,9 +868,16 @@ async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavaila
 
     anthropic_calls = []
     openai_calls = []
+    waiting_notices = []
     openai_available = True
 
-    class AnthropicStub:
+    def record_notice(event_type, payload):
+        if event_type == "system_message" and "waiting for" in payload.get("text", ""):
+            waiting_notices.append(payload["text"])
+
+    runtime.subscribe(record_notice)
+
+    class AnthropicStub(_StagedDiscoveryMixin):
         provider = "anthropic"
         uses_compact_hook = True
 
@@ -889,7 +901,7 @@ async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavaila
         async def compact(self, **kwargs):
             return None
 
-    class OpenAIStub:
+    class OpenAIStub(_StagedDiscoveryMixin):
         provider = "openai"
         uses_compact_hook = False
 
@@ -944,7 +956,7 @@ async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavaila
         async def compact(self, **kwargs):
             return None
 
-    class EmptyGoogleStub:
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
         provider = "google"
         uses_compact_hook = False
 
@@ -985,12 +997,15 @@ async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavaila
 
     complete(runtime.session, cluster, probe_id, job_id)
     await runtime._poll_slurm_jobs()
+    await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
 
     assert anthropic_calls == []
     assert len(openai_calls) == 1
     assert len(runtime.agents) == 1
     assert slurm.needs_review(runtime.session.workspace, probe_id)
+    assert len(waiting_notices) == 1
+    assert "waiting for OpenAI models to become available" in waiting_notices[0]
 
     # Restore OpenAI availability; automatic review resumes on OpenAI, not Claude.
     openai_available = True
@@ -1017,7 +1032,7 @@ async def test_reopened_review_after_partial_provider_switch_stays_on_new_owner(
     anthropic_calls = []
     openai_calls = []
 
-    class AnthropicStub:
+    class AnthropicStub(_StagedDiscoveryMixin):
         provider = "anthropic"
         uses_compact_hook = True
 
@@ -1042,7 +1057,7 @@ async def test_reopened_review_after_partial_provider_switch_stays_on_new_owner(
         async def compact(self, **kwargs):
             return None
 
-    class OpenAIStub:
+    class OpenAIStub(_StagedDiscoveryMixin):
         provider = "openai"
         uses_compact_hook = False
 
@@ -1094,7 +1109,7 @@ async def test_reopened_review_after_partial_provider_switch_stays_on_new_owner(
         async def compact(self, **kwargs):
             return None
 
-    class EmptyGoogleStub:
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
         provider = "google"
         uses_compact_hook = False
 
@@ -1156,7 +1171,7 @@ async def test_reopened_review_uses_latest_model_and_effort_on_same_native_threa
 
     openai_calls = []
 
-    class EmptyAnthropicStub:
+    class EmptyAnthropicStub(_StagedDiscoveryMixin):
         provider = "anthropic"
         uses_compact_hook = True
 
@@ -1170,7 +1185,7 @@ async def test_reopened_review_uses_latest_model_and_effort_on_same_native_threa
         async def compact(self, **kwargs):
             return None
 
-    class OpenAIStub:
+    class OpenAIStub(_StagedDiscoveryMixin):
         provider = "openai"
         uses_compact_hook = False
 
@@ -1236,7 +1251,7 @@ async def test_reopened_review_uses_latest_model_and_effort_on_same_native_threa
         async def compact(self, **kwargs):
             return None
 
-    class EmptyGoogleStub:
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
         provider = "google"
         uses_compact_hook = False
 

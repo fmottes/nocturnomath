@@ -60,6 +60,9 @@ class FakeBackend:
             ModelSpec(id="test", raw_id="test", provider=self.provider, label="test")
         ]
 
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
+
     async def run_turn(
         self,
         prompt,

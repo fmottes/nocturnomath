@@ -80,14 +80,17 @@ def codex_cli_candidates() -> list[Path]:
 
 def _is_missing_thread_error(text: str) -> bool:
     lowered = text.lower()
-    return any(
+    if any(
         marker in lowered
         for marker in (
             "no rollout found",
             "thread not found",
             "conversation not found",
-            "does not exist",
         )
+    ):
+        return True
+    return "does not exist" in lowered and any(
+        noun in lowered for noun in ("thread", "rollout", "conversation")
     )
 
 

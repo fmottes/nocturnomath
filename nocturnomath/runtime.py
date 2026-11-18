@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from . import slurm
-from .auth import PROVIDERS, AuthStore, ProviderId
-from .backends import DEFAULT_EFFORT, AgentBackend, ModelSpec, default_backends
+from .auth import PROVIDER_TITLES, PROVIDERS, AuthStore, ProviderId
+from .backends import DEFAULT_EFFORT, AgentBackend, default_backends
 from .session import DEFAULT_PROMPT_MODE, ExplorationSession
 
 logger = logging.getLogger("nocturnomath.runtime")
@@ -83,6 +83,10 @@ class Runtime:
         self._slurm_wakeup = asyncio.Event()
         self._slurm_seen: dict[tuple[Path, str], tuple] = {}
         self._slurm_review_attempts: set[tuple[Path, str]] = set()
+        self._slurm_waiting_notices: set[tuple[Path, str, ProviderId]] = set()
+        self._closed_session_meta_cache: dict[
+            Path, tuple[int, int, tuple[str | None, str | None, str | None]]
+        ] = {}
         if session is not None:
             self.primary_agent_id = self._new_agent_id()
             self.agents[self.primary_agent_id] = session
@@ -202,12 +206,35 @@ class Runtime:
             return self.model, preferred_effort or self.effort
         return None, None
 
+    def _closed_session_meta(
+        self, workspace, session_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        with suppress(Exception):
+            path = workspace.transcript_file(session_id)
+            stat = path.stat()
+            cached = self._closed_session_meta_cache.get(path)
+            if (
+                cached is not None
+                and cached[0] == stat.st_mtime_ns
+                and cached[1] == stat.st_size
+            ):
+                return cached[2]
+            records = workspace.read_transcript(path)
+            meta = workspace.session_provider_and_model(records)
+            self._closed_session_meta_cache[path] = (
+                stat.st_mtime_ns,
+                stat.st_size,
+                meta,
+            )
+            return meta
+        return None, None, None
+
     def _slurm_review_model(
         self,
         workspace,
         session_id: str,
         session: ExplorationSession | None = None,
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, ProviderId | None]:
         owner_provider: ProviderId | None = None
         preferred_model: str | None = None
         preferred_effort: str | None = None
@@ -216,18 +243,17 @@ class Runtime:
             preferred_model = session._active_model
             preferred_effort = session._active_effort
         if owner_provider is None:
-            records: list[dict[str, Any]] = []
-            with suppress(Exception):
-                records = (
-                    session.workspace.current_records()
-                    if session is not None
-                    else workspace.read_transcript(
-                        workspace.transcript_file(session_id)
-                    )
+            if session is not None:
+                records: list[dict[str, Any]] = []
+                with suppress(Exception):
+                    records = session.workspace.current_records()
+                raw_provider, rec_model, rec_effort = (
+                    workspace.session_provider_and_model(records)
                 )
-            raw_provider, rec_model, rec_effort = workspace.session_provider_and_model(
-                records
-            )
+            else:
+                raw_provider, rec_model, rec_effort = self._closed_session_meta(
+                    workspace, session_id
+                )
             if raw_provider in self.backends:
                 owner_provider = raw_provider
                 preferred_model = preferred_model or rec_model
@@ -241,13 +267,44 @@ class Runtime:
             ):
                 preferred_model = session.model
                 preferred_effort = preferred_effort or session.effort
-            return self._select_provider_model(
+            model, effort = self._select_provider_model(
                 owner_provider, preferred_model, preferred_effort
             )
+            return model, effort, owner_provider
         target = session or self.session
         if target is None or target.model is None:
-            return None, None
-        return target.model, target.effort
+            return None, None, None
+        return target.model, target.effort, None
+
+    async def _emit_waiting_review_notice(
+        self,
+        workspace,
+        probe_id: str,
+        owner_provider: ProviderId,
+        target_session: ExplorationSession | None = None,
+        target_agent_id: str | None = None,
+    ) -> None:
+        notice_key = (workspace.path, probe_id, owner_provider)
+        if notice_key in self._slurm_waiting_notices:
+            return
+        target = target_session or self.session
+        if target is None:
+            return
+        resolved_agent_id = (
+            target_agent_id if target_session is not None else self.primary_agent_id
+        )
+        self._slurm_waiting_notices.add(notice_key)
+        title = PROVIDER_TITLES.get(owner_provider, owner_provider)
+        text = (
+            f"Slurm probe {probe_id} finished; automatic review is waiting "
+            f"for {title} models to become available."
+        )
+        await target.emit("system_message", text=text)
+        if resolved_agent_id not in self._agent_subscribers:
+            await self.emit(
+                "system_message",
+                {"agent_id": resolved_agent_id, "text": text},
+            )
 
     async def _poll_slurm_jobs(self):
         if not self._started or self.changing or self.session is None:
@@ -277,7 +334,9 @@ class Runtime:
                 and not self._changing_agents
                 and not any(agent.has_active_query() for agent in self.agents.values())
             ):
-                review_model, _ = self._slurm_review_model(workspace, session_id)
+                review_model, _, owner_provider = self._slurm_review_model(
+                    workspace, session_id
+                )
                 if review_model is not None:
                     # Resume the owning chat, never repurpose the user's current chat.
                     agent_id = await self.transition(
@@ -288,6 +347,12 @@ class Runtime:
                         )
                     )
                     await self.emit("agent_added", self.agent_snapshot(agent_id))
+                elif owner_provider is not None and await asyncio.to_thread(
+                    slurm.needs_review, workspace, probe_id
+                ):
+                    await self._emit_waiting_review_notice(
+                        workspace, probe_id, owner_provider
+                    )
             if agent_id is None:
                 continue
             session = self.agents.get(agent_id)
@@ -336,7 +401,7 @@ class Runtime:
                 and agent_id not in self._changing_agents
                 and session._pending_verdict_probe_id in (None, probe_id)
             ):
-                review_model, review_effort = self._slurm_review_model(
+                review_model, review_effort, owner_provider = self._slurm_review_model(
                     workspace, session_id, session
                 )
                 if review_model is not None:
@@ -348,6 +413,12 @@ class Runtime:
                             model=review_model,
                             effort=review_effort,
                         )
+                    )
+                elif owner_provider is not None and await asyncio.to_thread(
+                    slurm.needs_review, workspace, probe_id
+                ):
+                    await self._emit_waiting_review_notice(
+                        workspace, probe_id, owner_provider, session, agent_id
                     )
 
     async def _review_slurm(
@@ -366,6 +437,12 @@ class Runtime:
                 # Do not repeatedly bill for a failed or interrupted review. The saved
                 # unresolved result is retried when the workspace is next opened.
                 self._slurm_review_attempts.add(key)
+                for notice_key in [
+                    item
+                    for item in self._slurm_waiting_notices
+                    if item[0] == session.workspace.path and item[1] == probe_id
+                ]:
+                    self._slurm_waiting_notices.discard(notice_key)
                 await asyncio.to_thread(
                     slurm.set_review_pending, session.workspace, probe_id, True
                 )
@@ -426,18 +503,11 @@ class Runtime:
         run_seq = self._discovery_seq
         auth_rev = self._auth_revision
         auth_snapshot = {provider: self.auth.get(provider) for provider in PROVIDERS}
-
-        async def probe_provider(
-            provider: ProviderId,
-        ) -> tuple[list[ModelSpec], Callable[[], None]]:
-            backend = self.backends[provider]
-            staged = getattr(backend, "discover_models_staged", None)
-            if callable(staged):
-                return await staged(auth_snapshot[provider])
-            return await backend.discover_models(auth_snapshot[provider]), lambda: None
-
         results = await asyncio.gather(
-            *(probe_provider(provider) for provider in PROVIDERS),
+            *(
+                self.backends[provider].discover_models_staged(auth_snapshot[provider])
+                for provider in PROVIDERS
+            ),
             return_exceptions=True,
         )
         if auth_rev != self._auth_revision or run_seq < self._published_discovery_seq:
@@ -772,6 +842,8 @@ class Runtime:
             raise ValueError("Choose an existing folder for the workspace.")
         self._slurm_seen.clear()
         self._slurm_review_attempts.clear()
+        self._slurm_waiting_notices.clear()
+        self._closed_session_meta_cache.clear()
 
         # Keep the terminal's long-standing in-place session contract when it
         # is the only explorer. Multi-tab workspace changes intentionally tear

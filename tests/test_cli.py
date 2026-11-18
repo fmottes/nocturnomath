@@ -783,6 +783,9 @@ async def test_pending_model_stays_bound_to_provider_across_auth_refresh(termina
                 self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
             )
 
+        async def discover_models_staged(self, auth):
+            return await self.discover_models(auth), lambda: None
+
     terminal.runtime.backends = {
         "anthropic": CollidingBackend(
             "anthropic", [[], [shared("anthropic")], [shared("anthropic")]]

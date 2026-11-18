@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
@@ -125,6 +125,10 @@ class AgentBackend(Protocol):
     uses_compact_hook: bool
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]: ...
+
+    async def discover_models_staged(
+        self, auth: ProviderAuth
+    ) -> tuple[list[ModelSpec], Callable[[], None]]: ...
 
     def run_turn(
         self,
@@ -296,13 +300,8 @@ async def terminate_process(
             except TimeoutError:
                 with suppress(ProcessLookupError):
                     proc.kill()
-                try:
+                with suppress(TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except TimeoutError:
-                    transport = getattr(proc, "_transport", None)
-                    if transport is not None:
-                        with suppress(Exception):
-                            transport.close()
     finally:
         if stdout_drain is not None:
             if not stdout_drain.done():

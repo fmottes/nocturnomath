@@ -35,6 +35,9 @@ class FakeWebBackend:
             raise self.error
         return list(self.models)
 
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
+
     async def run_turn(self, *args, **kwargs):
         self.turn_calls += 1
         if False:

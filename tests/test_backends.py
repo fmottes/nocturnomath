@@ -977,3 +977,72 @@ for line in sys.stdin:
     assert "session/set_model" in seen_methods
     assert seen_methods.count("session/set_config_option") == 2
     assert "session/prompt" not in seen_methods
+
+
+def test_missing_thread_and_session_helpers_ignore_unrelated_does_not_exist():
+    from nocturnomath.backends.google import _is_missing_session_error
+    from nocturnomath.backends.openai import _is_missing_thread_error
+
+    assert not _is_missing_thread_error("Working directory does not exist")
+    assert not _is_missing_thread_error("File /tmp/foo.py does not exist")
+    assert _is_missing_thread_error("Thread thr-123 does not exist")
+    assert _is_missing_thread_error("No rollout found for id")
+    assert _is_missing_thread_error("Thread not found")
+
+    assert not _is_missing_session_error("Working directory does not exist")
+    assert not _is_missing_session_error(
+        "No session cookie provided? Wait no directory"
+    )
+    assert _is_missing_session_error("Session agy-1 does not exist")
+    assert _is_missing_session_error("Session not found")
+    assert _is_missing_session_error("No session found")
+
+
+@pytest.mark.asyncio
+async def test_anthropic_backend_enforces_mcp_tool_timeout_floor(tmp_path, monkeypatch):
+    seen_timeouts: list[str] = []
+    fake = _write_fake_cli(
+        tmp_path / "claude",
+        f"""
+import json, os, sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({{
+    "type": "control_response",
+    "response": {{"request_id": req["request_id"], "subtype": "success", "response": {{}}}},
+}}), flush=True)
+with open({str(tmp_path / "env.log")!r}, "a") as fh:
+    fh.write(os.environ.get("MCP_TOOL_TIMEOUT", "") + "\\n")
+print(json.dumps({{"type": "result", "subtype": "success"}}), flush=True)
+""",
+    )
+    backend = AnthropicBackend(cli_path=fake)
+    auth = ProviderAuth("anthropic", "cli")
+
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT", "1000")
+    async for _ in backend.run_turn(
+        "hi",
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="claude-sonnet-5",
+        effort=None,
+        auth=auth,
+        tool_timeout_s=660,
+    ):
+        pass
+
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT", "900000")
+    async for _ in backend.run_turn(
+        "hi",
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="claude-sonnet-5",
+        effort=None,
+        auth=auth,
+        tool_timeout_s=660,
+    ):
+        pass
+
+    seen_timeouts = (tmp_path / "env.log").read_text().splitlines()
+    assert seen_timeouts == ["660000", "900000"]

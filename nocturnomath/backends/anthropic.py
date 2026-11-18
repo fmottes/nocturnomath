@@ -454,8 +454,12 @@ class AnthropicBackend:
             **auth.sdk_env(),
             "NOCTURNOMATH_WORKSPACE_PATH": str(workspace_path),
         }
-        if not env.get("MCP_TOOL_TIMEOUT"):
-            env["MCP_TOOL_TIMEOUT"] = str(max(1, int(tool_timeout_s)) * 1000)
+        required_timeout_ms = max(1, int(tool_timeout_s)) * 1000
+        try:
+            configured_ms = int(env.get("MCP_TOOL_TIMEOUT") or 0)
+        except ValueError:
+            configured_ms = 0
+        env["MCP_TOOL_TIMEOUT"] = str(max(required_timeout_ms, configured_ms))
         async with McpToolBridge(tools) as bridge:
             cmd = self._build_turn_cmd(
                 cli_path,

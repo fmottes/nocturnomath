@@ -51,16 +51,18 @@ _AGY_EXECUTOR_ERROR_PREFIXES = (
 
 def _is_missing_session_error(text: str) -> bool:
     lowered = text.lower()
-    return any(
+    if any(
         marker in lowered
         for marker in (
             "failed to read session",
             "session not found",
             "unknown session",
-            "no session",
-            "does not exist",
+            "no session found",
+            "no such session",
         )
-    )
+    ):
+        return True
+    return "does not exist" in lowered and "session" in lowered
 
 
 def _extract_agy_executor_error(text: Any) -> str | None:
