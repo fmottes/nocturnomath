@@ -44,7 +44,18 @@ async def test_mcp_bridge_serves_stdio_subprocess_roundtrip():
     started_slow = asyncio.Event()
     release_slow = asyncio.Event()
 
-    @tool("echo", "Echo text and optional png.", {"text": str, "with_image": bool})
+    @tool(
+        "echo",
+        "Echo text and optional png.",
+        {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "with_image": {"type": "boolean"},
+            },
+            "required": ["text"],
+        },
+    )
     async def echo(args):
         if args.get("text") == "fail":
             return {
@@ -249,3 +260,62 @@ async def test_mcp_bridge_emits_progress_notifications(monkeypatch):
         finally:
             proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_validates_schema_types_and_strips_optional_nulls():
+    seen: list[dict] = []
+
+    @tool(
+        "probe_like",
+        "Check schema validation.",
+        {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "expected": {"type": "string"},
+                "gpus": {"type": "integer"},
+                "replace_existing": {"type": "boolean"},
+                "packages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+            },
+            "required": ["code"],
+        },
+    )
+    async def probe_like(args):
+        seen.append(dict(args))
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    bridge = McpToolBridge([probe_like])
+
+    async def call(arguments):
+        resp = await bridge._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "probe_like", "arguments": arguments},
+            }
+        )
+        return resp["result"]
+
+    ok = await call({"code": "print(1)", "expected": None, "gpus": None})
+    assert ok["isError"] is False
+    assert seen == [{"code": "print(1)"}]
+
+    for bad in (
+        {},
+        {"code": None},
+        {"code": 123},
+        {"code": "x", "gpus": True},
+        {"code": "x", "replace_existing": "false"},
+        {"code": "x", "packages": "scipy"},
+        {"code": "x", "packages": []},
+        {"code": "x", "packages": [1]},
+    ):
+        res = await call(bad)
+        assert res["isError"] is True, bad
+    assert len(seen) == 1

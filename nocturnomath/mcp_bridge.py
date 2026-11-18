@@ -46,6 +46,83 @@ def _jsonrpc_error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
+def _check_json_type(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _validate_property_value(name: str, value: Any, prop: dict[str, Any]) -> None:
+    expected = prop.get("type")
+    if isinstance(expected, str):
+        if not _check_json_type(value, expected):
+            raise ValueError(f"Argument '{name}' must be of type {expected}.")
+    elif (
+        isinstance(expected, list)
+        and expected
+        and not any(isinstance(t, str) and _check_json_type(value, t) for t in expected)
+    ):
+        joined = " | ".join(str(t) for t in expected)
+        raise ValueError(f"Argument '{name}' must be of type {joined}.")
+    if "enum" in prop and isinstance(prop["enum"], list) and value not in prop["enum"]:
+        raise ValueError(f"Argument '{name}' must be one of {prop['enum']}.")
+    if isinstance(value, list):
+        min_items = prop.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ValueError(
+                f"Argument '{name}' must contain at least {min_items} item(s)."
+            )
+        items_schema = prop.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                _validate_property_value(f"{name}[{index}]", item, items_schema)
+
+
+def _validate_arguments(
+    schema: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    properties = (
+        schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    )
+    required_list = (
+        schema.get("required") if isinstance(schema.get("required"), list) else []
+    )
+    required = {item for item in required_list if isinstance(item, str)}
+    cleaned: dict[str, Any] = {}
+    for key, value in arguments.items():
+        prop = properties.get(key)
+        if value is None:
+            prop_type = prop.get("type") if isinstance(prop, dict) else None
+            allows_null = prop_type == "null" or (
+                isinstance(prop_type, list) and "null" in prop_type
+            )
+            if allows_null:
+                cleaned[key] = None
+                continue
+            if key not in required:
+                continue
+            raise ValueError(f"Argument '{key}' is required and cannot be null.")
+        if isinstance(prop, dict):
+            _validate_property_value(key, value, prop)
+        cleaned[key] = value
+    for key in required_list:
+        if isinstance(key, str) and key not in cleaned:
+            raise ValueError(f"Missing required argument: '{key}'.")
+    return cleaned
+
+
 class McpToolBridge:
     """Serve ``ToolSpec`` handlers over an authenticated loopback TCP socket."""
 
@@ -81,11 +158,15 @@ class McpToolBridge:
             await self.__aexit__(None, None, None)
             raise
 
-    async def __aexit__(self, *args: object) -> None:
+    async def cancel_in_flight(self) -> None:
+        """Cancel active client connections and running tool handlers immediately."""
         for task in list(self._client_tasks):
             task.cancel()
         if self._client_tasks:
             await asyncio.gather(*self._client_tasks, return_exceptions=True)
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.cancel_in_flight()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -130,28 +211,44 @@ class McpToolBridge:
 
             write_lock = asyncio.Lock()
             in_flight: set[asyncio.Task[None]] = set()
+            in_flight_by_id: dict[Any, asyncio.Task[None]] = {}
 
             async def send_json(payload: dict[str, Any]) -> None:
                 async with write_lock:
                     writer.write((json.dumps(payload) + "\n").encode("utf-8"))
                     await writer.drain()
 
-            async def handle_line(raw: str) -> None:
+            async def handle_parsed(request: Any, msg_id: Any) -> None:
                 try:
-                    request = json.loads(raw)
-                except json.JSONDecodeError:
-                    response = _jsonrpc_error(None, -32700, "Parse error")
-                else:
                     response = await self._dispatch(request, notify=send_json)
-                if response is not None:
-                    await send_json(response)
+                    if response is not None:
+                        await send_json(response)
+                finally:
+                    if msg_id is not None:
+                        in_flight_by_id.pop(msg_id, None)
 
             try:
                 async for line in lines:
                     if not line:
                         continue
-                    req_task = asyncio.create_task(handle_line(line))
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        await send_json(_jsonrpc_error(None, -32700, "Parse error"))
+                        continue
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get("method") == "notifications/cancelled"
+                    ):
+                        cancel_id = (parsed.get("params") or {}).get("requestId")
+                        if cancel_id is not None and cancel_id in in_flight_by_id:
+                            in_flight_by_id[cancel_id].cancel()
+                        continue
+                    msg_id = parsed.get("id") if isinstance(parsed, dict) else None
+                    req_task = asyncio.create_task(handle_parsed(parsed, msg_id))
                     in_flight.add(req_task)
+                    if msg_id is not None:
+                        in_flight_by_id[msg_id] = req_task
                     req_task.add_done_callback(in_flight.discard)
                 if in_flight:
                     await asyncio.gather(*in_flight, return_exceptions=True)
@@ -257,6 +354,16 @@ class McpToolBridge:
             if not isinstance(arguments, dict):
                 return _jsonrpc_error(
                     msg_id, -32602, "Tool arguments must be an object"
+                )
+            try:
+                arguments = _validate_arguments(spec.input_schema, arguments)
+            except ValueError as exc:
+                return _jsonrpc_result(
+                    msg_id,
+                    {
+                        "content": [{"type": "text", "text": str(exc)}],
+                        "isError": True,
+                    },
                 )
             meta = params.get("_meta")
             progress_token = (
