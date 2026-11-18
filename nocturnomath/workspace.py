@@ -786,7 +786,12 @@ class Workspace:
         return outputs
 
     @staticmethod
-    def recap(records: list[dict[str, Any]], max_chars: int = 8000) -> str:
+    def recap(
+        records: list[dict[str, Any]],
+        max_chars: int = 8000,
+        *,
+        kernel_preserved: bool = False,
+    ) -> str:
         lines = []
         for record in records:
             kind = record.get("kind")
@@ -809,8 +814,17 @@ class Workspace:
         body = "\n\n".join(lines)
         if len(body) > max_chars:
             body = "[earlier turns omitted]\n\n" + body[-max_chars:]
-        return (
-            "This continues an earlier exploration session. Its full context could not be "
-            "restored, so here is the transcript so far. The kernel may no longer hold the "
-            "state it had then; re-run whatever you need.\n\n" + body + "\n\n---\n\n"
-        )
+        if kernel_preserved:
+            intro = (
+                "This continues the current exploration session on a new model provider, "
+                "or after rebuilding provider context. Here is the transcript so far. "
+                "The live Jupyter kernel and its in-memory variables are still intact; "
+                "do not re-run earlier probes unless needed."
+            )
+        else:
+            intro = (
+                "This continues an earlier exploration session. Its full context could not be "
+                "restored, so here is the transcript so far. The kernel may no longer hold the "
+                "state it had then; re-run whatever you need."
+            )
+        return intro + "\n\n" + body + "\n\n---\n\n"

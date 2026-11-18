@@ -111,6 +111,16 @@ def test_recap_preserves_interpretation_and_corrections():
     assert "expecting: positive" in recap
     assert "Does not distinguish" in recap
     assert "evidence_struck E001" in recap
+    assert "Full context could not be restored".lower() in recap.lower()
+
+    preserved = Workspace.recap(
+        [{"kind": "user", "text": "question"}],
+        kernel_preserved=True,
+    )
+    assert (
+        "live Jupyter kernel and its in-memory variables are still intact" in preserved
+    )
+    assert "new model provider" in preserved
 
 
 def test_notebook_export_structures_turns_and_embeds_probe_results(tmp_path):

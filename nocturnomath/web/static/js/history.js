@@ -250,7 +250,11 @@ function renderRecords(records, isBusy = false) {
         break;
 
       case "compaction":
-        appendSystemMessage("This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing.");
+        appendSystemMessage(
+          rec.record_reloaded === false
+            ? "This Explorer's conversation was compacted. The latest scientific record will be attached on the next message."
+            : "This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing."
+        );
         break;
 
       case "packages_installed":

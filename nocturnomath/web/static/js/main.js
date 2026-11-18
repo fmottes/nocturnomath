@@ -345,7 +345,11 @@ function handleServerEvent(event) {
       break;
 
     case "context_compacted":
-      appendSystemMessage("This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing.");
+      appendSystemMessage(
+        event.record_reloaded === false
+          ? "This Explorer's conversation was compacted. The latest scientific record will be attached on the next message."
+          : "This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing."
+      );
       break;
 
     case "session_reset":

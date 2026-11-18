@@ -465,9 +465,14 @@ async def test_manual_compaction_uses_shared_runtime_and_renders_notice(terminal
     terminal.session.compact = compact
     await terminal.run("/compact")
     output = terminal.output()
-    assert "Chat context compacted" in output
+    assert (
+        "Chat context compacted. The current scientific record was reloaded." in output
+    )
     assert "Context: 2%" in output
     assert "[context_compacted]" not in output
+
+    await terminal.session.emit("context_compacted", record_reloaded=False)
+    assert "will be attached on the next message." in terminal.output()
 
     terminal.session._is_busy = True
     await terminal.run("/compact")

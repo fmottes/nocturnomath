@@ -452,6 +452,11 @@ class TerminalApp:
             )
 
     def _render_context_compacted(self, payload):
+        if payload.get("record_reloaded") is False:
+            self.write(
+                "Chat context compacted. The current scientific record will be attached on the next message."
+            )
+            return
         self.write(
             "Chat context compacted. The current scientific record was reloaded."
         )

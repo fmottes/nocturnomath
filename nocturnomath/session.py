@@ -22,12 +22,13 @@ from .backends import (
     TextBlockDone,
     TextDelta,
     TurnResult,
+    TurnStarted,
     default_backends,
 )
 from .environment import ResearchEnvironment
 from .kernel import Kernel
 from .prompt import DEFAULT_EXPLORATION_PROMPT, build_system_prompt
-from .tools import build_tools
+from .tools import ToolSpec, build_tools
 from .workspace import Workspace
 
 logger = logging.getLogger("nocturnomath")
@@ -82,7 +83,9 @@ class ExplorationSession:
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
         self._pending_kernel_start: tuple[str, str] | None = None
-        self._record_dirty = False
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
         self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
@@ -178,9 +181,33 @@ class ExplorationSession:
     def opening_notes(self) -> str:
         return self.workspace.opening_notes()
 
-    def mark_record_dirty(self):
-        """Ensure a concurrent explorer sees the shared record on its next turn."""
-        self._record_dirty = True
+    @property
+    def _record_dirty(self) -> bool:
+        return self._record_dirty_seq > self._record_acked_seq
+
+    @_record_dirty.setter
+    def _record_dirty(self, dirty: bool):
+        if dirty:
+            if not self._record_dirty:
+                self._record_dirty_seq += 1
+        else:
+            self._record_acked_seq = self._record_dirty_seq
+
+    def mark_record_dirty(self, reason: str = "concurrent"):
+        """Ensure an explorer reloads the shared record on its next turn."""
+        self._record_dirty_seq += 1
+        self._record_reload_reason = reason
+
+    def _record_reload_heading(self) -> str:
+        if self._record_reload_reason == "compaction":
+            return (
+                "Conversation history was compacted. "
+                "Treat this current scientific record as authoritative:\n\n"
+            )
+        return (
+            "The shared scientific record changed in another exploration. "
+            "Treat this current copy as authoritative:\n\n"
+        )
 
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
@@ -210,6 +237,9 @@ class ExplorationSession:
         self._results_since_note = 0
         self._pending_verdict = None
         self._pending_verdict_probe_id = None
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
         self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
@@ -372,12 +402,7 @@ class ExplorationSession:
         else:
             replayed = 0
 
-        target_provider = self.provider_for_model(self.model)
-        can_restore_native = (
-            sdk_id is not None
-            and saved_provider in self.backends
-            and saved_provider == target_provider
-        )
+        can_restore_native = sdk_id is not None and saved_provider in self.backends
         if can_restore_native:
             self._active_provider = saved_provider
             self._sdk_session_id = sdk_id
@@ -388,6 +413,9 @@ class ExplorationSession:
             self._resume_prefix = self.workspace.recap(records)
 
         self._sent_documents = {}
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
         self._results_since_note = 0
         self._restore_pending_verdict(records)
         self.context_usage = next(
@@ -449,9 +477,9 @@ class ExplorationSession:
     def shutdown(self):
         self.kernel.shutdown()
 
-    async def _record_compaction(self):
-        self.log_transcript("compaction")
-        await self.emit("context_compacted")
+    async def _record_compaction(self, *, record_reloaded: bool = True):
+        self.log_transcript("compaction", record_reloaded=record_reloaded)
+        await self.emit("context_compacted", record_reloaded=record_reloaded)
 
     async def compact(self):
         self.require_idle("compact this explorer")
@@ -487,15 +515,17 @@ class ExplorationSession:
                 self.context_usage = None
                 self._session_initialized = False
                 self._resume_prefix = (
-                    self.workspace.recap(prior_records) if prior_records else None
+                    self.workspace.recap(prior_records, kernel_preserved=True)
+                    if prior_records
+                    else None
                 )
                 raise RuntimeError(
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
                 ) from exc
             self._track_session_id(result.session_id, provider)
-            await self._record_compaction()
+            await self._record_compaction(record_reloaded=backend.uses_compact_hook)
             if not backend.uses_compact_hook:
-                self._record_dirty = True
+                self.mark_record_dirty(reason="compaction")
             logger.info(
                 "%s compaction completed in %.1fs",
                 provider,
@@ -544,7 +574,9 @@ class ExplorationSession:
             # before logging the new user message so it is never duplicated.
             if self._active_provider is not None and provider != self._active_provider:
                 self._resume_prefix = (
-                    self.workspace.recap(prior_records) if prior_records else None
+                    self.workspace.recap(prior_records, kernel_preserved=True)
+                    if prior_records
+                    else None
                 )
                 self._sdk_session_id = None
                 self._active_provider = None
@@ -556,10 +588,13 @@ class ExplorationSession:
             sent_documents: dict[str, str] = {}
             initialize_session = False
             kernel_notice = ""
+            prompt_record_seq = 0
             prompt = user_text
 
             def prepare_prompt():
-                nonlocal sent_documents, initialize_session, kernel_notice, prompt
+                nonlocal sent_documents, initialize_session, kernel_notice
+                nonlocal prompt_record_seq, prompt
+                prompt_record_seq = self._record_dirty_seq
                 document_prefix, sent_documents = (
                     self.document_context() if slurm_probe_id is None else ("", {})
                 )
@@ -573,11 +608,7 @@ class ExplorationSession:
                     prefix = self.opening_notes()
                     initialize_session = True
                 elif self._record_dirty:
-                    prefix = (
-                        "The shared scientific record changed in another exploration. "
-                        "Treat this current copy as authoritative:\n\n"
-                        + self.opening_notes()
-                    )
+                    prefix = self._record_reload_heading() + self.opening_notes()
 
                 prefix += document_prefix
                 if self._pending_verdict is not None:
@@ -614,7 +645,9 @@ class ExplorationSession:
                         self._session_initialized = True
                     if self._kernel_notice == kernel_notice:
                         self._kernel_notice = ""
-                    self._record_dirty = False
+                    self._record_acked_seq = max(
+                        self._record_acked_seq, prompt_record_seq
+                    )
                     self._sent_documents.update(sent_documents)
                     self._active_provider = provider
 
@@ -625,27 +658,52 @@ class ExplorationSession:
                         self._track_session_id(pending_session_id, provider)
                         pending_session_id = None
 
+                def wrap_tool(spec: ToolSpec) -> ToolSpec:
+                    async def wrapped_handler(args: dict[str, Any]) -> dict[str, Any]:
+                        commit_progress()
+                        return await spec.handler(args)
+
+                    return ToolSpec(
+                        name=spec.name,
+                        description=spec.description,
+                        input_schema=spec.input_schema,
+                        handler=wrapped_handler,
+                        annotations=spec.annotations,
+                    )
+
+                turn_tools = [wrap_tool(spec) for spec in self.tools]
+                tool_timeout_s = max(self.timeout_s, 600) + 60
+
                 try:
                     async for event in backend.run_turn(
                         prompt,
                         system_prompt=build_system_prompt(self.exploration_prompt),
-                        tools=self.tools,
+                        tools=turn_tools,
                         workspace_path=self.workspace_path,
                         model=self.raw_model_id(self.model),
                         effort=self.effort,
                         auth=self.auth.get(provider),
                         resume_session_id=resume_id,
+                        tool_timeout_s=tool_timeout_s,
                     ):
                         if isinstance(event, SessionStarted):
-                            pending_session_id = event.session_id
+                            if accepted:
+                                self._track_session_id(event.session_id, provider)
+                            else:
+                                pending_session_id = event.session_id
+                            continue
+                        if isinstance(event, TurnStarted):
+                            commit_progress()
                             continue
                         commit_progress()
                         if isinstance(event, TextDelta):
                             await self.emit("assistant_delta", text=event.text)
                         elif isinstance(event, CompactionNotice):
-                            await self._record_compaction()
+                            await self._record_compaction(
+                                record_reloaded=backend.uses_compact_hook
+                            )
                             if not backend.uses_compact_hook:
-                                self._record_dirty = True
+                                self.mark_record_dirty(reason="compaction")
                         elif isinstance(event, MessageUsage):
                             self.log_transcript(
                                 "message_usage",
@@ -702,8 +760,17 @@ class ExplorationSession:
                         self._sent_documents = {}
                         self.context_usage = None
                         self._session_initialized = False
+                        self.log_transcript(
+                            "meta",
+                            context_rebuilt=True,
+                            stale_sdk_session_id=resume_id,
+                        )
+                        await self.emit(
+                            "system_message",
+                            text="Original provider session was unavailable; rebuilt context from the saved transcript.",
+                        )
                         self._resume_prefix = (
-                            self.workspace.recap(prior_records)
+                            self.workspace.recap(prior_records, kernel_preserved=True)
                             if prior_records
                             else None
                         )
@@ -758,6 +825,9 @@ class ExplorationSession:
         self._results_since_note = 0
         self._pending_verdict = None
         self._pending_verdict_probe_id = None
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
         self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort
