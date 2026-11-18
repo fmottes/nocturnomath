@@ -602,7 +602,7 @@ export function rewriteEmbeddedImageUrls(container, documentPath) {
   container.querySelectorAll("img[src]").forEach((image) => {
     const source = image.getAttribute("src")?.trim();
     if (!source || source.startsWith("/") || source.startsWith("//") ||
-        source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
+      source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
       return;
     }
 
