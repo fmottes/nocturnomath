@@ -10,9 +10,12 @@ import re
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Any, Self
 
 from .tools import ToolSpec
@@ -21,6 +24,13 @@ logger = logging.getLogger("nocturnomath.mcp_bridge")
 
 _PROTOCOL_VERSION_RE = re.compile(r"^20\d\d-\d\d-\d\d$")
 _DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _package_version() -> str:
+    try:
+        return version("nocturnomath")
+    except PackageNotFoundError:
+        return "0.0.0"
 
 
 def _jsonrpc_result(msg_id: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -45,17 +55,30 @@ class McpToolBridge:
         self.token = secrets.token_urlsafe(32)
         self._server: asyncio.AbstractServer | None = None
         self.port: int | None = None
+        self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._auth_file: Path | None = None
         self._client_tasks: set[asyncio.Task[None]] = set()
 
     async def __aenter__(self) -> Self:
         self._server = await asyncio.start_server(
             self._handle_connection, host="127.0.0.1", port=0
         )
-        sockets = self._server.sockets
-        if not sockets:
-            raise RuntimeError("MCP bridge failed to bind a loopback socket.")
-        self.port = sockets[0].getsockname()[1]
-        return self
+        try:
+            sockets = self._server.sockets
+            if not sockets:
+                raise RuntimeError("MCP bridge failed to bind a loopback socket.")
+            self.port = sockets[0].getsockname()[1]
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="nocturnomath-mcp-")
+            auth_file = Path(self._temp_dir.name) / "bridge.json"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(auth_file, flags, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"port": self.port, "token": self.token}, handle)
+            self._auth_file = auth_file
+            return self
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
 
     async def __aexit__(self, *args: object) -> None:
         for task in list(self._client_tasks):
@@ -67,18 +90,20 @@ class McpToolBridge:
             await self._server.wait_closed()
             self._server = None
         self.port = None
+        if self._temp_dir is not None:
+            with suppress(Exception):
+                self._temp_dir.cleanup()
+            self._temp_dir = None
+        self._auth_file = None
 
     def stdio_server_config(self) -> dict[str, Any]:
         """Return standard MCP stdio server configuration for CLI subprocesses."""
-        if self.port is None:
+        if self.port is None or self._auth_file is None:
             raise RuntimeError("MCP bridge must be entered before requesting config.")
         return {
             "command": sys.executable,
-            "args": ["-m", "nocturnomath.mcp_bridge"],
-            "env": {
-                "NOCTURNOMATH_MCP_PORT": str(self.port),
-                "NOCTURNOMATH_MCP_TOKEN": self.token,
-            },
+            "args": ["-m", "nocturnomath.mcp_bridge", str(self._auth_file)],
+            "env": {},
         }
 
     async def _handle_connection(
@@ -188,7 +213,10 @@ class McpToolBridge:
                 {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": self._server_name, "version": "0.3.1"},
+                    "serverInfo": {
+                        "name": self._server_name,
+                        "version": _package_version(),
+                    },
                 },
             )
         if method == "ping":
@@ -245,8 +273,13 @@ class McpToolBridge:
 
 def main() -> None:
     """Forward newline-delimited JSON-RPC between stdio and the parent bridge."""
-    port = int(os.environ["NOCTURNOMATH_MCP_PORT"])
-    token = os.environ["NOCTURNOMATH_MCP_TOKEN"]
+    if len(sys.argv) > 1:
+        info = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        port = int(info["port"])
+        token = str(info["token"])
+    else:
+        port = int(os.environ["NOCTURNOMATH_MCP_PORT"])
+        token = os.environ["NOCTURNOMATH_MCP_TOKEN"]
 
     with socket.create_connection(("127.0.0.1", port)) as sock:
         sock.sendall((json.dumps({"auth": token}) + "\n").encode("utf-8"))

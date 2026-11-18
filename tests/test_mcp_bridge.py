@@ -2,6 +2,8 @@ import asyncio
 import base64
 import json
 import os
+import stat
+from pathlib import Path
 
 import pytest
 
@@ -68,6 +70,13 @@ async def test_mcp_bridge_serves_stdio_subprocess_roundtrip():
 
     async with McpToolBridge([echo, slow]) as bridge:
         cfg = bridge.stdio_server_config()
+        assert bridge.token not in json.dumps(cfg)
+        assert cfg["env"] == {}
+        auth_file = Path(cfg["args"][-1])
+        assert auth_file.is_file()
+        if os.name == "posix":
+            assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+            assert stat.S_IMODE(auth_file.parent.stat().st_mode) == 0o700
         proc = await asyncio.create_subprocess_exec(
             cfg["command"],
             *cfg["args"],
@@ -178,3 +187,4 @@ async def test_mcp_bridge_serves_stdio_subprocess_roundtrip():
         finally:
             proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5)
+    assert not auth_file.exists()
