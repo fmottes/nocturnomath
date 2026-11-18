@@ -267,10 +267,23 @@ class StderrCollector:
             await self._task
 
 
+async def _discard_stream(stream: asyncio.StreamReader | None) -> None:
+    if stream is None:
+        return
+    with suppress(Exception):
+        while await stream.read(65536):
+            pass
+
+
 async def terminate_process(
     proc: asyncio.subprocess.Process, stderr: StderrCollector | None = None
 ) -> None:
     """Terminate a subprocess gracefully, killing it if it ignores SIGTERM."""
+    stdout_drain = (
+        asyncio.create_task(_discard_stream(proc.stdout))
+        if proc.stdout is not None
+        else None
+    )
     try:
         if proc.returncode is None:
             if proc.stdin is not None and not proc.stdin.is_closing():
@@ -283,8 +296,19 @@ async def terminate_process(
             except TimeoutError:
                 with suppress(ProcessLookupError):
                     proc.kill()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except TimeoutError:
+                    transport = getattr(proc, "_transport", None)
+                    if transport is not None:
+                        with suppress(Exception):
+                            transport.close()
     finally:
+        if stdout_drain is not None:
+            if not stdout_drain.done():
+                stdout_drain.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await stdout_drain
         if stderr is not None:
             await stderr.close()
 

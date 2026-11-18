@@ -890,3 +890,40 @@ for line in sys.stdin:
             auth=auth,
             resume_session_id="agy-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_drains_paused_stdout_after_sigkill():
+    import signal
+
+    from nocturnomath.backends.base import StderrCollector, terminate_process
+
+    script = (
+        "import signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "sys.stdout.write('READY\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdout.write('x' * 512 * 1024)\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr = StderrCollector(proc.stderr)
+    try:
+        assert await asyncio.wait_for(proc.stdout.readline(), timeout=5.0) == b"READY\n"
+        await asyncio.sleep(0.1)
+        assert proc.returncode is None
+        await asyncio.wait_for(terminate_process(proc, stderr), timeout=5.0)
+        assert proc.returncode == -signal.SIGKILL
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        await stderr.close()

@@ -346,9 +346,13 @@ class OpenAIBackend:
         def commit_auth_home() -> None:
             self._prepare_env_and_flags(auth)
 
+        def commit_cleanup() -> None:
+            if auth.method != "api_key" or self._api_key_secret != auth.credential:
+                self._cleanup_api_home()
+
         candidates = codex_cli_candidates()
         if not candidates:
-            return [], commit_auth_home
+            return [], commit_cleanup
         with (
             tempfile.TemporaryDirectory(prefix="nocturnomath-codex-")
             if auth.method == "api_key"
@@ -467,7 +471,7 @@ class OpenAIBackend:
                         await terminate_process(proc, stderr)
                     elif stderr is not None:
                         await stderr.close()
-        return [], commit_auth_home
+        return [], commit_cleanup
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)

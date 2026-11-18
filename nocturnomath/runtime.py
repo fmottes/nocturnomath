@@ -459,7 +459,11 @@ class Runtime:
                 logger.warning("Could not discover %s models: %s", provider, result)
                 continue
             specs, commit = result
-            commit()
+            try:
+                commit()
+            except Exception as exc:
+                logger.warning("Could not discover %s models: %s", provider, exc)
+                continue
             for spec in specs:
                 spec_id = spec.id
                 if spec_id in seen:

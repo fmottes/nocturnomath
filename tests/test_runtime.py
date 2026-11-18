@@ -1247,3 +1247,42 @@ print(json.dumps({{
 
     assert runtime.models == ["claude-new"]
     assert backend.cli_path == cli_second
+
+
+@pytest.mark.asyncio
+async def test_discovery_commit_failure_is_isolated_per_provider(session):
+    anthropic_spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="claude-sonnet-5",
+        efforts=["medium"],
+        is_default=True,
+    )
+    openai_spec = ModelSpec(
+        id="gpt-5.4",
+        raw_id="gpt-5.4",
+        provider="openai",
+        label="GPT-5.4",
+        efforts=["high"],
+    )
+
+    class FailingCommitOpenAI(StubBackend):
+        async def discover_models_staged(self, auth):
+            def failing_commit() -> None:
+                raise OSError("disk full")
+
+            return [openai_spec], failing_commit
+
+    runtime = Runtime(
+        session,
+        backends=stub_backends(
+            anthropic=StubBackend("anthropic", responses=[[anthropic_spec]]),
+            openai=FailingCommitOpenAI("openai"),
+        ),
+    )
+
+    await runtime.discover_models()
+    assert runtime.models == ["claude-sonnet-5"]
+    assert runtime.model == "claude-sonnet-5"
+    assert session.model == "claude-sonnet-5"

@@ -346,9 +346,13 @@ class GoogleBackend:
         def commit_auth_dir() -> None:
             self._prepare_env_and_flags(auth)
 
+        def commit_cleanup() -> None:
+            if auth.method != "api_key" or self._api_key_secret != auth.credential:
+                self._cleanup_api_dir()
+
         candidates = agy_cli_candidates()
         if not candidates:
-            return [], commit_auth_dir
+            return [], commit_cleanup
         env = {**os.environ, **auth.sdk_env()}
         base_flags = ["--include-default-customizations=false"]
         with (
@@ -418,7 +422,7 @@ class GoogleBackend:
                         await terminate_process(proc, stderr)
                     elif stderr is not None:
                         await stderr.close()
-        return [], commit_auth_dir
+        return [], commit_cleanup
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
