@@ -256,6 +256,7 @@ for line in sys.stdin:
     assert "developerInstructions" not in logs[1]["thread_params"]
     assert "baseInstructions" in logs[1]["thread_params"]
     assert "NOCTURNOMATH_MCP_TOKEN" not in json.dumps(logs[1]["argv"])
+    assert 'default_tools_approval_mode="approve"' in " ".join(logs[1]["argv"])
     assert "mcp_servers.node_repl.enabled=false" in logs[3]["argv"]
     assert "mcp_servers.user_extra.enabled=false" in logs[3]["argv"]
     assert (real_home / "auth.json").read_text() == '{"keep":"untouched"}\n'

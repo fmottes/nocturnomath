@@ -105,7 +105,8 @@ def _toml_mcp_override(
         f"args=[{args_toml}], "
         f"env={{{env_items}}}, "
         "startup_timeout_sec=30, "
-        f"tool_timeout_sec={timeout_sec}"
+        f"tool_timeout_sec={timeout_sec}, "
+        'default_tools_approval_mode="approve"'
         "}}"
     )
 
