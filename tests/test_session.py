@@ -12,6 +12,7 @@ from nocturnomath.backends import (
     CompactResult,
     MessageUsage,
     ModelSpec,
+    SessionResumeError,
     SessionStarted,
     TextBlockDone,
     TextDelta,
@@ -673,3 +674,90 @@ async def test_query_logs_usage_records(session):
     assert msg[0]["usage"]["output_tokens"] == 5
     assert len(total) == 1 and total[0]["total_cost_usd"] == 0.01
     assert total[0]["num_turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_after_session_started_does_not_commit_prompt_state(session):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+
+    class EmitStartThenFailBackend(FakeBackend):
+        async def run_turn(self, *args, **kwargs):
+            yield SessionStarted("ephemeral-thread")
+            raise RuntimeError("invalid model")
+
+    attach_backend(session, EmitStartThenFailBackend())
+    assert await session.query("first") is False
+    assert session._sdk_session_id is None
+    assert session._active_provider is None
+    assert session._session_initialized is False
+    assert session._sent_documents == {}
+    assert session._kernel_notice != ""
+
+    backend = attach_backend(session, FakeBackend(session_id="real-thread"))
+    assert await session.query("second") is True
+    assert session._sdk_session_id == "real-thread"
+    assert "# Evidence" in backend.calls[-1].prompt
+    assert "### inputs.md\n\n# Inputs\n" in backend.calls[-1].prompt
+
+
+@pytest.mark.asyncio
+async def test_stale_native_session_falls_back_to_recap_and_recovers(session):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+    session.model = "gpt-5.6-sol"
+
+    class RecoveringBackend(FakeBackend):
+        def __init__(self):
+            super().__init__(provider="openai", uses_compact_hook=False)
+            self.turn_num = 0
+
+        async def run_turn(self, prompt, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            self.turn_num += 1
+            if self.turn_num == 1:
+                yield SessionStarted("stale-thread")
+                yield TextBlockDone("first answer")
+                yield TurnResult()
+                return
+            if kwargs.get("resume_session_id") == "stale-thread":
+                raise SessionResumeError("Thread not found")
+            yield SessionStarted("fresh-thread")
+            yield TextBlockDone("recovered answer")
+            yield TurnResult()
+
+    backend = attach_backend(session, RecoveringBackend(), "openai")
+    assert await session.query("first question") is True
+    assert session._sdk_session_id == "stale-thread"
+
+    assert await session.query("follow up") is True
+    assert len(backend.calls) == 3
+    assert backend.calls[1].resume_session_id == "stale-thread"
+    assert backend.calls[2].resume_session_id is None
+    assert "Me: first question" in backend.calls[2].prompt
+    assert backend.calls[2].prompt.count("follow up") == 1
+    assert "### inputs.md\n\n# Inputs\n" in backend.calls[2].prompt
+    assert session._sdk_session_id == "fresh-thread"
+
+
+@pytest.mark.asyncio
+async def test_compact_omits_model_when_selected_model_belongs_to_another_provider(
+    session,
+):
+    anthropic = attach_backend(
+        session, FakeBackend(provider="anthropic", session_id="ant-1"), "anthropic"
+    )
+    await session.query("first")
+    session.model = "gpt-5.6-sol"
+
+    await session.compact()
+    assert anthropic.compact_calls[-1]["model"] is None
+    assert anthropic.compact_calls[-1]["effort"] is None

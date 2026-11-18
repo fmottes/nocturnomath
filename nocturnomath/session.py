@@ -17,6 +17,7 @@ from .backends import (
     AgentBackend,
     CompactionNotice,
     MessageUsage,
+    SessionResumeError,
     SessionStarted,
     TextBlockDone,
     TextDelta,
@@ -458,19 +459,39 @@ class ExplorationSession:
             raise RuntimeError("This explorer has no conversation context to compact.")
         provider = self._active_provider
         backend = self.backends[provider]
+        compact_model = (
+            self.raw_model_id(self.model)
+            if self.model and self.provider_for_model(self.model) == provider
+            else None
+        )
+        compact_effort = self.effort if compact_model is not None else None
         self._is_busy = True
         started_at = time.monotonic()
         try:
             await self.emit("status_change", status="compacting")
-            result = await backend.compact(
-                system_prompt=build_system_prompt(self.exploration_prompt),
-                tools=self.tools,
-                workspace_path=self.workspace_path,
-                model=self.raw_model_id(self.model) if self.model else None,
-                effort=self.effort,
-                auth=self.auth.get(provider),
-                resume_session_id=self._sdk_session_id,
-            )
+            try:
+                result = await backend.compact(
+                    system_prompt=build_system_prompt(self.exploration_prompt),
+                    tools=self.tools,
+                    workspace_path=self.workspace_path,
+                    model=compact_model,
+                    effort=compact_effort,
+                    auth=self.auth.get(provider),
+                    resume_session_id=self._sdk_session_id,
+                )
+            except SessionResumeError as exc:
+                prior_records = self.workspace.current_records()
+                self._sdk_session_id = None
+                self._active_provider = None
+                self._sent_documents = {}
+                self.context_usage = None
+                self._session_initialized = False
+                self._resume_prefix = (
+                    self.workspace.recap(prior_records) if prior_records else None
+                )
+                raise RuntimeError(
+                    "Saved provider session is no longer available; the next message will rebuild context from the transcript."
+                ) from exc
             self._track_session_id(result.session_id, provider)
             await self._record_compaction()
             if not backend.uses_compact_hook:
@@ -518,10 +539,10 @@ class ExplorationSession:
         backend = self.backends[provider]
         self._is_busy = True
         try:
+            prior_records = self.workspace.current_records()
             # When switching providers mid-chat, capture the prior transcript recap
             # before logging the new user message so it is never duplicated.
             if self._active_provider is not None and provider != self._active_provider:
-                prior_records = self.workspace.current_records()
                 self._resume_prefix = (
                     self.workspace.recap(prior_records) if prior_records else None
                 )
@@ -532,9 +553,44 @@ class ExplorationSession:
 
             # Snapshot the selection before yielding so changes made while this turn runs
             # apply to the next message.
-            document_prefix, sent_documents = (
-                self.document_context() if slurm_probe_id is None else ("", {})
-            )
+            sent_documents: dict[str, str] = {}
+            initialize_session = False
+            kernel_notice = ""
+            prompt = user_text
+
+            def prepare_prompt():
+                nonlocal sent_documents, initialize_session, kernel_notice, prompt
+                document_prefix, sent_documents = (
+                    self.document_context() if slurm_probe_id is None else ("", {})
+                )
+                prefix = ""
+                resume_prefix = self._resume_prefix
+                initialize_session = False
+                if resume_prefix:
+                    prefix = self.opening_notes() + resume_prefix
+                    initialize_session = True
+                elif not self._session_initialized:
+                    prefix = self.opening_notes()
+                    initialize_session = True
+                elif self._record_dirty:
+                    prefix = (
+                        "The shared scientific record changed in another exploration. "
+                        "Treat this current copy as authoritative:\n\n"
+                        + self.opening_notes()
+                    )
+
+                prefix += document_prefix
+                if self._pending_verdict is not None:
+                    prefix += (
+                        f"Probe {self._pending_verdict_probe_id} still needs a verdict "
+                        f"against its prediction: {self._pending_verdict}. "
+                        "Call verdict before starting another probe.\n\n"
+                    )
+                kernel_notice = self._kernel_notice
+                prefix += kernel_notice
+                prompt = prefix + user_text if prefix else user_text
+
+            prepare_prompt()
             await self.emit("status_change", status="thinking")
             if slurm_probe_id is None:
                 self.log_transcript("user", text=user_text)
@@ -542,109 +598,119 @@ class ExplorationSession:
                 self.log_transcript("slurm_review", probe_id=slurm_probe_id)
                 await self.emit("slurm_review", probe_id=slurm_probe_id)
 
-            prefix = ""
-            resume_prefix = self._resume_prefix
-            initialize_session = False
-            if resume_prefix:
-                prefix = self.opening_notes() + resume_prefix
-                initialize_session = True
-            elif not self._session_initialized:
-                prefix = self.opening_notes()
-                initialize_session = True
-            elif self._record_dirty:
-                prefix = (
-                    "The shared scientific record changed in another exploration. "
-                    "Treat this current copy as authoritative:\n\n"
-                    + self.opening_notes()
-                )
-
-            prefix += document_prefix
-            if self._pending_verdict is not None:
-                prefix += (
-                    f"Probe {self._pending_verdict_probe_id} still needs a verdict "
-                    f"against its prediction: {self._pending_verdict}. "
-                    "Call verdict before starting another probe.\n\n"
-                )
-            kernel_notice = self._kernel_notice
-            prefix += kernel_notice
-            prompt = prefix + user_text if prefix else user_text
-
-            accepted = False
-
-            def commit_prompt_state():
-                nonlocal accepted
-                if accepted:
-                    return
-                accepted = True
-                self._resume_prefix = None
-                if initialize_session:
-                    self._session_initialized = True
-                if self._kernel_notice == kernel_notice:
-                    self._kernel_notice = ""
-                self._record_dirty = False
-                self._sent_documents.update(sent_documents)
-                self._active_provider = provider
-
             accumulated_text: list[str] = []
-            async for event in backend.run_turn(
-                prompt,
-                system_prompt=build_system_prompt(self.exploration_prompt),
-                tools=self.tools,
-                workspace_path=self.workspace_path,
-                model=self.raw_model_id(self.model),
-                effort=self.effort,
-                auth=self.auth.get(provider),
-                resume_session_id=self._sdk_session_id,
-            ):
-                commit_prompt_state()
-                if isinstance(event, SessionStarted):
-                    self._track_session_id(event.session_id, provider)
-                elif isinstance(event, TextDelta):
-                    await self.emit("assistant_delta", text=event.text)
-                elif isinstance(event, CompactionNotice):
-                    await self._record_compaction()
-                    if not backend.uses_compact_hook:
-                        self._record_dirty = True
-                elif isinstance(event, MessageUsage):
-                    self.log_transcript(
-                        "message_usage",
-                        message_id=event.message_id,
-                        model=event.model,
-                        usage=event.usage,
-                    )
-                elif isinstance(event, TextBlockDone):
-                    accumulated_text.append(event.text)
-                    self.log_transcript("agent", text=event.text)
-                    await self.emit("assistant_text", text=event.text)
-                elif isinstance(event, TurnResult):
-                    if any(
-                        value is not None
-                        for value in (
-                            event.usage,
-                            event.model_usage,
-                            event.total_cost_usd,
-                            event.duration_ms,
-                            event.duration_api_ms,
-                            event.num_turns,
-                        )
-                    ):
-                        self.log_transcript(
-                            "usage",
-                            usage=event.usage,
-                            model_usage=event.model_usage,
-                            total_cost_usd=event.total_cost_usd,
-                            duration_ms=event.duration_ms,
-                            duration_api_ms=event.duration_api_ms,
-                            num_turns=event.num_turns,
-                        )
-                    if event.context_usage is not None:
-                        self.context_usage = event.context_usage
-                        self.log_transcript("meta", context_usage=self.context_usage)
-                        await self.emit(
-                            "context_usage_changed", context_usage=self.context_usage
-                        )
+            for attempt in range(2):
+                accepted = False
+                pending_session_id: str | None = None
+                resume_id = self._sdk_session_id
 
-            commit_prompt_state()
+                def commit_prompt_state():
+                    nonlocal accepted
+                    if accepted:
+                        return
+                    accepted = True
+                    self._resume_prefix = None
+                    if initialize_session:
+                        self._session_initialized = True
+                    if self._kernel_notice == kernel_notice:
+                        self._kernel_notice = ""
+                    self._record_dirty = False
+                    self._sent_documents.update(sent_documents)
+                    self._active_provider = provider
+
+                def commit_progress():
+                    nonlocal pending_session_id
+                    commit_prompt_state()
+                    if pending_session_id is not None:
+                        self._track_session_id(pending_session_id, provider)
+                        pending_session_id = None
+
+                try:
+                    async for event in backend.run_turn(
+                        prompt,
+                        system_prompt=build_system_prompt(self.exploration_prompt),
+                        tools=self.tools,
+                        workspace_path=self.workspace_path,
+                        model=self.raw_model_id(self.model),
+                        effort=self.effort,
+                        auth=self.auth.get(provider),
+                        resume_session_id=resume_id,
+                    ):
+                        if isinstance(event, SessionStarted):
+                            pending_session_id = event.session_id
+                            continue
+                        commit_progress()
+                        if isinstance(event, TextDelta):
+                            await self.emit("assistant_delta", text=event.text)
+                        elif isinstance(event, CompactionNotice):
+                            await self._record_compaction()
+                            if not backend.uses_compact_hook:
+                                self._record_dirty = True
+                        elif isinstance(event, MessageUsage):
+                            self.log_transcript(
+                                "message_usage",
+                                message_id=event.message_id,
+                                model=event.model,
+                                usage=event.usage,
+                            )
+                        elif isinstance(event, TextBlockDone):
+                            accumulated_text.append(event.text)
+                            self.log_transcript("agent", text=event.text)
+                            await self.emit("assistant_text", text=event.text)
+                        elif isinstance(event, TurnResult):
+                            if any(
+                                value is not None
+                                for value in (
+                                    event.usage,
+                                    event.model_usage,
+                                    event.total_cost_usd,
+                                    event.duration_ms,
+                                    event.duration_api_ms,
+                                    event.num_turns,
+                                )
+                            ):
+                                self.log_transcript(
+                                    "usage",
+                                    usage=event.usage,
+                                    model_usage=event.model_usage,
+                                    total_cost_usd=event.total_cost_usd,
+                                    duration_ms=event.duration_ms,
+                                    duration_api_ms=event.duration_api_ms,
+                                    num_turns=event.num_turns,
+                                )
+                            if event.context_usage is not None:
+                                self.context_usage = event.context_usage
+                                self.log_transcript(
+                                    "meta", context_usage=self.context_usage
+                                )
+                                await self.emit(
+                                    "context_usage_changed",
+                                    context_usage=self.context_usage,
+                                )
+                    commit_progress()
+                    break
+                except SessionResumeError as exc:
+                    if attempt == 0 and resume_id is not None and not accepted:
+                        logger.warning(
+                            "Could not resume %s session %s (%s); rebuilding context from transcript.",
+                            provider,
+                            resume_id,
+                            exc,
+                        )
+                        self._sdk_session_id = None
+                        self._active_provider = None
+                        self._sent_documents = {}
+                        self.context_usage = None
+                        self._session_initialized = False
+                        self._resume_prefix = (
+                            self.workspace.recap(prior_records)
+                            if prior_records
+                            else None
+                        )
+                        prepare_prompt()
+                        continue
+                    raise RuntimeError(str(exc)) from exc
+
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
