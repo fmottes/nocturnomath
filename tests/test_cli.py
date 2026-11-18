@@ -827,3 +827,17 @@ async def test_prompts_while_busy_are_scheduled_with_configured_mode(terminal):
         (item["text"], item["mode"])
         for item in terminal.session.pending_prompts_snapshot()
     ] == [("steer me", "steer"), ("queue me", "queue")]
+
+
+@pytest.mark.asyncio
+async def test_prompts_during_compaction_are_labelled_queue(terminal):
+    terminal.session.set_prompt_mode("steer")
+    terminal.session._is_busy = True
+    terminal.session.status = "compacting"
+
+    await terminal.run("wait for compaction")
+    assert "Scheduled (queue, after current turn)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("wait for compaction", "queue")]

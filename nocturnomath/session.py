@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .auth import AuthStore, ProviderId
+from .auth import AuthStore, ProviderAuth, ProviderId
 from .backends import (
     DEFAULT_EFFORT,
     EFFORT_LEVELS,
@@ -49,6 +49,17 @@ class PendingPrompt:
     effort: str | None = None
     provider: ProviderId | None = None
     raw_model: str | None = None
+
+
+@dataclass(frozen=True)
+class BoundTurnConfig:
+    """Model, effort, provider, and credential bound for one accepted turn."""
+
+    catalogue_model: str
+    provider: ProviderId
+    raw_model: str
+    effort: str | None
+    auth: ProviderAuth
 
 
 class ExplorationSession:
@@ -108,6 +119,7 @@ class ExplorationSession:
         self._pending_prompts: list[PendingPrompt] = []
         self._turn_model: str | None = None
         self._turn_selection: tuple[ProviderId, str, str | None] | None = None
+        self._bound_turn: BoundTurnConfig | None = None
         self._last_pending_task: asyncio.Task[Any] | None = None
         self._commit_turn_accepted: Callable[[], None] | None = None
         self._draining_queries = False
@@ -289,6 +301,7 @@ class ExplorationSession:
         self._pending_prompts = []
         self._turn_model = None
         self._turn_selection = None
+        self._bound_turn = None
         self._pending_user_logs = None
         self.context_usage = None
         self.load_document_settings()
@@ -433,7 +446,7 @@ class ExplorationSession:
 
     def pending_prompts_snapshot(self) -> list[dict[str, str]]:
         """Serialize pending prompts without exposing backend model overrides."""
-        if (
+        if self.status == "compacting" or (
             self._turn_selection is None
             and self._probe_task is not None
             and not self._probe_task.done()
@@ -678,6 +691,7 @@ class ExplorationSession:
         self._pending_prompts = []
         self._turn_model = None
         self._turn_selection = None
+        self._bound_turn = None
         self._pending_user_logs = None
         self._restore_pending_verdict(records)
         self.context_usage = next(
@@ -758,6 +772,7 @@ class ExplorationSession:
         compact_effort = self.effort if compact_model is not None else None
         compact_auth = self.auth.get(provider)
         self._is_busy = True
+        self.status = "compacting"
         started_at = time.monotonic()
         try:
             await self.emit("status_change", status="compacting")
@@ -804,6 +819,22 @@ class ExplorationSession:
             self._is_busy = False
             await self.emit("status_change", status="idle")
 
+    def bind_next_turn(self) -> BoundTurnConfig:
+        """Bind the current model, provider, effort, and auth for the next turn."""
+        if self.model is None:
+            raise RuntimeError("No model available.")
+        catalogue_model = self.model
+        provider = self.provider_for_model(catalogue_model)
+        bound = BoundTurnConfig(
+            catalogue_model=catalogue_model,
+            provider=provider,
+            raw_model=self.raw_model_id(catalogue_model),
+            effort=self.effort,
+            auth=self.auth.get(provider),
+        )
+        self._bound_turn = bound
+        return bound
+
     async def review_slurm(self, probe_id: str):
         return await self.query(
             f"Runtime event: Slurm probe {probe_id} has finished and its output is saved. "
@@ -828,14 +859,17 @@ class ExplorationSession:
     async def query(self, user_text: str, *, slurm_probe_id: str | None = None):
         if self._is_busy:
             raise RuntimeError("Agent is already running a query.")
-        if self.model is None:
-            raise RuntimeError("No model available.")
+        bound = self._bound_turn
+        self._bound_turn = None
+        if bound is None:
+            bound = self.bind_next_turn()
+            self._bound_turn = None
 
-        turn_catalogue_model = self.model
-        provider = self.provider_for_model(turn_catalogue_model)
-        turn_raw_model = self.raw_model_id(turn_catalogue_model)
-        turn_effort = self.effort
-        turn_auth = self.auth.get(provider)
+        turn_catalogue_model = bound.catalogue_model
+        provider = bound.provider
+        turn_raw_model = bound.raw_model
+        turn_effort = bound.effort
+        turn_auth = bound.auth
         backend = self.backends[provider]
         self._is_busy = True
         self._turn_model = turn_catalogue_model
@@ -1120,6 +1154,7 @@ class ExplorationSession:
         self._pending_prompts = []
         self._turn_model = None
         self._turn_selection = None
+        self._bound_turn = None
         self._pending_user_logs = None
         self.context_usage = None
         self.model = self.default_model

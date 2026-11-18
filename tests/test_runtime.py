@@ -924,3 +924,164 @@ async def test_prompt_submitted_during_failed_turn_error_broadcast_is_cleared(
     backend.fail = False
     assert runtime.start_query("after recovery") == "started"
     await runtime.wait_for_query()
+
+
+@pytest.mark.asyncio
+async def test_auth_refresh_during_queued_prompt_broadcast_preserves_bound_provider(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    entered_turn1 = asyncio.Event()
+    release_turn1 = asyncio.Event()
+
+    class BlockingAnthropic(StubBackend):
+        def __init__(self):
+            super().__init__(
+                "anthropic",
+                responses=[
+                    [
+                        ModelSpec(
+                            id="claude-opus-5",
+                            raw_id="claude-opus-5",
+                            provider="anthropic",
+                            label="claude-opus-5",
+                            efforts=["high"],
+                            is_default=True,
+                        )
+                    ]
+                ],
+            )
+            self.calls = []
+
+        async def run_turn(self, prompt, *, model, effort, auth, **kwargs):
+            self.calls.append((prompt, model, effort, auth.method))
+            yield SessionStarted("ant-1")
+            entered_turn1.set()
+            await release_turn1.wait()
+            yield TextBlockDone("anthropic done")
+            yield TurnResult()
+
+    class OpenAIBackendStub(StubBackend):
+        def __init__(self):
+            super().__init__(
+                "openai",
+                responses=[
+                    [
+                        ModelSpec(
+                            id="gpt-5.6",
+                            raw_id="gpt-5.6",
+                            provider="openai",
+                            label="gpt-5.6",
+                            efforts=["low", "high"],
+                        )
+                    ],
+                    [],
+                ],
+            )
+            self.calls = []
+
+        async def run_turn(self, prompt, *, model, effort, auth, **kwargs):
+            self.calls.append((prompt, model, effort, auth.method, auth.credential))
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("openai done")
+            yield TurnResult()
+
+    anthropic = BlockingAnthropic()
+    openai = OpenAIBackendStub()
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=anthropic, openai=openai)
+    )
+    runtime.auth.set("openai", "api_key", "sk-oai-1")
+    await runtime.discover_models()
+    runtime.start()
+
+    refresh_triggered = False
+
+    async def on_event(event_type, payload):
+        nonlocal refresh_triggered
+        if (
+            not refresh_triggered
+            and event_type == "user_message"
+            and payload.get("text") == "queued for openai"
+        ):
+            refresh_triggered = True
+            runtime.auth.set("openai", "cli")
+            await runtime.discover_models()
+
+    runtime.subscribe(on_event)
+
+    assert runtime.start_query("first turn", "claude-opus-5", "high") == "started"
+    await entered_turn1.wait()
+    assert runtime.start_query("queued for openai", "gpt-5.6", "high") == "pending"
+    release_turn1.set()
+    await runtime.wait_for_query()
+
+    assert refresh_triggered is True
+    assert runtime.models == ["claude-opus-5"]
+    assert len(anthropic.calls) == 1
+    assert len(openai.calls) == 1
+    oai_prompt, oai_model, oai_effort, oai_method, oai_key = openai.calls[0]
+    assert oai_prompt.endswith("queued for openai")
+    assert (oai_model, oai_effort, oai_method, oai_key) == (
+        "gpt-5.6",
+        "high",
+        "api_key",
+        "sk-oai-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupting_queued_prompt_keeps_background_probe_worker_tracked(
+    session,
+):
+    from nocturnomath.backends import SessionStarted
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def slow_install(packages):
+        worker_started.set()
+        release_worker.wait(timeout=5)
+        return ("completed", f"installed {packages}", "done")
+
+    session.install_packages = slow_install
+
+    class InstallBackend(StubBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-1")
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["install_packages"].handler({"packages": ["numpy"]})
+
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=InstallBackend("anthropic"))
+    )
+    runtime.models = ["test"]
+    runtime.model_providers = {"test": "anthropic"}
+    runtime.model_raw_ids = {"test": "test"}
+
+    assert runtime.start_query("install numpy") == "started"
+    await asyncio.to_thread(worker_started.wait, 5)
+    await session.interrupt()
+    await runtime.wait_for_query()
+
+    assert session._is_busy is False
+    assert session._probe_task is not None and not session._probe_task.done()
+    assert runtime.start_query("queued while worker runs") == "pending"
+
+    await session.interrupt()
+    await runtime.wait_for_query()
+
+    assert session._pending_prompts == []
+    assert session._probe_task is not None and not session._probe_task.done()
+    assert session.has_active_query() is True
+    with pytest.raises(RuntimeError, match="running a query"):
+        session.require_idle("change workspace")
+
+    probe_task = session._probe_task
+    release_worker.set()
+    await probe_task
+    await asyncio.sleep(0)
+
+    assert session._probe_task is None
+    assert session.has_active_query() is False

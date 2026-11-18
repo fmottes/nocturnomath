@@ -998,6 +998,7 @@ class Runtime:
             return "pending"
 
         self._apply_query_model(session, model, effort, agent_id)
+        session.bind_next_turn()
         # An accepted first message allocates its session before the UI sees it.
         session.activate_session()
         task = asyncio.create_task(self._run_query(session, text, agent_id))
@@ -1078,6 +1079,7 @@ class Runtime:
                 await session.clear_pending_prompts()
                 return False
             self._apply_query_model(session, batch_model, batch_effort, agent_id)
+            session.bind_next_turn()
             session.activate_session()
             for item in batch:
                 await session.emit(
@@ -1095,6 +1097,7 @@ class Runtime:
             try:
                 ok = await session.query("\n\n".join(item.text for item in batch))
             finally:
+                session._bound_turn = None
                 session._pending_user_logs = None
             if ok is False:
                 await session.clear_pending_prompts()
@@ -1104,12 +1107,21 @@ class Runtime:
     async def _wait_and_drain_pending(
         self, session: ExplorationSession, agent_id: str | None
     ):
+        current = asyncio.current_task()
         try:
             while True:
                 probe_task = session._probe_task
                 if probe_task is not None:
                     if not probe_task.done():
-                        await asyncio.gather(probe_task, return_exceptions=True)
+                        try:
+                            await asyncio.shield(probe_task)
+                        except asyncio.CancelledError:
+                            if current is not None and current.cancelling():
+                                raise
+                        except Exception as exc:
+                            logger.debug(
+                                "Background probe task ended with error: %s", exc
+                            )
                     if session._probe_task is probe_task and probe_task.done():
                         session._probe_task = None
                     if probe_task is not session._probe_task:
@@ -1124,7 +1136,7 @@ class Runtime:
                 break
         except asyncio.CancelledError:
             await session.clear_pending_prompts()
-            if session._current_task is asyncio.current_task():
+            if session._current_task is current:
                 session._current_task = None
             return
         await self._run_query_body(session, agent_id)
@@ -1166,6 +1178,7 @@ class Runtime:
                 payload["agent_id"] = agent_id
             await self.emit("error", payload)
         finally:
+            session._bound_turn = None
             session._pending_user_logs = None
             session._draining_queries = False
             if not session._is_busy and session.status != "idle":
