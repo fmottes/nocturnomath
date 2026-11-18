@@ -1006,3 +1006,290 @@ async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavaila
     assert owner.model == "gpt-5.4"
     assert slurm.has_verdict(owner.workspace, probe_id)
     assert not slurm.needs_review(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_reopened_review_after_partial_provider_switch_stays_on_new_owner(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    anthropic_calls = []
+    openai_calls = []
+
+    class AnthropicStub:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="Claude Sonnet 5",
+                    efforts=["medium"],
+                    is_default=True,
+                )
+            ]
+
+        async def run_turn(self, prompt, **kwargs):
+            anthropic_calls.append({"prompt": prompt, **kwargs})
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("Initial Claude turn.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub:
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["high"],
+                )
+            ]
+
+        async def run_turn(
+            self, prompt, *, model, tools=(), resume_session_id=None, **kwargs
+        ):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            by_name = {spec.name: spec for spec in tools}
+            if len(openai_calls) == 1:
+                submitted = await by_name["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                raise RuntimeError("OpenAI CLI disconnected before reporting thread ID")
+
+            result = await by_name["check_slurm_job"].handler({"probe_id": "S001/P001"})
+            assert not result.get("is_error")
+            await by_name["verdict"].handler(
+                {"text": "Reviewed on OpenAI after disconnect."}
+            )
+            yield SessionStarted("oai-recovered")
+            yield TextBlockDone("Reviewed on OpenAI.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub:
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": AnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+
+    assert runtime.start_query("Start on Claude.") == "started"
+    await runtime.wait_for_query()
+
+    assert (
+        runtime.start_query(
+            "Switch to OpenAI and submit.",
+            "gpt-5.4",
+            "high",
+            provider="openai",
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert len(anthropic_calls) == 1
+    assert len(openai_calls) == 2
+    assert openai_calls[1]["resume_session_id"] is None
+    assert openai_calls[1]["model"] == "gpt-5.4"
+    assert "Initial Claude turn." in openai_calls[1]["prompt"]
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert slurm.has_verdict(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_reopened_review_uses_latest_model_and_effort_on_same_native_thread(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    openai_calls = []
+
+    class EmptyAnthropicStub:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub:
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["low", "high"],
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="gpt-5.4-mini",
+                    raw_id="gpt-5.4-mini",
+                    provider="openai",
+                    label="GPT-5.4 Mini",
+                    efforts=["low", "high"],
+                ),
+            ]
+
+        async def run_turn(
+            self, prompt, *, model, effort=None, resume_session_id=None, **kwargs
+        ):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "effort": effort,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+            handlers = tools(owner)
+            if len(openai_calls) == 1:
+                yield SessionStarted("oai-shared-thread")
+                yield TextBlockDone("First OpenAI turn.")
+            elif len(openai_calls) == 2:
+                submitted = await handlers["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                yield TextBlockDone("Submitted from mini.")
+            else:
+                result = await handlers["check_slurm_job"].handler(
+                    {"probe_id": "S001/P001"}
+                )
+                assert not result.get("is_error")
+                await handlers["verdict"].handler(
+                    {"text": "Reviewed on gpt-5.4-mini at low effort."}
+                )
+                yield TextBlockDone("Reviewed on mini.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub:
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": EmptyAnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+
+    assert (
+        runtime.start_query(
+            "Turn 1 on GPT-5.4 high.", "gpt-5.4", "high", provider="openai"
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    assert (
+        runtime.start_query(
+            "Turn 2 on GPT-5.4 Mini low.",
+            "gpt-5.4-mini",
+            "low",
+            provider="openai",
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert len(openai_calls) == 3
+    assert openai_calls[2]["model"] == "gpt-5.4-mini"
+    assert openai_calls[2]["effort"] == "low"
+    assert openai_calls[2]["resume_session_id"] == "oai-shared-thread"
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert (owner.model, owner.effort) == ("gpt-5.4-mini", "low")
+    assert slurm.has_verdict(owner.workspace, probe_id)

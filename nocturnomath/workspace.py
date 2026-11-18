@@ -492,36 +492,81 @@ class Workspace:
         return records
 
     @staticmethod
+    def _accepted_session_meta(
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        owner_provider: str | None = None
+        sdk_id: str | None = None
+        sdk_id_allowed = True
+        model: str | None = None
+        effort: str | None = None
+        for record in reversed(records):
+            if record.get("kind") != "meta":
+                continue
+            provider = record.get("provider")
+            has_provider = provider in PROVIDERS
+            raw_sdk_id = record.get("sdk_session_id")
+            has_sdk_id = isinstance(raw_sdk_id, str) and bool(raw_sdk_id)
+            has_rebuilt = bool(record.get("context_rebuilt"))
+            if not (has_provider or has_sdk_id or has_rebuilt):
+                continue
+            rec_provider = (
+                provider if has_provider else ("anthropic" if has_sdk_id else None)
+            )
+            if owner_provider is None:
+                if rec_provider is None:
+                    sdk_id_allowed = False
+                    continue
+                owner_provider = rec_provider
+                if has_rebuilt or not has_sdk_id:
+                    sdk_id_allowed = False
+                elif sdk_id_allowed:
+                    sdk_id = raw_sdk_id
+                    sdk_id_allowed = False
+            else:
+                if rec_provider is not None and rec_provider != owner_provider:
+                    break
+                if sdk_id is None and sdk_id_allowed:
+                    if has_rebuilt or not has_sdk_id:
+                        sdk_id_allowed = False
+                    else:
+                        sdk_id = raw_sdk_id
+                        sdk_id_allowed = False
+            if model is None:
+                candidate_model = record.get("raw_model") or record.get("model")
+                if isinstance(candidate_model, str) and candidate_model:
+                    model = candidate_model
+                    rec_effort = record.get("effort")
+                    effort = (
+                        rec_effort
+                        if isinstance(rec_effort, str) and rec_effort
+                        else None
+                    )
+            if (sdk_id is not None or not sdk_id_allowed) and model is not None:
+                break
+        return owner_provider, sdk_id, model, effort
+
+    @classmethod
     def sdk_session_info(
+        cls,
         records: list[dict[str, Any]],
     ) -> tuple[str | None, str | None]:
-        for record in reversed(records):
-            if record.get("kind") == "meta" and record.get("sdk_session_id"):
-                return record.get("provider") or "anthropic", record["sdk_session_id"]
+        owner_provider, sdk_id, _, _ = cls._accepted_session_meta(records)
+        if sdk_id is not None and owner_provider is not None:
+            return owner_provider, sdk_id
         return None, None
 
     @classmethod
     def sdk_id(cls, records: list[dict[str, Any]]) -> str | None:
         return cls.sdk_session_info(records)[1]
 
-    @staticmethod
+    @classmethod
     def session_provider_and_model(
+        cls,
         records: list[dict[str, Any]],
     ) -> tuple[str | None, str | None, str | None]:
-        for record in reversed(records):
-            if record.get("kind") != "meta":
-                continue
-            provider = record.get("provider")
-            if provider in PROVIDERS or record.get("sdk_session_id"):
-                resolved = provider if provider in PROVIDERS else "anthropic"
-                model = record.get("model")
-                effort = record.get("effort")
-                return (
-                    resolved,
-                    model if isinstance(model, str) and model else None,
-                    effort if isinstance(effort, str) and effort else None,
-                )
-        return None, None, None
+        owner_provider, _, model, effort = cls._accepted_session_meta(records)
+        return owner_provider, model, effort
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []

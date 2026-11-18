@@ -111,6 +111,7 @@ class ExplorationSession:
         self._active_provider: ProviderId | None = None
         self._owner_provider: ProviderId | None = None
         self._active_model: str | None = None
+        self._active_raw_model: str | None = None
         self._active_effort: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
@@ -274,6 +275,7 @@ class ExplorationSession:
         self.workspace.start_new_transcript()
         self._owner_provider = None
         self._active_model = None
+        self._active_raw_model = None
         self._active_effort = None
         self.context_usage = None
 
@@ -298,6 +300,7 @@ class ExplorationSession:
         self._active_provider = None
         self._owner_provider = None
         self._active_model = None
+        self._active_raw_model = None
         self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
@@ -685,7 +688,18 @@ class ExplorationSession:
         else:
             replayed = 0
 
-        can_restore_native = sdk_id is not None and saved_provider in self.backends
+        resolved_owner = (
+            owner_provider
+            if owner_provider in self.backends
+            else saved_provider
+            if saved_provider in self.backends
+            else None
+        )
+        can_restore_native = (
+            sdk_id is not None
+            and saved_provider in self.backends
+            and (resolved_owner is None or saved_provider == resolved_owner)
+        )
         if can_restore_native:
             self._active_provider = saved_provider
             self._sdk_session_id = sdk_id
@@ -694,14 +708,11 @@ class ExplorationSession:
             self._active_provider = None
             self._sdk_session_id = None
             self._resume_prefix = self.workspace.recap(records)
-        self._owner_provider = (
-            saved_provider
-            if saved_provider in self.backends
-            else owner_provider
-            if owner_provider in self.backends
-            else None
-        )
+        self._owner_provider = resolved_owner
         self._active_model = saved_model
+        self._active_raw_model = (
+            self.raw_model_id(saved_model) if saved_model is not None else None
+        )
         self._active_effort = saved_effort
 
         self._sent_documents = {}
@@ -845,12 +856,18 @@ class ExplorationSession:
     ) -> tuple[str | None, str | None]:
         if self.model and self.provider_for_model(self.model) == owner_provider:
             return self.model, self.effort
-        if (
-            self._active_model
-            and self.provider_for_model(self._active_model) == owner_provider
-            and (not self.model_providers or self._active_model in self.model_providers)
-        ):
-            return self._active_model, self._active_effort
+        if self._active_model:
+            for candidate, candidate_provider in self.model_providers.items():
+                if candidate_provider == owner_provider and (
+                    candidate == self._active_model
+                    or self.model_raw_ids.get(candidate) == self._active_model
+                ):
+                    return candidate, self._active_effort
+            if (
+                not self.model_providers
+                and self.provider_for_model(self._active_model) == owner_provider
+            ):
+                return self._active_model, self._active_effort
         if (
             self.default_model
             and self.provider_for_model(self.default_model) == owner_provider
@@ -1026,29 +1043,43 @@ class ExplorationSession:
                     self._active_provider = provider
                     self._owner_provider = provider
                     self._active_model = turn_catalogue_model
+                    self._active_raw_model = turn_raw_model
                     self._active_effort = turn_effort
                     return False
 
                 def commit_progress():
                     nonlocal pending_session_id
-                    prev_provider = self._active_provider
-                    prev_model = self._active_model
+                    prev_selection = (
+                        self._active_provider,
+                        self._active_model,
+                        self._active_raw_model,
+                        self._active_effort,
+                    )
+                    new_selection = (
+                        provider,
+                        turn_catalogue_model,
+                        turn_raw_model,
+                        turn_effort,
+                    )
                     was_accepted = commit_prompt_state()
+                    selection_changed = (
+                        not was_accepted and prev_selection != new_selection
+                    )
                     if pending_session_id is not None:
-                        self._track_session_id(pending_session_id, provider)
-                        pending_session_id = None
-                    elif (
-                        not was_accepted
-                        and self._sdk_session_id is None
-                        and (
-                            prev_provider != provider
-                            or prev_model != turn_catalogue_model
+                        self._track_session_id(
+                            pending_session_id,
+                            provider,
+                            force_meta=selection_changed,
                         )
-                    ):
+                        pending_session_id = None
+                    elif selection_changed:
                         meta_fields: dict[str, Any] = {
                             "provider": provider,
                             "model": turn_catalogue_model,
+                            "raw_model": turn_raw_model,
                         }
+                        if self._sdk_session_id is not None:
+                            meta_fields["sdk_session_id"] = self._sdk_session_id
                         if turn_effort is not None:
                             meta_fields["effort"] = turn_effort
                         self.log_transcript("meta", **meta_fields)
@@ -1201,13 +1232,18 @@ class ExplorationSession:
                 await self.emit("status_change", status="idle")
 
     def _track_session_id(
-        self, session_id: str | None, provider: ProviderId | None = None
+        self,
+        session_id: str | None,
+        provider: ProviderId | None = None,
+        *,
+        force_meta: bool = False,
     ):
         resolved_provider = (
             provider or self._active_provider or self.provider_for_model(self.model)
         )
         if not session_id or (
-            session_id == self._sdk_session_id
+            not force_meta
+            and session_id == self._sdk_session_id
             and resolved_provider == self._active_provider
         ):
             return
@@ -1221,6 +1257,7 @@ class ExplorationSession:
         active_model = self._turn_model or self._active_model or self.model
         if active_model and self.provider_for_model(active_model) == resolved_provider:
             meta_fields["model"] = active_model
+            meta_fields["raw_model"] = self.raw_model_id(active_model)
             if (
                 self._turn_selection is not None
                 and self._turn_selection[0] == resolved_provider
@@ -1246,6 +1283,7 @@ class ExplorationSession:
         self._active_provider = None
         self._owner_provider = None
         self._active_model = None
+        self._active_raw_model = None
         self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
