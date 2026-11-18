@@ -1085,3 +1085,87 @@ async def test_interrupting_queued_prompt_keeps_background_probe_worker_tracked(
 
     assert session._probe_task is None
     assert session.has_active_query() is False
+
+
+def test_runtime_reuses_attached_session_backends_unless_overridden(session):
+    attached = stub_backends()
+    session.backends = attached
+
+    runtime = Runtime(session)
+    assert runtime.backends is attached
+    assert runtime.backends["openai"] is attached["openai"]
+
+    override = stub_backends()
+    overridden = Runtime(session, backends=override)
+    assert overridden.backends == override
+    assert overridden.backends is not attached
+    assert session.backends is overridden.backends
+
+
+@pytest.mark.asyncio
+async def test_saved_session_defaults_recover_after_empty_discovery_on_reset(session):
+    session.set_session_defaults("gpt-5.4", "high", provider="openai")
+    anthropic_spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="claude-sonnet-5",
+        efforts=["medium"],
+        is_default=True,
+    )
+    openai_spec = ModelSpec(
+        id="gpt-5.4",
+        raw_id="gpt-5.4",
+        provider="openai",
+        label="GPT-5.4",
+        efforts=["medium", "high"],
+    )
+    runtime = Runtime(
+        session,
+        backends=stub_backends(
+            anthropic=StubBackend("anthropic", responses=[[], [anthropic_spec]]),
+            openai=StubBackend("openai", responses=[[], [openai_spec]]),
+        ),
+    )
+
+    await runtime.discover_models()
+    assert runtime.models == []
+    assert session.default_model is None
+    assert session.model is None
+
+    # Recovering straight from empty discovery restores both saved defaults and
+    # the unassigned active model.
+    await runtime.discover_models()
+    assert (session.model, session.effort) == ("gpt-5.4", "high")
+    assert (
+        session.default_model,
+        session.default_provider,
+        session.default_effort,
+    ) == ("gpt-5.4", "openai", "high")
+
+    # Partial discovery followed by full discovery keeps the active model
+    # undisturbed while restoring saved workspace defaults for reset_session().
+    runtime2 = Runtime(
+        session,
+        backends=stub_backends(
+            anthropic=StubBackend(
+                "anthropic", responses=[[anthropic_spec], [anthropic_spec]]
+            ),
+            openai=StubBackend("openai", responses=[[], [openai_spec]]),
+        ),
+    )
+    await runtime2.discover_models()
+    assert session.model == "claude-sonnet-5"
+    assert session.default_model == "claude-sonnet-5"
+
+    await runtime2.discover_models()
+    assert session.model == "claude-sonnet-5"
+    assert (
+        session.default_model,
+        session.default_provider,
+        session.default_effort,
+    ) == ("gpt-5.4", "openai", "high")
+
+    runtime2.reset_session()
+    assert (session.model, session.effort) == ("gpt-5.4", "high")
+    assert (runtime2.model, runtime2.effort) == ("gpt-5.4", "high")

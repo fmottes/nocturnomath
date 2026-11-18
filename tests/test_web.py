@@ -84,6 +84,7 @@ def backend_model_catalog():
     }
     with (
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+        patch("nocturnomath.session.default_backends", return_value=backends),
         patch("nocturnomath.runtime.default_backends", return_value=backends),
     ):
         yield backends

@@ -42,14 +42,16 @@ class Runtime:
         self.session = session
         self.agents: dict[str, ExplorationSession] = {}
         self.primary_agent_id: str | None = None
-        self.backends: dict[ProviderId, AgentBackend] = (
-            dict(backends) if backends is not None else default_backends()
-        )
+        if backends is not None:
+            self.backends: dict[ProviderId, AgentBackend] = dict(backends)
+        elif session is not None:
+            self.backends = session.backends
+        else:
+            self.backends = default_backends()
         self._auth = auth or (session.auth if session else AuthStore())
         if session:
             session.auth = self._auth
-            if backends is not None:
-                session.backends = dict(self.backends)
+            session.backends = self.backends
         self.startup_default_model = model
         self.startup_default_effort = effort
         self.model = session.model if session else None
@@ -386,19 +388,24 @@ class Runtime:
                 self._apply_workspace_defaults()
             else:
                 for session in self.agents.values():
-                    def_pref, def_prov = previous_selection(
-                        session.default_model, session.default_provider
+                    default_model, default_effort, default_provider = (
+                        self._workspace_defaults(session)
                     )
-                    session.default_model = self._select_model(def_pref, def_prov)
-                    session.default_provider = self.model_providers.get(
-                        session.default_model or ""
-                    )
-                    session.default_effort = self._select_effort(
-                        session.default_model, session.default_effort
-                    )
-                    sess_pref, sess_prov = previous_selection(session.model)
-                    session.model = self._select_model(sess_pref, sess_prov)
-                    session.effort = self._select_effort(session.model, session.effort)
+                    session.default_model = default_model
+                    session.default_provider = default_provider
+                    session.default_effort = default_effort
+                    if session.model is None:
+                        session.model = default_model
+                        session.effort = default_effort
+                    else:
+                        sess_pref, sess_prov = previous_selection(session.model)
+                        session.model = self._select_model(sess_pref, sess_prov)
+                        session.effort = self._select_effort(
+                            session.model, session.effort
+                        )
+                if self.session is not None:
+                    self.model = self.session.model
+                    self.effort = self.session.effort
         self._wake_slurm_monitor()
 
     def resolve_model(
@@ -556,6 +563,12 @@ class Runtime:
     def reset_session(self):
         """Start a session with the workspace's configured defaults."""
         session = self.require_session()
+        if self.models or self._models_discovered:
+            (
+                session.default_model,
+                session.default_effort,
+                session.default_provider,
+            ) = self._workspace_defaults(session)
         session.reset_client_session()
         self.model = session.model
         self.effort = session.effort
