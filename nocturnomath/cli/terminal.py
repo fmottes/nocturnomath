@@ -582,7 +582,13 @@ class TerminalApp:
         self.pending_model = None
         self.pending_model_provider = None
         if query_state == "pending":
-            mode = self.runtime.session.prompt_mode if self.runtime.session else "steer"
+            session = self.runtime.session
+            snapshot = session.pending_prompts_snapshot() if session else []
+            mode = (
+                snapshot[-1]["mode"]
+                if snapshot
+                else (session.prompt_mode if session else "steer")
+            )
             when = "before next probe" if mode == "steer" else "after current turn"
             self.write(f"Scheduled ({mode}, {when}).", style="dim")
             return

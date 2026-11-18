@@ -197,12 +197,13 @@ def build_tools(session: "ExplorationSession"):
         workspace = session.workspace
         transcript_path = session.transcript_path
         try:
+            active_model = session.active_model
             probe_path = (
                 workspace.retry_probe(
                     retry_of,
                     code,
                     expected,
-                    session.model,
+                    active_model,
                     kernel_id=session.kernel_id,
                     environment=session.environment_record,
                 )
@@ -210,7 +211,7 @@ def build_tools(session: "ExplorationSession"):
                 else workspace.start_probe(
                     code,
                     expected,
-                    session.model,
+                    active_model,
                     kernel_id=session.kernel_id,
                     environment=session.environment_record,
                 )

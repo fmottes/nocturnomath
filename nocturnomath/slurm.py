@@ -134,7 +134,7 @@ def submit(
     probe = workspace.start_probe(
         code,
         expected,
-        session.model,
+        session.active_model,
         backend="slurm",
         environment=session.environment_record,
         python=str(session.environment.python),

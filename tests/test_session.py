@@ -1011,3 +1011,79 @@ async def test_session_status_tracks_kernel_probing(session):
     session._is_busy = False
     await session.emit("status_change", status="idle")
     assert session.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_query_snapshots_turn_model_effort_and_auth_across_concurrent_refresh(
+    session,
+):
+    openai = attach_backend(session, FakeBackend(provider="openai"), "openai")
+    anthropic = attach_backend(session, FakeBackend(provider="anthropic"), "anthropic")
+    session.model_providers = {"gpt-5.6-sol": "openai", "claude-sonnet-5": "anthropic"}
+    session.model_raw_ids = {
+        "gpt-5.6-sol": "gpt-5.6-sol",
+        "claude-sonnet-5": "claude-sonnet-5",
+    }
+    session.model = "gpt-5.6-sol"
+    session.effort = "high"
+
+    async def mutate_on_thinking(event_type, payload):
+        if event_type == "status_change" and payload.get("status") == "thinking":
+            session.auth.set("openai", "api_key", "sk-later")
+            session.model = "claude-sonnet-5"
+            session.effort = "low"
+            session.model_providers = {"claude-sonnet-5": "anthropic"}
+            session.model_raw_ids = {"claude-sonnet-5": "claude-sonnet-5"}
+
+    session.subscribe(mutate_on_thinking)
+    assert await session.query("run with snapshotted turn config") is True
+    assert anthropic.calls == []
+    assert len(openai.calls) == 1
+    call = openai.calls[0]
+    assert call.model == "gpt-5.6-sol"
+    assert call.effort == "high"
+    assert call.auth.method == "cli"
+
+
+@pytest.mark.asyncio
+async def test_recap_kernel_preserved_reflects_kernel_notice_and_provider_switch(
+    session,
+):
+    anthropic = attach_backend(
+        session,
+        FakeBackend(provider="anthropic", session_id="ant-1"),
+        "anthropic",
+    )
+    openai = attach_backend(
+        session,
+        FakeBackend(provider="openai", session_id="oai-1"),
+        "openai",
+    )
+    session.model_providers = {"claude-sonnet-5": "anthropic", "gpt-5.6-sol": "openai"}
+    session.model_raw_ids = {
+        "claude-sonnet-5": "claude-sonnet-5",
+        "gpt-5.6-sol": "gpt-5.6-sol",
+    }
+    session.model = "claude-sonnet-5"
+    assert await session.query("first question") is True
+    assert session._kernel_notice == ""
+
+    # Switching providers while the kernel stayed live marks the kernel preserved.
+    session.model = "gpt-5.6-sol"
+    assert await session.query("switch while kernel live") is True
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        in openai.calls[-1].prompt
+    )
+
+    # After restarting the kernel, switching providers must NOT claim the kernel is intact.
+    session.kernel.restart("manual restart")
+    assert session._kernel_notice
+    session.model = "claude-sonnet-5"
+    assert await session.query("switch after restart") is True
+    rebuild_prompt = anthropic.calls[-1].prompt
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        not in rebuild_prompt
+    )
+    assert "The kernel may no longer hold the state it had then" in rebuild_prompt

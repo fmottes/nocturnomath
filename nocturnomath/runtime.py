@@ -967,17 +967,6 @@ class Runtime:
         if metadata:
             session.log_transcript("meta", **metadata)
 
-    def _apply_deferred_model(self, session: ExplorationSession, agent_id: str | None):
-        if session._deferred_model_effort is None:
-            return
-        deferred_model, deferred_effort = session._deferred_model_effort
-        session._deferred_model_effort = None
-        try:
-            self._validate_query_model(session, deferred_model, deferred_effort)
-        except ValueError:
-            return
-        self._apply_query_model(session, deferred_model, deferred_effort, agent_id)
-
     def start_query(
         self,
         text: str,
@@ -1045,12 +1034,31 @@ class Runtime:
             batch = session.pop_next_turn_prompts()
             batch_model: str | None = None
             batch_effort: str | None = None
+            batch_provider: ProviderId | None = None
+            batch_raw_model: str | None = None
             for item in batch:
                 if item.model is not None:
                     batch_model = item.model
+                    batch_provider = item.provider or session.provider_for_model(
+                        item.model
+                    )
+                    batch_raw_model = item.raw_model or session.raw_model_id(item.model)
                     batch_effort = item.effort
                 elif item.effort is not None:
                     batch_effort = item.effort
+            if (
+                batch_model is not None
+                and batch_provider is not None
+                and self.model_providers
+            ):
+                resolved = self.resolve_model(
+                    batch_raw_model or batch_model, batch_provider
+                )
+                batch_model = (
+                    resolved
+                    if resolved is not None
+                    else f"{batch_provider}/{batch_raw_model or batch_model}"
+                )
             try:
                 self._validate_query_model(session, batch_model, batch_effort)
             except ValueError as exc:
@@ -1062,10 +1070,6 @@ class Runtime:
                 break
             self._apply_query_model(session, batch_model, batch_effort, agent_id)
             session.activate_session()
-            if len(batch) > 1:
-                for item in batch:
-                    session.log_transcript("user", text=item.text)
-                session._prelogged_user_turn = True
             for item in batch:
                 await session.emit(
                     "user_message",
@@ -1076,9 +1080,13 @@ class Runtime:
                 "pending_prompts_changed",
                 pending_prompts=session.pending_prompts_snapshot(),
             )
-            ok = await session.query("\n\n".join(item.text for item in batch))
-            session._prelogged_user_turn = False
-            self._apply_deferred_model(session, agent_id)
+            session._pending_user_logs = (
+                [item.text for item in batch] if len(batch) > 1 else None
+            )
+            try:
+                ok = await session.query("\n\n".join(item.text for item in batch))
+            finally:
+                session._pending_user_logs = None
             if ok is False:
                 await session.clear_pending_prompts()
                 break
@@ -1094,7 +1102,6 @@ class Runtime:
             ok = True
             if initial_text is not None:
                 ok = await session.query(initial_text)
-                self._apply_deferred_model(session, agent_id)
             if ok is not False:
                 await self._drain_pending_loop(session, agent_id)
         except asyncio.CancelledError:
@@ -1107,7 +1114,7 @@ class Runtime:
                 payload["agent_id"] = agent_id
             await self.emit("error", payload)
         finally:
-            session._prelogged_user_turn = False
+            session._pending_user_logs = None
             session._draining_queries = False
             if not session._is_busy and session.status != "idle":
                 await session.emit("status_change", status="idle")

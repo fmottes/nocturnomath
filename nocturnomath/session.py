@@ -47,6 +47,8 @@ class PendingPrompt:
     mode: str
     model: str | None = None
     effort: str | None = None
+    provider: ProviderId | None = None
+    raw_model: str | None = None
 
 
 class ExplorationSession:
@@ -98,16 +100,18 @@ class ExplorationSession:
         self._active_provider: ProviderId | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
+        self._kernel_notice = ""
         self._pending_kernel_start: tuple[str, str] | None = None
         self._record_dirty_seq = 0
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
         self._pending_prompts: list[PendingPrompt] = []
-        self._deferred_model_effort: tuple[str | None, str | None] | None = None
+        self._turn_model: str | None = None
+        self._turn_selection: tuple[ProviderId, str, str | None] | None = None
         self._last_pending_task: asyncio.Task[Any] | None = None
         self._commit_turn_accepted: Callable[[], None] | None = None
         self._draining_queries = False
-        self._prelogged_user_turn = False
+        self._pending_user_logs: list[str] | None = None
         self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
@@ -125,6 +129,10 @@ class ExplorationSession:
             self.kernel.shutdown()
             raise
         self.tools = build_tools(self)
+
+    @property
+    def active_model(self) -> str | None:
+        return self._turn_model if self._turn_model is not None else self.model
 
     @property
     def workspace_path(self) -> Path:
@@ -279,7 +287,9 @@ class ExplorationSession:
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
         self._pending_prompts = []
-        self._deferred_model_effort = None
+        self._turn_model = None
+        self._turn_selection = None
+        self._pending_user_logs = None
         self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
@@ -379,11 +389,71 @@ class ExplorationSession:
         self.workspace.update_config(prompt_mode=mode)
         return mode
 
+    def _baseline_selection(
+        self,
+    ) -> tuple[ProviderId | None, str | None, str | None]:
+        if self._turn_selection is not None:
+            return self._turn_selection
+        if self.model is None:
+            return (None, None, self.effort)
+        return (
+            self.provider_for_model(self.model),
+            self.raw_model_id(self.model),
+            self.effort,
+        )
+
+    def _prompt_selection(
+        self,
+        item: PendingPrompt,
+        base: tuple[ProviderId | None, str | None, str | None],
+    ) -> tuple[ProviderId | None, str | None, str | None]:
+        if item.model is not None:
+            provider = item.provider or self.provider_for_model(item.model)
+            raw_model = item.raw_model or self.raw_model_id(item.model)
+            effort = (
+                (item.effort if item.effort is not None else base[2])
+                if (provider, raw_model) == (base[0], base[1])
+                else item.effort
+            )
+            return (provider, raw_model, effort)
+        return (
+            base[0],
+            base[1],
+            item.effort if item.effort is not None else base[2],
+        )
+
+    def _steerable_prefix_count(self) -> int:
+        base = self._baseline_selection()
+        count = 0
+        for item in self._pending_prompts:
+            if item.mode != "steer" or self._prompt_selection(item, base) != base:
+                break
+            count += 1
+        return count
+
     def pending_prompts_snapshot(self) -> list[dict[str, str]]:
         """Serialize pending prompts without exposing backend model overrides."""
+        if (
+            self._turn_selection is None
+            and self._probe_task is not None
+            and not self._probe_task.done()
+        ):
+            steerable: int | None = 0
+        elif self._turn_selection is not None or self._is_busy:
+            steerable = self._steerable_prefix_count()
+        else:
+            steerable = None
         return [
-            {"id": item.id, "text": item.text, "mode": item.mode}
-            for item in self._pending_prompts
+            {
+                "id": item.id,
+                "text": item.text,
+                "mode": (
+                    "steer"
+                    if item.mode == "steer" and (steerable is None or index < steerable)
+                    else "queue"
+                ),
+            }
+            for index, item in enumerate(self._pending_prompts)
         ]
 
     def enqueue_prompt(
@@ -402,6 +472,8 @@ class ExplorationSession:
             mode=resolved_mode,
             model=model,
             effort=effort,
+            provider=self.provider_for_model(model) if model is not None else None,
+            raw_model=self.raw_model_id(model) if model is not None else None,
         )
         self._pending_prompts.append(prompt)
         try:
@@ -435,45 +507,39 @@ class ExplorationSession:
         """Drop all pending prompts and notify listeners if any were present."""
         had_pending = bool(self._pending_prompts)
         self._pending_prompts.clear()
-        self._deferred_model_effort = None
         if had_pending:
             await self.emit("pending_prompts_changed", pending_prompts=[])
 
     def pop_next_turn_prompts(self) -> list[PendingPrompt]:
-        """Pop the next queued turn, batching leading steer prompts together."""
+        """Pop the next queued turn, batching matching leading steer prompts together."""
         if not self._pending_prompts:
             return []
-        if self._pending_prompts[0].mode == "steer":
-            batch: list[PendingPrompt] = []
-            while self._pending_prompts and self._pending_prompts[0].mode == "steer":
-                batch.append(self._pending_prompts.pop(0))
-            return batch
-        return [self._pending_prompts.pop(0)]
+        first = self._pending_prompts.pop(0)
+        if first.mode != "steer":
+            return [first]
+        target = self._prompt_selection(first, self._baseline_selection())
+        batch = [first]
+        while (
+            self._pending_prompts
+            and self._pending_prompts[0].mode == "steer"
+            and self._prompt_selection(self._pending_prompts[0], target) == target
+        ):
+            batch.append(self._pending_prompts.pop(0))
+        return batch
 
     async def consume_steer_message(self) -> dict[str, Any] | None:
-        """Consume any pending steer messages before starting the next probe."""
-        if not any(item.mode == "steer" for item in self._pending_prompts):
+        """Consume matching leading steer messages before starting the next probe."""
+        if self._steerable_prefix_count() == 0:
             return None
         # Yield briefly so ready assistant text arrives before logging user input.
         await asyncio.sleep(0)
-        steered = [item for item in self._pending_prompts if item.mode == "steer"]
-        if not steered:
+        count = self._steerable_prefix_count()
+        if count == 0:
             return None
-        self._pending_prompts = [
-            item for item in self._pending_prompts if item.mode != "steer"
-        ]
+        steered = self._pending_prompts[:count]
+        self._pending_prompts = self._pending_prompts[count:]
         if self._commit_turn_accepted is not None:
             self._commit_turn_accepted()
-
-        deferred_model, deferred_effort = self._deferred_model_effort or (None, None)
-        for item in steered:
-            if item.model is not None:
-                deferred_model = item.model
-                deferred_effort = item.effort
-            elif item.effort is not None:
-                deferred_effort = item.effort
-        if deferred_model is not None or deferred_effort is not None:
-            self._deferred_model_effort = (deferred_model, deferred_effort)
 
         prefix = ""
         if self._record_dirty:
@@ -610,7 +676,9 @@ class ExplorationSession:
         self._record_reload_reason = "concurrent"
         self._results_since_note = 0
         self._pending_prompts = []
-        self._deferred_model_effort = None
+        self._turn_model = None
+        self._turn_selection = None
+        self._pending_user_logs = None
         self._restore_pending_verdict(records)
         self.context_usage = next(
             (
@@ -688,6 +756,7 @@ class ExplorationSession:
             else None
         )
         compact_effort = self.effort if compact_model is not None else None
+        compact_auth = self.auth.get(provider)
         self._is_busy = True
         started_at = time.monotonic()
         try:
@@ -699,7 +768,7 @@ class ExplorationSession:
                     workspace_path=self.workspace_path,
                     model=compact_model,
                     effort=compact_effort,
-                    auth=self.auth.get(provider),
+                    auth=compact_auth,
                     resume_session_id=self._sdk_session_id,
                 )
             except SessionResumeError as exc:
@@ -710,7 +779,9 @@ class ExplorationSession:
                 self.context_usage = None
                 self._session_initialized = False
                 self._resume_prefix = (
-                    self.workspace.recap(prior_records, kernel_preserved=True)
+                    self.workspace.recap(
+                        prior_records, kernel_preserved=not self._kernel_notice
+                    )
                     if prior_records
                     else None
                 )
@@ -760,16 +831,24 @@ class ExplorationSession:
         if self.model is None:
             raise RuntimeError("No model available.")
 
-        provider = self.provider_for_model(self.model)
+        turn_catalogue_model = self.model
+        provider = self.provider_for_model(turn_catalogue_model)
+        turn_raw_model = self.raw_model_id(turn_catalogue_model)
+        turn_effort = self.effort
+        turn_auth = self.auth.get(provider)
         backend = self.backends[provider]
         self._is_busy = True
+        self._turn_model = turn_catalogue_model
+        self._turn_selection = (provider, turn_raw_model, turn_effort)
         try:
             prior_records = self.workspace.current_records()
             # When switching providers mid-chat, capture the prior transcript recap
             # before logging the new user message so it is never duplicated.
             if self._active_provider is not None and provider != self._active_provider:
                 self._resume_prefix = (
-                    self.workspace.recap(prior_records, kernel_preserved=True)
+                    self.workspace.recap(
+                        prior_records, kernel_preserved=not self._kernel_notice
+                    )
                     if prior_records
                     else None
                 )
@@ -819,10 +898,10 @@ class ExplorationSession:
             prepare_prompt()
             await self.emit("status_change", status="thinking")
             if slurm_probe_id is None:
-                if self._prelogged_user_turn:
-                    self._prelogged_user_turn = False
-                else:
-                    self.log_transcript("user", text=user_text)
+                user_logs = self._pending_user_logs or [user_text]
+                self._pending_user_logs = None
+                for message_text in user_logs:
+                    self.log_transcript("user", text=message_text)
             else:
                 self.log_transcript("slurm_review", probe_id=slurm_probe_id)
                 await self.emit("slurm_review", probe_id=slurm_probe_id)
@@ -879,9 +958,9 @@ class ExplorationSession:
                             system_prompt=build_system_prompt(self.exploration_prompt),
                             tools=turn_tools,
                             workspace_path=self.workspace_path,
-                            model=self.raw_model_id(self.model),
-                            effort=self.effort,
-                            auth=self.auth.get(provider),
+                            model=turn_raw_model,
+                            effort=turn_effort,
+                            auth=turn_auth,
                             resume_session_id=resume_id,
                             tool_timeout_s=tool_timeout_s,
                         ):
@@ -971,7 +1050,9 @@ class ExplorationSession:
                             text="Original provider session was unavailable; rebuilt context from the saved transcript.",
                         )
                         self._resume_prefix = (
-                            self.workspace.recap(prior_records, kernel_preserved=True)
+                            self.workspace.recap(
+                                prior_records, kernel_preserved=not self._kernel_notice
+                            )
                             if prior_records
                             else None
                         )
@@ -991,8 +1072,10 @@ class ExplorationSession:
             await self.emit("error", message=str(exc))
             return False
         finally:
-            self._prelogged_user_turn = False
+            self._pending_user_logs = None
             self._commit_turn_accepted = None
+            self._turn_model = None
+            self._turn_selection = None
             self._is_busy = False
             if not (self._draining_queries and self._pending_prompts):
                 await self.emit("status_change", status="idle")
@@ -1035,7 +1118,9 @@ class ExplorationSession:
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
         self._pending_prompts = []
-        self._deferred_model_effort = None
+        self._turn_model = None
+        self._turn_selection = None
+        self._pending_user_logs = None
         self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort

@@ -685,3 +685,149 @@ async def test_queue_mode_runs_fifo_turns_applies_models_and_clears_on_interrupt
 
     assert session._pending_prompts == []
     assert seen == [("fourth", "opus", "high")]
+
+
+@pytest.mark.asyncio
+async def test_steer_with_model_switch_queues_for_requested_provider(session):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    class SteerProbeBackend(StubBackend):
+        def __init__(self, provider, on_turn=None):
+            super().__init__(provider)
+            self.on_turn = on_turn
+            self.calls = []
+
+        async def run_turn(self, prompt, *, tools, model, effort, auth, **kwargs):
+            self.calls.append((prompt, model, effort, auth))
+            yield SessionStarted(f"{self.provider}-1")
+            if self.on_turn is not None:
+                await self.on_turn(tools)
+            yield TextBlockDone(f"{self.provider} done")
+            yield TurnResult()
+
+    runtime_ref = {}
+    snapshots = []
+
+    async def on_anthropic_turn(tools):
+        runtime = runtime_ref["runtime"]
+        by_name = {spec.name: spec for spec in tools}
+        first_run = await by_name["run"].handler({"code": "x = 1", "expected": "1"})
+        assert not first_run.get("is_error")
+        await by_name["verdict"].handler({"text": "x was set"})
+
+        # Submitting with a different model in steer mode must queue instead of steering
+        # into the active Anthropic turn.
+        runtime.start_query("follow on openai 1", "gpt-5.6", "high")
+        runtime.start_query("follow on openai 2", "gpt-5.6", "high")
+        session.workspace.create_document("OpenAIHint", "Only for OpenAI")
+        snapshots.append(session.pending_prompts_snapshot())
+
+        second_run = await by_name["run"].handler(
+            {"code": "print(x + 1)", "expected": "2"}
+        )
+        assert not second_run.get("is_error")
+        assert "Probe S001/P002" in second_run["content"][0]["text"]
+        assert "follow on openai" not in second_run["content"][0]["text"]
+        assert "Only for OpenAI" not in second_run["content"][0]["text"]
+        await by_name["verdict"].handler({"text": "x + 1 was printed"})
+
+    anthropic = SteerProbeBackend("anthropic", on_turn=on_anthropic_turn)
+    openai = SteerProbeBackend("openai")
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=anthropic, openai=openai)
+    )
+    runtime_ref["runtime"] = runtime
+    runtime.models = ["claude-opus-5", "gpt-5.6"]
+    runtime.model_providers = {"claude-opus-5": "anthropic", "gpt-5.6": "openai"}
+    runtime.model_raw_ids = {"claude-opus-5": "claude-opus-5", "gpt-5.6": "gpt-5.6"}
+    runtime.model_efforts = {"claude-opus-5": ["high"], "gpt-5.6": ["low", "high"]}
+    session.model_providers = dict(runtime.model_providers)
+    session.model_raw_ids = dict(runtime.model_raw_ids)
+    session.model = "claude-opus-5"
+    session.effort = "high"
+
+    assert (
+        runtime.start_query("start on anthropic", "claude-opus-5", "high") == "started"
+    )
+    await runtime.wait_for_query()
+
+    assert [item["mode"] for item in snapshots[0]] == ["queue", "queue"]
+    assert len(anthropic.calls) == 1
+    assert len(openai.calls) == 1
+    oai_prompt, oai_model, oai_effort, _ = openai.calls[0]
+    assert oai_model == "gpt-5.6"
+    assert oai_effort == "high"
+    assert "Only for OpenAI" in oai_prompt
+    assert oai_prompt.count("follow on openai 1") == 1
+    assert oai_prompt.count("follow on openai 2") == 1
+    assert "Only for OpenAI" not in anthropic.calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_steer_fallback_batch_not_duplicated_and_respects_provider_switch(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    turn1_entered = asyncio.Event()
+    release_turn1 = asyncio.Event()
+
+    class BlockingAnthropic(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-1")
+            turn1_entered.set()
+            await release_turn1.wait()
+            yield TextBlockDone("anthropic reply")
+            yield TurnResult()
+
+    class RecordingOpenAI(StubBackend):
+        def __init__(self):
+            super().__init__("openai")
+            self.calls = []
+
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            self.calls.append((prompt, model, effort))
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("openai reply")
+            yield TurnResult()
+
+    openai = RecordingOpenAI()
+    runtime = Runtime(
+        session,
+        backends=stub_backends(anthropic=BlockingAnthropic("anthropic"), openai=openai),
+    )
+    runtime.models = ["claude-opus-5", "gpt-5.6"]
+    runtime.model_providers = {"claude-opus-5": "anthropic", "gpt-5.6": "openai"}
+    runtime.model_raw_ids = {"claude-opus-5": "claude-opus-5", "gpt-5.6": "gpt-5.6"}
+    runtime.model_efforts = {"claude-opus-5": ["high"], "gpt-5.6": ["low", "high"]}
+    session.model_providers = dict(runtime.model_providers)
+    session.model_raw_ids = dict(runtime.model_raw_ids)
+    session.model = "claude-opus-5"
+    session.effort = "high"
+
+    assert runtime.start_query("first turn", "claude-opus-5", "high") == "started"
+    await turn1_entered.wait()
+    assert runtime.start_query("batch msg one", "gpt-5.6", "low") == "pending"
+    assert runtime.start_query("batch msg two", "gpt-5.6", "low") == "pending"
+    assert runtime.start_query("third turn", "claude-opus-5", "high") == "pending"
+    release_turn1.set()
+    await runtime.wait_for_query()
+
+    assert len(openai.calls) == 1
+    oai_prompt, oai_model, oai_effort = openai.calls[0]
+    assert oai_model == "gpt-5.6"
+    assert oai_effort == "low"
+    assert oai_prompt.count("batch msg one") == 1
+    assert oai_prompt.count("batch msg two") == 1
+    assert "third turn" not in oai_prompt
+    user_records = [
+        record["text"]
+        for record in session.workspace.current_records()
+        if record.get("kind") == "user"
+    ]
+    assert user_records == [
+        "first turn",
+        "batch msg one",
+        "batch msg two",
+        "third turn",
+    ]
