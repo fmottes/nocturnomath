@@ -134,6 +134,8 @@ EVENT_PAYLOAD = {
         "path": "/tmp/workspace",
         "environment": {"python": "/tmp/venv/bin/python", "version": "3.12"},
     },
+    "name": "summary.md",
+    "action": "created",
 }
 
 EVENT_TYPES = [
@@ -160,6 +162,7 @@ EVENT_TYPES = [
     "context_compacted",
     "context_usage_changed",
     "pending_prompts_changed",
+    "document_saved",
 ]
 
 
@@ -844,3 +847,18 @@ async def test_prompts_during_compaction_are_labelled_queue(terminal):
         (item["text"], item["mode"])
         for item in terminal.session.pending_prompts_snapshot()
     ] == [("wait for compaction", "queue")]
+
+
+@pytest.mark.asyncio
+async def test_effort_command_lists_and_applies_next_turn_effort(terminal):
+    terminal.runtime.model_efforts[terminal.session.model] = ["low", "medium", "high"]
+    await terminal.run("/effort")
+    assert "effort:" in terminal.output()
+
+    await terminal.run("/effort low")
+    assert terminal.app.pending_effort == "low"
+    assert "Using effort low from the next message." in terminal.output()
+
+    await terminal.run("test with low effort")
+    assert terminal.app.pending_effort is None
+    assert terminal.session.effort == "low"

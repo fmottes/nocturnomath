@@ -52,6 +52,7 @@ COMMANDS = [
     ("/resume", "<S001> [--kernel]", "reopen a chat, optionally replaying its probes"),
     ("/export", "[path]", "save the current chat as a Jupyter notebook"),
     ("/model", "[name]", "show the catalogue, or use a model from the next message"),
+    ("/effort", "[level]", "show or set reasoning effort from the next message"),
     (
         "/auth",
         "[status|<provider> <method>]",
@@ -124,6 +125,7 @@ class TerminalApp:
         self.credential_reader = credential_reader
         self.pending_model: str | None = None
         self.pending_model_provider: str | None = None
+        self.pending_effort: str | None = None
         self.status = "idle"
         self.stopped = False
         self._interrupt_task: asyncio.Task | None = None
@@ -222,7 +224,8 @@ class TerminalApp:
             )
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model or 'No model available'}", style="dim")
-            self.write(f"effort: {session.effort}", style="dim")
+            if session.effort:
+                self.write(f"effort: {session.effort}", style="dim")
             auth = self.runtime.auth.public(self.runtime._provider_models)
             self.write(f"auth: {auth['label']}", style="dim")
             for info in auth["providers"].values():
@@ -250,6 +253,12 @@ class TerminalApp:
         model = session.model or "No model available"
         if self.pending_model:
             model += f" → {self.pending_model}"
+        effort = session.effort
+        if self.pending_effort:
+            effort = (
+                f"{effort} → {self.pending_effort}" if effort else self.pending_effort
+            )
+        effort_part = f" · effort {effort}" if effort else ""
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
         custom_auth = [
@@ -259,7 +268,7 @@ class TerminalApp:
         ]
         auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
         return (
-            f"kernel {kernel} · model {model} · effort {session.effort} · "
+            f"kernel {kernel} · model {model}{effort_part} · "
             f"auth {auth_summary} · chat {chat} · {self.status}"
         )
 
@@ -401,6 +410,8 @@ class TerminalApp:
         self.status = payload.get("status", "idle")
         if self.status == "thinking":
             self.show_spinner("thinking…")
+        elif self.status == "probing":
+            self.show_spinner("running probe…")
         elif self.status == "compacting":
             self.show_spinner("compacting…")
         else:
@@ -473,6 +484,13 @@ class TerminalApp:
     def _render_pending_prompts_changed(self, payload):
         pass
 
+    def _render_document_saved(self, payload):
+        verb = "Updated" if payload.get("action") == "revised" else "Created"
+        self.write(
+            f"{verb} .nocturnomath/documents/{payload.get('name', '')}.",
+            style="green",
+        )
+
     # ----------------------------------------------------------------- helpers
 
     def workspace_file(self, relative_path: str) -> Path:
@@ -511,7 +529,11 @@ class TerminalApp:
     def check_model(self, requested: str | None):
         if not self.runtime.models:
             self.write("No model available.", style="dim")
-        elif requested and requested not in self.runtime.models:
+        elif (
+            requested
+            and requested not in self.runtime.models
+            and self.runtime.resolve_model(requested) is None
+        ):
             self.write(
                 f"Model {requested} is unavailable; using {self.runtime.model}.",
                 style="dim",
@@ -574,15 +596,25 @@ class TerminalApp:
             return True
 
     async def run_query(self, text: str):
+        raw_model = (
+            self.runtime.model_raw_ids.get(self.pending_model)
+            if self.pending_model
+            else None
+        )
         try:
             query_state = self.runtime.start_query(
-                text, self.pending_model, provider=self.pending_model_provider
+                text,
+                self.pending_model,
+                self.pending_effort,
+                provider=self.pending_model_provider,
+                raw_model=raw_model,
             )
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return
         self.pending_model = None
         self.pending_model_provider = None
+        self.pending_effort = None
         if query_state == "pending":
             session = self.runtime.session
             snapshot = session.pending_prompts_snapshot() if session else []
@@ -593,6 +625,12 @@ class TerminalApp:
             )
             when = "before next probe" if mode == "steer" else "after current turn"
             self.write(f"Scheduled ({mode}, {when}).", style="dim")
+            if self.runtime.current_task is None:
+                return
+            while self.runtime.current_task and not self.runtime.current_task.done():
+                await self.runtime.wait_for_query()
+            self.close_stream()
+            self.clear_spinner()
             return
         await self.runtime.wait_for_query()
         self.close_stream()
@@ -606,6 +644,7 @@ class TerminalApp:
         self.require_idle("start a new session")
         self.pending_model = None
         self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -673,6 +712,7 @@ class TerminalApp:
         )
         self.pending_model = None
         self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.emit("session_resumed", data)
         return True
 
@@ -717,7 +757,41 @@ class TerminalApp:
             return True
         self.pending_model = argument
         self.pending_model_provider = runtime.model_providers.get(argument)
+        supported = runtime.model_efforts.get(argument, [])
+        if self.pending_effort and self.pending_effort not in supported:
+            self.pending_effort = None
         self.write(f"Using {argument} from the next message.")
+        return True
+
+    async def _command_effort(self, argument: str) -> bool:
+        runtime = self.runtime
+        session = runtime.session
+        target = self.pending_model or (session.model if session else runtime.model)
+        levels = runtime.model_efforts.get(target or "", [])
+        current = session.effort if session else runtime.effort
+        if not argument:
+            self.write(f"effort: {current or 'none'}")
+            if self.pending_effort:
+                self.write(
+                    f"{self.pending_effort} applies from the next message.",
+                    style="dim",
+                )
+            if levels:
+                self.write(f"  supported for {target}: {', '.join(levels)}")
+            else:
+                self.write(
+                    f"  {target or 'Current model'} has no effort setting.",
+                    style="dim",
+                )
+            return True
+        if not levels:
+            self.error(f"{target or 'Current model'} does not support effort levels.")
+            return True
+        if argument not in levels:
+            self.error(f"Choose a supported effort for {target}: {', '.join(levels)}.")
+            return True
+        self.pending_effort = argument
+        self.write(f"Using effort {argument} from the next message.")
         return True
 
     async def _command_auth(self, argument: str) -> bool:
@@ -786,9 +860,26 @@ class TerminalApp:
                 )
                 self.pending_model = None
                 self.pending_model_provider = None
+                self.pending_effort = None
             else:
                 self.pending_model = resolved
                 self.pending_model_provider = self.runtime.model_providers.get(resolved)
+                if (
+                    self.pending_effort
+                    and self.pending_effort
+                    not in self.runtime.model_efforts.get(resolved, [])
+                ):
+                    self.pending_effort = None
+        elif self.pending_effort:
+            active_model = (
+                self.runtime.session.model
+                if self.runtime.session
+                else self.runtime.model
+            )
+            if self.pending_effort not in self.runtime.model_efforts.get(
+                active_model or "", []
+            ):
+                self.pending_effort = None
         self.check_model(self.runtime.model)
         return True
 
@@ -801,6 +892,9 @@ class TerminalApp:
             self.runtime.open_workspace, session.workspace_path, argument
         )
         self.initial_python = None
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         self.write("New research environment; this starts a new chat.")
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
@@ -815,6 +909,9 @@ class TerminalApp:
             self.runtime.open_workspace, argument, self.initial_python
         )
         self.initial_python = None
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
         )
@@ -908,7 +1005,6 @@ async def run_terminal(args: argparse.Namespace):
         console=console,
         python=args.python,
     )
-    app.runtime.start()
     app.runtime.subscribe(app.render_event)
     try:
         app.runtime.open_workspace(args.path, args.python)
@@ -917,6 +1013,7 @@ async def run_terminal(args: argparse.Namespace):
         return
     app.initial_python = None
     await app.runtime.discover_models()
+    app.runtime.start()
     app.check_model(args.default_model)
     app.banner()
 

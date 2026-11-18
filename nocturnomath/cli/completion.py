@@ -65,6 +65,8 @@ class CommandCompleter(Completer):
 
     def _arguments(self, name: str, argument: str = "") -> list[tuple[str, str]]:
         if name == "/model":
+            if " " in argument.lstrip():
+                return []
             items = []
             for model in self.runtime.models:
                 provider = self.runtime.model_providers.get(model)
@@ -76,6 +78,18 @@ class CommandCompleter(Completer):
                     meta = label
                 items.append((model, meta))
             return items
+        if name == "/effort":
+            if " " in argument.lstrip():
+                return []
+            current = (
+                self.runtime.session.model
+                if self.runtime.session
+                else self.runtime.model
+            )
+            return [
+                (level, f"reasoning effort for {current}")
+                for level in self.runtime.model_efforts.get(current or "", [])
+            ]
         if name == "/auth":
             head, space, rest = argument.lstrip().partition(" ")
             if not space:
