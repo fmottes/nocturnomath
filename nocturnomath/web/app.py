@@ -132,8 +132,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        runtime.start()
         await runtime.discover_models()
+        runtime.start()
         browser_task = None
         if browser_url:
 
@@ -261,8 +261,10 @@ def create_app(
                 detail="Open a workspace folder before using the agent.",
             )
         try:
-            agent_id = await asyncio.to_thread(runtime.create_agent)
+            agent_id = await runtime.create_agent_async()
             snapshot = runtime.agent_snapshot(agent_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Failed to create explorer")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -326,6 +328,7 @@ def create_app(
             "models": runtime.models,
             "model_labels": runtime.model_labels,
             "model_providers": runtime.model_providers,
+            "model_raw_ids": runtime.model_raw_ids,
             "model_efforts": runtime.model_efforts,
             "effort": runtime.session.effort if runtime.session else runtime.effort,
             "agent_models": {
@@ -591,12 +594,14 @@ def create_app(
     async def restart_kernel(agent_id: str | None = None):
         require_idle("restart the kernel", agent_id)
         session = active_session(agent_id)
-        await runtime.transition_agent(
-            agent_id or runtime.primary_agent_id, session.kernel.restart
-        )
+        resolved_agent_id = agent_id or runtime.primary_agent_id
+        await runtime.transition_agent(resolved_agent_id, session.kernel.restart)
         await runtime.broadcast(
             "kernel_restarted",
-            {"agent_id": agent_id, "kernel_alive": session.kernel.is_alive()},
+            {
+                "agent_id": resolved_agent_id,
+                "kernel_alive": session.kernel.is_alive(),
+            },
         )
         return {"status": "ok", "kernel_alive": session.kernel.is_alive()}
 
@@ -665,7 +670,10 @@ def create_app(
         await runtime.broadcast(
             "session_reset",
             {
-                "session_id": session.workspace.session_id,
+                "agent_id": runtime.primary_agent_id,
+                "session_id": None
+                if session.workspace.session_pending
+                else session.workspace.session_id,
                 "model": session.model,
                 "effort": session.effort,
             },
@@ -756,7 +764,7 @@ def create_app(
 
                 if action == "new_agent":
                     try:
-                        agent_id = await asyncio.to_thread(runtime.create_agent)
+                        agent_id = await runtime.create_agent_async()
                         await runtime.broadcast(
                             "agent_added", runtime.agent_snapshot(agent_id)
                         )
@@ -795,7 +803,7 @@ def create_app(
                         continue
                     if text == "/new":
                         try:
-                            new_id = await asyncio.to_thread(runtime.create_agent)
+                            new_id = await runtime.create_agent_async()
                             await runtime.broadcast(
                                 "agent_added",
                                 {
@@ -814,10 +822,10 @@ def create_app(
                                 agent_id, session.kernel.restart
                             )
                             await runtime.broadcast(
-                                "system_message",
+                                "kernel_restarted",
                                 {
                                     "agent_id": agent_id,
-                                    "text": "Kernel restarted. In-memory state is cleared.",
+                                    "kernel_alive": session.kernel.is_alive(),
                                 },
                             )
                         except RuntimeError as exc:
@@ -908,11 +916,19 @@ def create_app(
                             "error", {"agent_id": agent_id, "message": str(exc)}
                         )
                 elif action == "new_session":
-                    new_id = await asyncio.to_thread(runtime.create_agent)
-                    await runtime.broadcast(
-                        "agent_added",
-                        {"requested_by": agent_id, **runtime.agent_snapshot(new_id)},
-                    )
+                    try:
+                        new_id = await runtime.create_agent_async()
+                        await runtime.broadcast(
+                            "agent_added",
+                            {
+                                "requested_by": agent_id,
+                                **runtime.agent_snapshot(new_id),
+                            },
+                        )
+                    except Exception as exc:
+                        await runtime.broadcast(
+                            "error", {"agent_id": agent_id, "message": str(exc)}
+                        )
         except WebSocketDisconnect:
             runtime.websockets.discard(websocket)
         except Exception as exc:

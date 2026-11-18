@@ -44,7 +44,7 @@ export function updateAgentStatus(status) {
   elements.btnSend.disabled = state.exiting || !elements.modelSelect.value;
   if (elements.sendBtnText) {
     elements.sendBtnText.textContent = busy
-      ? (state.promptMode === "queue" ? "Queue" : "Steer")
+      ? (status === "compacting" || state.promptMode === "queue" ? "Queue" : "Steer")
       : "Send";
   }
   if (busy) {

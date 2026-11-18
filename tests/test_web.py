@@ -1224,3 +1224,79 @@ def test_websocket_query_and_defaults_keep_provider_when_catalogue_collides(
             err = websocket.receive_json()
         assert "Choose a model from the model selector." in err["message"]
         assert anthropic.turn_calls == 0
+
+
+def test_prefixed_raw_model_ids_and_session_reset_resume_payloads(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_raw"
+    workspace.mkdir()
+    oss_spec = ModelSpec(
+        id="openai/gpt-oss-120b",
+        raw_id="openai/gpt-oss-120b",
+        provider="openai",
+        label="GPT-OSS 120B",
+        efforts=["low", "high"],
+        is_default=True,
+    )
+
+    class PrefixedOpenAI(FakeWebBackend):
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            self.turn_calls += 1
+            assert model == "openai/gpt-oss-120b"
+            yield SessionStarted("oai-oss-1")
+            yield TextBlockDone("oss-ok")
+            yield TurnResult()
+
+    backend_model_catalog["anthropic"] = FakeWebBackend("anthropic", models=[])
+    backend_model_catalog["openai"] = PrefixedOpenAI("openai", models=[oss_spec])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        ws_res = client.post("/api/workspace", json={"path": str(workspace)})
+        assert ws_res.status_code == 200
+        snap = ws_res.json()["workspace"]
+        assert snap["session_id"] is None
+        assert snap["model_raw_ids"] == {"openai/gpt-oss-120b": "openai/gpt-oss-120b"}
+        assert client.get("/api/auth").json()["model_raw_ids"] == {
+            "openai/gpt-oss-120b": "openai/gpt-oss-120b"
+        }
+        ws_evt = websocket.receive_json()
+        agent_id = ws_evt["workspace"]["agents"][0]["agent_id"]
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "create S001",
+                "model": "openai/gpt-oss-120b",
+                "provider": "openai",
+                "raw_model": "openai/gpt-oss-120b",
+                "effort": "high",
+            }
+        )
+        while websocket.receive_json()["type"] != "turn_complete":
+            pass
+        while client.app.state.runtime.get_agent(agent_id).has_active_query():
+            pass
+
+        reset_res = client.post("/api/session/new")
+        assert reset_res.status_code == 200
+        reset_evt = websocket.receive_json()
+        while reset_evt["type"] != "session_reset":
+            reset_evt = websocket.receive_json()
+        assert reset_evt["agent_id"] == agent_id
+        assert reset_evt["session_id"] is None
+
+        resume_res = client.post("/api/session/resume", json={"id": "S001"})
+        assert resume_res.status_code == 200
+        body = resume_res.json()
+        assert body["session_id"] == "S001"
+        assert body["can_compact"] is True

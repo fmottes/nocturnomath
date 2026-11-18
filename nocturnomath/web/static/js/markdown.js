@@ -66,10 +66,11 @@ function escapeHtml(text) {
 function protectMath(markdown) {
   const formulas = [];
   const protectedText = markdown.replace(
-    /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\n])+?(?<!\s)\$/g,
-    (formula) => {
+    /(```[\s\S]*?```|~~~[\s\S]*?~~~|`+[^`\n]*?`+)|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\n])+?(?<!\s)\$/g,
+    (match, codeSpan) => {
+      if (codeSpan !== undefined) return codeSpan;
       const token = `NocturnomathMathToken${formulas.length}End`;
-      formulas.push(formula);
+      formulas.push(match);
       return token;
     },
   );

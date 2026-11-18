@@ -47,6 +47,8 @@ export function applyWorkspace(ws) {
     ws.model_efforts || {},
     selected?.effort || ws.effort,
     ws.model_providers || {},
+    null,
+    ws.model_raw_ids || {},
   );
   setSessionDefaults(ws.session_defaults);
   setExplorationPrompt(ws.exploration_prompt, ws.exploration_prompt_is_custom);
@@ -188,8 +190,11 @@ function fillModelSelect(select, models, labels, preferred, providers = {}) {
   select.value = models.includes(preferred) ? preferred : models[0] || "";
 }
 
-export function rawModelId(model, provider = null) {
+export function rawModelId(model, provider = null, modelRawIds = state.modelRawIds) {
   if (!model) return null;
+  if (modelRawIds && Object.prototype.hasOwnProperty.call(modelRawIds, model)) {
+    return modelRawIds[model];
+  }
   if (provider && model.startsWith(`${provider}/`)) {
     return model.slice(provider.length + 1);
   }
@@ -205,6 +210,7 @@ export function resolveCatalogueModel(
   provider = null,
   models = state.models,
   modelProviders = state.modelProviders,
+  modelRawIds = state.modelRawIds,
 ) {
   if (!rawOrCatalogueId || !models.length) return null;
   let targetProvider = provider;
@@ -223,7 +229,15 @@ export function resolveCatalogueModel(
   ) {
     return rawOrCatalogueId;
   }
-  const raw = rawModelId(rawOrCatalogueId, targetProvider);
+  for (const candidate of models) {
+    if (
+      modelProviders[candidate] === targetProvider
+      && modelRawIds?.[candidate] === rawOrCatalogueId
+    ) {
+      return candidate;
+    }
+  }
+  const raw = rawModelId(rawOrCatalogueId, targetProvider, modelRawIds);
   for (const candidate of [`${targetProvider}/${raw}`, raw]) {
     if (models.includes(candidate) && modelProviders[candidate] === targetProvider) {
       return candidate;
@@ -277,34 +291,39 @@ export function setModelCatalogue(
   serverEffort = null,
   modelProviders = {},
   agentModels = null,
+  modelRawIds = {},
 ) {
   // The dropdown decides the model of the next message, so an unsent choice
-  // survives a catalogue refresh; otherwise follow the server's model.
+  // survives a catalogue refresh; otherwise follow the active explorer's server model.
   const previousProviders = state.modelProviders || {};
+  const previousRawIds = state.modelRawIds || {};
   const currentModel = elements.modelSelect.value;
   const currentEffort = elements.effortSelect.value;
   const currentProvider = previousProviders[currentModel] || null;
+  const currentRaw = rawModelId(currentModel, currentProvider, previousRawIds);
   state.models = models;
   state.modelLabels = labels;
   state.modelEfforts = modelEfforts;
   state.modelProviders = modelProviders;
+  state.modelRawIds = modelRawIds;
   const resolvedCurrent = resolveCatalogueModel(
-    currentModel,
+    currentRaw || currentModel,
     currentProvider,
     models,
     modelProviders,
+    modelRawIds,
   );
   for (const agent of state.agents.values()) {
     if (agent.draftModel || agent.draftRawModel) {
       const draftProv = agent.draftProvider || previousProviders[agent.draftModel] || null;
-      const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv);
-      const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders);
+      const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv, previousRawIds);
+      const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders, modelRawIds);
       if (resolvedDraft) {
         agent.draftModel = resolvedDraft;
         agent.draftProvider = modelProviders[resolvedDraft] || draftProv;
-        agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider);
+        agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider, modelRawIds);
         agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
-      } else if (models.length) {
+      } else {
         agent.draftModel = null;
         agent.draftProvider = null;
         agent.draftRawModel = null;
@@ -319,21 +338,32 @@ export function setModelCatalogue(
     } else if (agent.model) {
       const modelProv = agent.modelProvider || previousProviders[agent.model] || null;
       const resolvedAgentModel = resolveCatalogueModel(
-        rawModelId(agent.model, modelProv),
+        rawModelId(agent.model, modelProv, previousRawIds),
         modelProv,
         models,
         modelProviders,
+        modelRawIds,
       );
       agent.model = resolvedAgentModel || (models.includes(serverModel) ? serverModel : models[0] || null);
       agent.modelProvider = agent.model ? (modelProviders[agent.model] || null) : null;
     }
   }
-  const preferred = resolvedCurrent || (models.includes(serverModel) ? serverModel : null);
+  const activeAgent = state.activeAgentId ? state.agents.get(state.activeAgentId) : null;
+  const activeServerModel = activeAgent ? activeAgent.model : serverModel;
+  const activeServerEffort = activeAgent ? activeAgent.effort : serverEffort;
+  const preferred = activeAgent
+    ? (activeAgent.draftModel || (models.includes(activeServerModel) ? activeServerModel : resolvedCurrent))
+    : (resolvedCurrent || (models.includes(activeServerModel) ? activeServerModel : null));
   fillModelSelect(elements.modelSelect, models, labels, preferred, modelProviders);
+  const preferredEffort = activeAgent?.draftModel && activeAgent.draftModel === elements.modelSelect.value
+    ? activeAgent.draftEffort
+    : (!activeAgent && resolvedCurrent && resolvedCurrent === elements.modelSelect.value
+      ? currentEffort
+      : activeServerEffort);
   setEffortForModel(
     elements.effortSelect,
     elements.modelSelect.value,
-    resolvedCurrent && resolvedCurrent === elements.modelSelect.value ? currentEffort : serverEffort,
+    preferredEffort,
   );
   if (state.sessionDefaults) setSessionDefaults(state.sessionDefaults);
 }

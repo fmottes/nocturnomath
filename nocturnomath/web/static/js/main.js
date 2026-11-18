@@ -148,7 +148,7 @@ function applyExplorer(agent, repaint = false) {
       merged.draftModel = resolvedDraft;
       merged.draftProvider = state.modelProviders[resolvedDraft] || merged.draftProvider || null;
       merged.draftRawModel = rawModelId(resolvedDraft, merged.draftProvider);
-    } else if (state.models.length) {
+    } else {
       merged.draftModel = null;
       merged.draftProvider = null;
       merged.draftRawModel = null;
@@ -302,11 +302,18 @@ function handleServerEvent(event) {
     }
     if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
     if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
+    if (event.type === "user_message" && event.session_id) current.session_id = event.session_id;
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
-    if (event.agent_id !== state.activeAgentId && event.type !== "agent_focused") {
+    if (
+      event.agent_id !== state.activeAgentId
+      && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
+    ) {
       if (event.type === "record_changed" && state.activeTab !== "plots") {
         loadDocument(state.activeDoc, "", true);
+      }
+      if (event.type === "turn_complete") {
+        refreshContextUsage(event.agent_id);
       }
       return;
     }
@@ -441,11 +448,13 @@ function handleServerEvent(event) {
       );
       break;
 
-    case "session_reset":
-      if (state.agents.has(event.agent_id)) {
-        Object.assign(state.agents.get(event.agent_id), {
+    case "session_reset": {
+      const targetId = event.agent_id || state.activeAgentId;
+      if (state.agents.has(targetId)) {
+        Object.assign(state.agents.get(targetId), {
           context_usage: null,
-          session_id: event.session_id,
+          session_id: event.session_id ?? null,
+          records: [],
           can_compact: false,
           pending_prompts: [],
           model: event.model,
@@ -457,14 +466,18 @@ function handleServerEvent(event) {
           draftEffort: null,
         });
       }
-      renderPendingPrompts([]);
-      setContextUsage(null);
-      setSessionId(event.session_id);
       renderExplorerTabs();
-      setActiveModelAndEffort(event.model, event.effort);
-      clearChat();
-      updateKernelStatus(true, false);
+      if (!event.agent_id || event.agent_id === state.activeAgentId) {
+        renderPendingPrompts([]);
+        setContextUsage(null);
+        setSessionId(event.session_id ?? null);
+        setActiveModelAndEffort(event.model, event.effort);
+        clearChat();
+        updateKernelStatus(true, false);
+        updateCompactButton();
+      }
       break;
+    }
 
     case "session_defaults_changed":
       setSessionDefaults(event.session_defaults);
@@ -482,9 +495,12 @@ function handleServerEvent(event) {
       renderPendingPrompts(event.pending_prompts || []);
       break;
 
-    case "session_resumed":
+    case "session_resumed": {
+      const resumedId = event.session_id || event.id || null;
       if (state.agents.has(event.agent_id)) {
         Object.assign(state.agents.get(event.agent_id), {
+          session_id: resumedId,
+          can_compact: event.can_compact ?? Boolean(event.context_restored),
           draftText: "",
           scrollTop: 0,
           followChat: true,
@@ -494,17 +510,24 @@ function handleServerEvent(event) {
           draftEffort: null,
         });
       }
-      applyExplorer(event);
-      restoreExplorerView(state.agents.get(event.agent_id));
-      setSessionId(event.id);
-      replaySession(
-        event.records || [],
-        event.context_restored,
-        event.kernel_reset,
-        event.kernel_restored,
-        event.probes_replayed
-      );
+      applyExplorer({
+        ...event,
+        session_id: resumedId,
+        can_compact: event.can_compact ?? Boolean(event.context_restored),
+      });
+      if (!event.agent_id || event.agent_id === state.activeAgentId) {
+        restoreExplorerView(state.agents.get(event.agent_id));
+        setSessionId(resumedId);
+        replaySession(
+          event.records || [],
+          event.context_restored,
+          event.kernel_reset,
+          event.kernel_restored,
+          event.probes_replayed
+        );
+      }
       break;
+    }
 
     case "system_message":
       appendSystemMessage(event.text);
@@ -607,7 +630,13 @@ function setupEventListeners() {
     elements.promptInput.value = "";
     elements.promptInput.style.height = "44px";
     const agent = state.agents.get(state.activeAgentId);
-    if (agent) agent.draftText = "";
+    if (agent) {
+      agent.draftText = "";
+      agent.draftModel = null;
+      agent.draftProvider = null;
+      agent.draftRawModel = null;
+      agent.draftEffort = null;
+    }
   });
 
   // Prompt Enter / Shift+Enter handling
@@ -823,6 +852,7 @@ function applyAuthChange(data) {
     data.effort,
     data.model_providers || {},
     data.agent_models || null,
+    data.model_raw_ids || {},
   );
   if (data.session_defaults) setSessionDefaults(data.session_defaults);
   refreshSendButton();

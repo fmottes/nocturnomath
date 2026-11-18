@@ -36,6 +36,7 @@ export const state = {
   models: [],
   modelLabels: {},
   modelProviders: {},
+  modelRawIds: {},
   modelEfforts: {},
   sessionDefaults: null,
 };
