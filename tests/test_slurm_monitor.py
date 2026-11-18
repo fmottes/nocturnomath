@@ -1308,3 +1308,48 @@ async def test_reopened_review_uses_latest_model_and_effort_on_same_native_threa
     owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
     assert (owner.model, owner.effort) == ("gpt-5.4-mini", "low")
     assert slurm.has_verdict(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_slurm_review_defers_steer_prompts_and_preserves_null_correction_of(
+    session, runtime, cluster
+):
+    probe_id, job_id = await submit(session)
+    complete(session, cluster, probe_id, job_id, state="FAILED")
+
+    async def review_with_user_steer():
+        session._slurm_review_probe_id = probe_id
+        try:
+            await tools(session)["check_slurm_job"].handler({"probe_id": probe_id})
+            await tools(session)["verdict"].handler(
+                {"text": "Job failed on missing flag; submitting fixed script."}
+            )
+            # User submits a steer message mid-review: must queue rather than hijack submit_slurm.
+            session.enqueue_prompt("Switch topic after review", mode="steer")
+            assert session._steerable_prefix_count() == 0
+            assert session.pending_prompts_snapshot()[0]["mode"] == "queue"
+            res = await tools(session)["submit_slurm"].handler(
+                {
+                    "code": "print('fixed')",
+                    "expected": "prints 42",
+                    "time_minutes": 10,
+                    "cpus": 1,
+                    "memory_gb": 1,
+                    "correction_of": None,
+                }
+            )
+            assert not res.get("is_error")
+        finally:
+            session._slurm_review_probe_id = None
+
+    await review_with_user_steer()
+    jobs = slurm.list_jobs(session.workspace)
+    assert len(jobs) == 2
+    replacement_meta = json.loads(
+        (
+            session.workspace.sessions_path / "S001" / "probes" / "P002" / "probe.json"
+        ).read_text()
+    )
+    assert replacement_meta["correction_of"] == probe_id
+    assert not slurm.needs_review(session.workspace, probe_id)
+    assert len(session._pending_prompts) == 1

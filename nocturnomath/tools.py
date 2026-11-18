@@ -138,8 +138,8 @@ def build_tools(session: "ExplorationSession"):
     @serialize_probe_operation
     async def run(args):
         code = args["code"]
-        expected = args.get("expected", "").strip()
-        retry_of = args.get("retry_of")
+        expected = (args.get("expected") or "").strip()
+        retry_of = args.get("retry_of") or None
 
         if session._pending_verdict is not None:
             return {
@@ -189,7 +189,10 @@ def build_tools(session: "ExplorationSession"):
 
         preface = []
         if not session.kernel.is_alive():
-            await asyncio.to_thread(session.kernel.restart)
+            restart_task = track_probe_task(
+                asyncio.create_task(asyncio.to_thread(session.kernel.restart))
+            )
+            await asyncio.shield(restart_task)
             preface.append(
                 "Note: the kernel was dead and has been restarted. Everything in memory is gone; "
                 "reload what you need."
@@ -241,42 +244,46 @@ def build_tools(session: "ExplorationSession"):
             code=code,
         )
         cancelled = threading.Event()
+        session._kernel_interrupt_requested = False
 
         def execute_and_save():
             try:
-                text, images, kernel_note = session.kernel.execute(
-                    code, session.timeout_s
-                )
-            except Exception as exc:
-                workspace.finish_probe(probe_path, str(exc), [], "failed", str(exc))
+                try:
+                    text, images, kernel_note = session.kernel.execute(
+                        code, session.timeout_s
+                    )
+                except Exception as exc:
+                    workspace.finish_probe(probe_path, str(exc), [], "failed", str(exc))
+                    workspace.log_transcript(
+                        "probe_failed",
+                        transcript_path=transcript_path,
+                        probe_id=source_id,
+                        text=str(exc),
+                    )
+                    raise
+                status = "completed"
+                if cancelled.is_set() or session._kernel_interrupt_requested:
+                    status = "interrupted"
+                elif session.kernel.errored:
+                    status = "error"
+                elif kernel_note:
+                    status = "incomplete"
+                workspace.finish_probe(probe_path, text, images, status, kernel_note)
+                paths = [f"{probe_dir}/plot-{i}.png" for i in range(1, len(images) + 1)]
                 workspace.log_transcript(
-                    "probe_failed",
+                    "run",
                     transcript_path=transcript_path,
                     probe_id=source_id,
-                    text=str(exc),
+                    expected=expected,
+                    code=code,
+                    output=text,
+                    images=paths,
+                    execution_note=kernel_note,
+                    status=status,
                 )
-                raise
-            status = "completed"
-            if cancelled.is_set():
-                status = "interrupted"
-            elif session.kernel.errored:
-                status = "error"
-            elif kernel_note:
-                status = "incomplete"
-            workspace.finish_probe(probe_path, text, images, status, kernel_note)
-            paths = [f"{probe_dir}/plot-{i}.png" for i in range(1, len(images) + 1)]
-            workspace.log_transcript(
-                "run",
-                transcript_path=transcript_path,
-                probe_id=source_id,
-                expected=expected,
-                code=code,
-                output=text,
-                images=paths,
-                execution_note=kernel_note,
-                status=status,
-            )
-            return text, images, kernel_note, paths, status
+                return text, images, kernel_note, paths, status
+            finally:
+                session._kernel_interrupt_requested = False
 
         await session.emit(
             "probe_start",
@@ -512,7 +519,7 @@ def build_tools(session: "ExplorationSession"):
         {"text": str},
     )
     async def verdict(args):
-        text = args.get("text", "").strip()
+        text = (args.get("text") or "").strip()
         if not text:
             return {
                 "content": [{"type": "text", "text": "text must be non-empty."}],
@@ -579,6 +586,7 @@ def build_tools(session: "ExplorationSession"):
         "Restart the Jupyter kernel. All in-memory state is lost.",
         {},
     )
+    @serialize_probe_operation
     async def restart_kernel(args):
         if session.kernel.busy or (
             session._probe_task and not session._probe_task.done()
@@ -619,6 +627,7 @@ def build_tools(session: "ExplorationSession"):
             "required": ["packages"],
         },
     )
+    @serialize_probe_operation
     async def install_packages(args):
         if session.kernel.busy or (
             session._probe_task and not session._probe_task.done()
@@ -703,14 +712,13 @@ def build_tools(session: "ExplorationSession"):
                     args["time_minutes"],
                     args["cpus"],
                     args["memory_gb"],
-                    args.get("partition", ""),
-                    args.get("gpus", 0),
-                    args.get("account", ""),
-                    args.get("qos", ""),
-                    args.get("result_files", []),
-                    correction_of=args.get(
-                        "correction_of", session._slurm_review_probe_id
-                    ),
+                    args.get("partition") or "",
+                    args.get("gpus") if args.get("gpus") is not None else 0,
+                    args.get("account") or "",
+                    args.get("qos") or "",
+                    args.get("result_files") or [],
+                    correction_of=args.get("correction_of")
+                    or session._slurm_review_probe_id,
                 )
             )
         )
@@ -823,9 +831,11 @@ def build_tools(session: "ExplorationSession"):
                 f"{probe_id}."
             )
         session.activate_session()
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                slurm.check, session.workspace, probe_id, session.transcript_path
+        task = track_probe_task(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    slurm.check, session.workspace, probe_id, session.transcript_path
+                )
             )
         )
         try:
@@ -838,6 +848,9 @@ def build_tools(session: "ExplorationSession"):
             raise
         except ValueError as exc:
             return failure(str(exc))
+        finally:
+            if task.done():
+                session._probe_task = None
         status = metadata["status"]
         state = metadata.get("slurm_state", "UNKNOWN")
         probe = (
@@ -919,6 +932,8 @@ def build_tools(session: "ExplorationSession"):
     async def save_document(args):
         path = args["path"]
         replace_existing = args["replace_existing"]
+        if not isinstance(replace_existing, bool):
+            return failure("replace_existing must be a boolean.")
         try:
             session.workspace.save_document(path, args["text"], replace_existing)
         except (ValueError, OSError) as exc:

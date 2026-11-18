@@ -1560,3 +1560,92 @@ async def test_partial_refresh_and_unavailable_resume_use_owner_then_workspace_d
         "gemini-4-carbon",
         "medium",
     )
+
+
+@pytest.mark.asyncio
+async def test_post_interrupt_prompt_submitted_during_unwind_runs_instead_of_being_cleared(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    started_turn = asyncio.Event()
+    finish_unwind = asyncio.Event()
+    seen_prompts: list[str] = []
+
+    class SlowUnwindBackend(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            seen_prompts.append(prompt)
+            if len(seen_prompts) == 1:
+                try:
+                    yield SessionStarted("ant-1")
+                    started_turn.set()
+                    await asyncio.Event().wait()
+                finally:
+                    await finish_unwind.wait()
+                return
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("second-done")
+            yield TurnResult()
+
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=SlowUnwindBackend("anthropic"))
+    )
+    runtime.start()
+    try:
+        assert runtime.start_query("first") == "started"
+        await asyncio.wait_for(started_turn.wait(), timeout=2)
+        assert runtime.start_query("queued-before-stop") == "pending"
+
+        interrupt_task = asyncio.create_task(session.interrupt())
+        await asyncio.sleep(0.02)
+        # Pre-interrupt prompt was cleared immediately; submit a new prompt while unwinding.
+        assert session._pending_prompts == []
+        assert runtime.start_query("submitted-after-stop") == "pending"
+        finish_unwind.set()
+        await interrupt_task
+        await runtime.wait_for_query()
+
+        assert len(seen_prompts) == 2
+        assert seen_prompts[1].endswith("submitted-after-stop")
+    finally:
+        await runtime.drain()
+        runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_compaction_clears_queued_prompts_and_blocks_duplicate_resume(
+    session,
+):
+    class FailingCompactBackend(StubBackend):
+        async def compact(self, **kwargs):
+            await asyncio.sleep(0.03)
+            raise RuntimeError("compact exploded")
+
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=FailingCompactBackend("anthropic"))
+    )
+    runtime.start()
+    try:
+        session._sdk_session_id = "ant-1"
+        session._active_provider = "anthropic"
+        session.activate_session()
+        session.log_transcript("user", text="seed")
+
+        compact_task = asyncio.create_task(
+            runtime.compact_agent(runtime.primary_agent_id)
+        )
+        await asyncio.sleep(0.005)
+        assert runtime.start_query("queued-during-failing-compact") == "pending"
+        with pytest.raises(RuntimeError, match="compact exploded"):
+            await compact_task
+        assert session._pending_prompts == []
+        assert session.status == "idle"
+
+        other_id = await runtime.create_agent_async()
+        runtime.reset_session()
+        runtime.replace_agent(other_id, "S001")
+        with pytest.raises(RuntimeError, match="already open in another explorer"):
+            runtime.resume_session("S001")
+    finally:
+        await runtime.drain()
+        runtime.shutdown()

@@ -6,7 +6,8 @@ import logging
 import subprocess
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,9 @@ class ExplorationSession:
         self._active_effort: str | None = None
         self._sdk_session_id: str | None = None
         self._resume_prefix: str | None = None
+        self._needs_recap = False
+        self._recap_allow_preserved_kernel = False
+        self._kernel_interrupt_requested = False
         self._kernel_notice = ""
         self._pending_kernel_start: tuple[str, str] | None = None
         self._record_dirty_seq = 0
@@ -304,6 +308,9 @@ class ExplorationSession:
         self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
+        self._needs_recap = False
+        self._recap_allow_preserved_kernel = False
+        self._kernel_interrupt_requested = False
         self._results_since_note = 0
         self._pending_verdict = None
         self._pending_verdict_probe_id = None
@@ -381,10 +388,11 @@ class ExplorationSession:
         self.default_model = model
         self.default_effort = effort
         self.default_provider = provider
-        updates: dict[str, Any] = {"default_model": model, "default_effort": effort}
-        if provider is not None:
-            updates["default_provider"] = provider
-        self.workspace.update_config(**updates)
+        self.workspace.update_config(
+            default_model=model,
+            default_effort=effort,
+            default_provider=provider,
+        )
 
     @property
     def exploration_prompt_override(self) -> str | None:
@@ -448,6 +456,8 @@ class ExplorationSession:
         )
 
     def _steerable_prefix_count(self) -> int:
+        if self._slurm_review_probe_id is not None:
+            return 0
         base = self._baseline_selection()
         count = 0
         for item in self._pending_prompts:
@@ -458,25 +468,25 @@ class ExplorationSession:
 
     def pending_prompts_snapshot(self) -> list[dict[str, str]]:
         """Serialize pending prompts without exposing backend model overrides."""
-        if self.status == "compacting" or (
-            self._turn_selection is None
-            and self._probe_task is not None
-            and not self._probe_task.done()
+        if (
+            self.status == "compacting"
+            or self._slurm_review_probe_id is not None
+            or (
+                self._turn_selection is None
+                and self._probe_task is not None
+                and not self._probe_task.done()
+            )
         ):
-            steerable: int | None = 0
-        elif self._turn_selection is not None or self._is_busy:
-            steerable = self._steerable_prefix_count()
+            steerable = 0
         else:
-            steerable = None
+            steerable = self._steerable_prefix_count()
         return [
             {
                 "id": item.id,
                 "text": item.text,
-                "mode": (
-                    "steer"
-                    if item.mode == "steer" and (steerable is None or index < steerable)
-                    else "queue"
-                ),
+                "mode": "steer"
+                if item.mode == "steer" and index < steerable
+                else "queue",
             }
             for index, item in enumerate(self._pending_prompts)
         ]
@@ -673,7 +683,9 @@ class ExplorationSession:
         owner_provider, saved_model, saved_effort = (
             self.workspace.session_provider_and_model(records)
         )
-        changed = path != self.workspace.transcript_path
+        changed = (
+            self.workspace.session_pending or path != self.workspace.transcript_path
+        )
         previous_state = self.workspace.session_state()
         self.workspace.use_transcript(path)
         if changed or restore_kernel:
@@ -707,10 +719,14 @@ class ExplorationSession:
             self._active_provider = saved_provider
             self._sdk_session_id = sdk_id
             self._resume_prefix = None
+            self._needs_recap = False
+            self._recap_allow_preserved_kernel = False
         else:
             self._active_provider = None
             self._sdk_session_id = None
             self._resume_prefix = self.workspace.recap(records)
+            self._needs_recap = True
+            self._recap_allow_preserved_kernel = False
         self._owner_provider = resolved_owner
         self._active_model = saved_model
         self._active_raw_model = (
@@ -729,14 +745,20 @@ class ExplorationSession:
         self._bound_turn = None
         self._pending_user_logs = None
         self._restore_pending_verdict(records)
-        self.context_usage = next(
-            (
-                record["context_usage"]
-                for record in reversed(records)
-                if record.get("kind") == "meta"
-                and isinstance(record.get("context_usage"), dict)
-            ),
-            None,
+        latest_ctx_record = (
+            next(
+                (
+                    record["context_usage"]
+                    for record in reversed(records)
+                    if record.get("kind") == "meta" and "context_usage" in record
+                ),
+                None,
+            )
+            if can_restore_native
+            else None
+        )
+        self.context_usage = (
+            latest_ctx_record if isinstance(latest_ctx_record, dict) else None
         )
         self._session_initialized = False
 
@@ -780,11 +802,15 @@ class ExplorationSession:
     async def interrupt(self):
         await self.clear_pending_prompts()
         if self.kernel.busy:
+            self._kernel_interrupt_requested = True
             self.kernel.interrupt()
             await self.emit("kernel_interrupted")
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
+        task = self._current_task
+        if task and not task.done():
+            task.cancel()
             await self.emit("query_cancelled")
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
 
     def shutdown(self):
         self.kernel.shutdown()
@@ -794,7 +820,22 @@ class ExplorationSession:
         await self.emit("context_compacted", record_reloaded=record_reloaded)
 
     async def compact(self):
-        self.require_idle("compact this explorer")
+        current = asyncio.current_task()
+        if (
+            self._is_busy
+            or self.kernel.busy
+            or self._probe_operation_lock.locked()
+            or bool(self._pending_prompts)
+            or (self._probe_task is not None and not self._probe_task.done())
+            or (
+                self._current_task is not None
+                and not self._current_task.done()
+                and self._current_task is not current
+            )
+        ):
+            raise RuntimeError(
+                "Cannot compact this explorer while the agent is running a query."
+            )
         if not self._sdk_session_id or self._active_provider is None:
             raise RuntimeError("This explorer has no conversation context to compact.")
         provider = self._active_provider
@@ -828,6 +869,8 @@ class ExplorationSession:
                 self._sent_documents = {}
                 self.context_usage = None
                 self._session_initialized = False
+                self._needs_recap = True
+                self._recap_allow_preserved_kernel = True
                 self._resume_prefix = (
                     self.workspace.recap(
                         prior_records, kernel_preserved=not self._kernel_notice
@@ -835,6 +878,8 @@ class ExplorationSession:
                     if prior_records
                     else None
                 )
+                self.log_transcript("meta", context_usage=None)
+                await self.emit("context_usage_changed", context_usage=None)
                 raise RuntimeError(
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
                 ) from exc
@@ -866,9 +911,10 @@ class ExplorationSession:
                     or self.model_raw_ids.get(candidate) == self._active_model
                 ):
                     return candidate, self._active_effort
-            if (
-                not self.model_providers
-                and self.provider_for_model(self._active_model) == owner_provider
+            if not self.model_providers and (
+                self._active_provider == owner_provider
+                or self._owner_provider == owner_provider
+                or self.provider_for_model(self._active_model) == owner_provider
             ):
                 return self._active_model, self._active_effort
         if (
@@ -977,6 +1023,16 @@ class ExplorationSession:
                     else None
                 )
                 if resetting_context
+                else (
+                    self.workspace.recap(
+                        prior_records,
+                        kernel_preserved=self._recap_allow_preserved_kernel
+                        and not self._kernel_notice,
+                    )
+                    if prior_records
+                    else None
+                )
+                if self._needs_recap
                 else self._resume_prefix
             )
             base_sent_documents: Mapping[str, str] = (
@@ -1047,6 +1103,8 @@ class ExplorationSession:
                         return True
                     accepted = True
                     self._resume_prefix = None
+                    self._needs_recap = False
+                    self._recap_allow_preserved_kernel = False
                     if initialize_session:
                         self._session_initialized = True
                     if self._kernel_notice == kernel_notice:
@@ -1122,76 +1180,83 @@ class ExplorationSession:
                 try:
                     self._commit_turn_accepted = commit_progress
                     try:
-                        async for event in backend.run_turn(
-                            prompt,
-                            system_prompt=build_system_prompt(self.exploration_prompt),
-                            tools=turn_tools,
-                            workspace_path=self.workspace_path,
-                            model=turn_raw_model,
-                            effort=turn_effort,
-                            auth=turn_auth,
-                            resume_session_id=resume_id,
-                            tool_timeout_s=tool_timeout_s,
-                        ):
-                            if isinstance(event, SessionStarted):
-                                if accepted:
-                                    self._track_session_id(event.session_id, provider)
-                                else:
-                                    pending_session_id = event.session_id
-                                continue
-                            if isinstance(event, TurnStarted):
+                        async with aclosing(
+                            backend.run_turn(
+                                prompt,
+                                system_prompt=build_system_prompt(
+                                    self.exploration_prompt
+                                ),
+                                tools=turn_tools,
+                                workspace_path=self.workspace_path,
+                                model=turn_raw_model,
+                                effort=turn_effort,
+                                auth=turn_auth,
+                                resume_session_id=resume_id,
+                                tool_timeout_s=tool_timeout_s,
+                            )
+                        ) as turn_events:
+                            async for event in turn_events:
+                                if isinstance(event, SessionStarted):
+                                    if accepted:
+                                        self._track_session_id(
+                                            event.session_id, provider
+                                        )
+                                    else:
+                                        pending_session_id = event.session_id
+                                    continue
+                                if isinstance(event, TurnStarted):
+                                    commit_progress()
+                                    continue
                                 commit_progress()
-                                continue
-                            commit_progress()
-                            if isinstance(event, TextDelta):
-                                await self.emit("assistant_delta", text=event.text)
-                            elif isinstance(event, CompactionNotice):
-                                await self._record_compaction(
-                                    record_reloaded=backend.uses_compact_hook
-                                )
-                                if not backend.uses_compact_hook:
-                                    self.mark_record_dirty(reason="compaction")
-                            elif isinstance(event, MessageUsage):
-                                self.log_transcript(
-                                    "message_usage",
-                                    message_id=event.message_id,
-                                    model=event.model,
-                                    usage=event.usage,
-                                )
-                            elif isinstance(event, TextBlockDone):
-                                accumulated_text.append(event.text)
-                                self.log_transcript("agent", text=event.text)
-                                await self.emit("assistant_text", text=event.text)
-                            elif isinstance(event, TurnResult):
-                                if any(
-                                    value is not None
-                                    for value in (
-                                        event.usage,
-                                        event.model_usage,
-                                        event.total_cost_usd,
-                                        event.duration_ms,
-                                        event.duration_api_ms,
-                                        event.num_turns,
+                                if isinstance(event, TextDelta):
+                                    await self.emit("assistant_delta", text=event.text)
+                                elif isinstance(event, CompactionNotice):
+                                    await self._record_compaction(
+                                        record_reloaded=backend.uses_compact_hook
                                     )
-                                ):
+                                    if not backend.uses_compact_hook:
+                                        self.mark_record_dirty(reason="compaction")
+                                elif isinstance(event, MessageUsage):
                                     self.log_transcript(
-                                        "usage",
+                                        "message_usage",
+                                        message_id=event.message_id,
+                                        model=event.model,
                                         usage=event.usage,
-                                        model_usage=event.model_usage,
-                                        total_cost_usd=event.total_cost_usd,
-                                        duration_ms=event.duration_ms,
-                                        duration_api_ms=event.duration_api_ms,
-                                        num_turns=event.num_turns,
                                     )
-                                if event.context_usage is not None:
-                                    self.context_usage = event.context_usage
-                                    self.log_transcript(
-                                        "meta", context_usage=self.context_usage
-                                    )
-                                    await self.emit(
-                                        "context_usage_changed",
-                                        context_usage=self.context_usage,
-                                    )
+                                elif isinstance(event, TextBlockDone):
+                                    accumulated_text.append(event.text)
+                                    self.log_transcript("agent", text=event.text)
+                                    await self.emit("assistant_text", text=event.text)
+                                elif isinstance(event, TurnResult):
+                                    if any(
+                                        value is not None
+                                        for value in (
+                                            event.usage,
+                                            event.model_usage,
+                                            event.total_cost_usd,
+                                            event.duration_ms,
+                                            event.duration_api_ms,
+                                            event.num_turns,
+                                        )
+                                    ):
+                                        self.log_transcript(
+                                            "usage",
+                                            usage=event.usage,
+                                            model_usage=event.model_usage,
+                                            total_cost_usd=event.total_cost_usd,
+                                            duration_ms=event.duration_ms,
+                                            duration_api_ms=event.duration_api_ms,
+                                            num_turns=event.num_turns,
+                                        )
+                                    if event.context_usage is not None:
+                                        self.context_usage = event.context_usage
+                                        self.log_transcript(
+                                            "meta", context_usage=self.context_usage
+                                        )
+                                        await self.emit(
+                                            "context_usage_changed",
+                                            context_usage=self.context_usage,
+                                        )
                         commit_progress()
                         break
                     finally:
@@ -1220,6 +1285,8 @@ class ExplorationSession:
                             "system_message",
                             text="Original provider session was unavailable; rebuilt context from the saved transcript.",
                         )
+                        self._needs_recap = True
+                        self._recap_allow_preserved_kernel = True
                         self._resume_prefix = (
                             self.workspace.recap(
                                 prior_records, kernel_preserved=not self._kernel_notice
@@ -1236,7 +1303,6 @@ class ExplorationSession:
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
-            await self.clear_pending_prompts()
             await self.emit("status_change", status="cancelled")
             raise
         except Exception as exc:
@@ -1276,20 +1342,36 @@ class ExplorationSession:
             "provider": resolved_provider,
             "sdk_session_id": session_id,
         }
-        active_model = self._turn_model or self._active_model or self.model
-        if active_model and self.provider_for_model(active_model) == resolved_provider:
-            meta_fields["model"] = active_model
-            meta_fields["raw_model"] = self.raw_model_id(active_model)
-            if (
-                self._turn_selection is not None
-                and self._turn_selection[0] == resolved_provider
+        if (
+            self._turn_selection is not None
+            and self._turn_selection[0] == resolved_provider
+        ):
+            meta_fields["model"] = self._turn_model or self._turn_selection[1]
+            meta_fields["raw_model"] = self._turn_selection[1]
+            if self._turn_selection[2] is not None:
+                meta_fields["effort"] = self._turn_selection[2]
+        else:
+            active_model = self._active_model or self.model
+            if active_model and (
+                (
+                    active_model == self._active_model
+                    and self._owner_provider == resolved_provider
+                )
+                or self.provider_for_model(active_model) == resolved_provider
             ):
-                if self._turn_selection[2] is not None:
-                    meta_fields["effort"] = self._turn_selection[2]
-            elif self._active_effort is not None and active_model == self._active_model:
-                meta_fields["effort"] = self._active_effort
-            elif active_model == self.model and self.effort is not None:
-                meta_fields["effort"] = self.effort
+                meta_fields["model"] = active_model
+                meta_fields["raw_model"] = (
+                    self._active_raw_model
+                    if active_model == self._active_model and self._active_raw_model
+                    else self.raw_model_id(active_model)
+                )
+                if (
+                    self._active_effort is not None
+                    and active_model == self._active_model
+                ):
+                    meta_fields["effort"] = self._active_effort
+                elif active_model == self.model and self.effort is not None:
+                    meta_fields["effort"] = self.effort
         self.log_transcript("meta", **meta_fields)
 
     def reset_client_session(self):
@@ -1309,6 +1391,9 @@ class ExplorationSession:
         self._active_effort = None
         self._sdk_session_id = None
         self._resume_prefix = None
+        self._needs_recap = False
+        self._recap_allow_preserved_kernel = False
+        self._kernel_interrupt_requested = False
         self._sent_documents = {}
         self._results_since_note = 0
         self._pending_verdict = None
@@ -1356,7 +1441,14 @@ class ExplorationSession:
 
     def install_packages(self, packages):
         self.activate_session()
-        if not packages or any(not p or p.startswith("-") for p in packages):
+        if (
+            isinstance(packages, (str, bytes))
+            or not isinstance(packages, Sequence)
+            or not packages
+            or any(
+                not isinstance(p, str) or not p or p.startswith("-") for p in packages
+            )
+        ):
             raise ValueError("Provide package requirements, not installer options.")
         directory = (
             self.transcript_path.parent / "environment_changes" / uuid.uuid4().hex

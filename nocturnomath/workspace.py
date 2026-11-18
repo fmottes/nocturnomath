@@ -865,11 +865,32 @@ class Workspace:
             elif kind == "agent":
                 lines.append("You: " + _clip(record.get("text", ""), 800))
             elif kind == "run":
+                probe_id = record.get("probe_id")
+                status = record.get("status", "completed")
+                header = (
+                    f"You ran probe {probe_id} ({status}), expecting: "
+                    if probe_id
+                    else "You ran a probe expecting: "
+                ) + record.get("expected", "")
+                if probe_id:
+                    sources = [f"{probe_id}/output.txt"] + [
+                        f"{probe_id}/plot-{i}.png"
+                        for i in range(1, len(record.get("images") or []) + 1)
+                    ]
+                    header += "\nSources: " + ", ".join(sources)
                 lines.append(
-                    "You ran a probe expecting: "
+                    header + "\nIt printed: " + _clip(record.get("output", ""), 400)
+                )
+            elif kind == "probe_failed":
+                lines.append(
+                    f"Probe {record.get('probe_id', '')} failed: "
+                    + _clip(record.get("text", ""), 300)
+                )
+            elif kind == "slurm_submitted":
+                lines.append(
+                    f"Submitted Slurm probe {record.get('probe_id', '')} "
+                    f"(job {record.get('job_id', '')}), expecting: "
                     + record.get("expected", "")
-                    + "\nIt printed: "
-                    + _clip(record.get("output", ""), 400)
                 )
             elif kind in ("evidence", "thought", "evidence_struck", "verdict"):
                 lines.append(

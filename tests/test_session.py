@@ -1145,3 +1145,117 @@ async def test_failed_cross_provider_switch_preserves_thread_and_threadless_turn
     assert "# Evidence" in rebuilt_prompt
     assert "Me: first" in rebuilt_prompt
     assert "### inputs.md" in rebuilt_prompt
+
+
+@pytest.mark.asyncio
+async def test_mid_emit_cancellation_closes_backend_turn_generator(session):
+    closed = False
+    inside_emit = asyncio.Event()
+
+    class GeneratorBackend(FakeBackend):
+        async def run_turn(self, prompt, **kwargs):
+            nonlocal closed
+            try:
+                yield SessionStarted("ant-gen")
+                yield TextDelta("streaming")
+                await asyncio.Event().wait()
+            finally:
+                closed = True
+
+    attach_backend(session, GeneratorBackend(provider="anthropic"), "anthropic")
+
+    async def block_on_delta(event_type, _payload):
+        if event_type == "assistant_delta":
+            inside_emit.set()
+            await asyncio.Event().wait()
+
+    session.subscribe(block_on_delta)
+    task = asyncio.create_task(session.query("cancel inside emit"))
+    session._current_task = task
+    await asyncio.wait_for(inside_emit.wait(), timeout=2)
+    await session.interrupt()
+    assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_resume_session_onto_pending_explorer_initializes_environment_record(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from conftest import FakeEnvironment, FakeKernel
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        first = ExplorationSession(tmp_path, model="claude-sonnet-5")
+        second = ExplorationSession(tmp_path, model="claude-sonnet-5")
+        try:
+            attach_backend(
+                first, FakeBackend(provider="anthropic", session_id="s1"), "anthropic"
+            )
+            assert await first.query("create S001") is True
+            assert first.workspace.session_id == "S001"
+
+            # `second` still has tentative S001 (`session_pending=True`) and no environment_record.
+            assert second.workspace.session_pending is True
+            second.resume_session("S001", restore_kernel=False)
+            assert hasattr(second, "environment_record")
+            by_name = {spec.name: spec for spec in second.tools}
+            res = await by_name["run"].handler(
+                {"code": "print(1 + 1)", "expected": "prints 2"}
+            )
+            assert not res.get("is_error")
+        finally:
+            first.shutdown()
+            second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_user_interrupt_during_kernel_probe_records_interrupted_status(session):
+    import threading
+
+    entered = threading.Event()
+    interrupted = threading.Event()
+
+    def slow_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        interrupted.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = True
+        return "KeyboardInterrupt", [], None
+
+    def mark_interrupt():
+        interrupted.set()
+
+    session.kernel.execute = slow_execute
+    session.kernel.interrupt = mark_interrupt
+
+    class SlowRunBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-int")
+            by_name = {spec.name: spec for spec in tools}
+            # Simulate a backend subprocess whose MCP call completes on kernel SIGINT
+            # slightly before task cancellation reaches the tool handler.
+            await by_name["run"].handler(
+                {"code": "import time; time.sleep(10)", "expected": "finishes"}
+            )
+            await asyncio.Event().wait()
+
+    attach_backend(session, SlowRunBackend(provider="anthropic"), "anthropic")
+    task = asyncio.create_task(session.query("run slow probe"))
+    session._current_task = task
+    await asyncio.to_thread(entered.wait, 5)
+    await session.interrupt()
+
+    probe_meta = (
+        session.workspace.sessions_path / "S001" / "probes" / "P001" / "probe.json"
+    )
+    assert '"status": "interrupted"' in probe_meta.read_text()
+
+
+def test_install_packages_rejects_bare_string_argument(session):
+    with pytest.raises(ValueError, match="package requirements"):
+        session.install_packages("scipy")

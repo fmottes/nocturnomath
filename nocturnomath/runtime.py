@@ -77,6 +77,8 @@ class Runtime:
         self._started = False
         self.changing = False
         self._changing_agents: set[str] = set()
+        self._creating_agents = 0
+        self._discovering_models = 0
         self._agent_subscribers: dict[str, Callable[[str, dict[str, Any]], Any]] = {}
         self._workspace_defaults_pending = session is not None
         self._slurm_task: asyncio.Task | None = None
@@ -329,6 +331,7 @@ class Runtime:
             agent_id = self.find_agent_for_session(session_id)
             if (
                 terminal
+                and self._discovering_models == 0
                 and agent_id is None
                 and key not in self._slurm_review_attempts
                 and not self._changing_agents
@@ -396,6 +399,7 @@ class Runtime:
                 self._slurm_seen[key] = state
             if (
                 terminal
+                and self._discovering_models == 0
                 and key not in self._slurm_review_attempts
                 and not session.has_active_query()
                 and agent_id not in self._changing_agents
@@ -499,142 +503,159 @@ class Runtime:
 
     async def discover_models(self):
         """Read model catalogues concurrently across all available provider CLIs."""
+        self._discovering_models += 1
         self._discovery_seq += 1
         run_seq = self._discovery_seq
         auth_rev = self._auth_revision
         auth_snapshot = {provider: self.auth.get(provider) for provider in PROVIDERS}
-        results = await asyncio.gather(
-            *(
-                self.backends[provider].discover_models_staged(auth_snapshot[provider])
-                for provider in PROVIDERS
-            ),
-            return_exceptions=True,
-        )
-        if auth_rev != self._auth_revision or run_seq < self._published_discovery_seq:
-            return
-        self._published_discovery_seq = run_seq
-
-        models: list[str] = []
-        model_labels: dict[str, str] = {}
-        model_providers: dict[str, ProviderId] = {}
-        model_raw_ids: dict[str, str] = {}
-        model_efforts: dict[str, list[str]] = {}
-        provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
-        provider_default_models: dict[ProviderId, str] = {}
-        provider_defaults: list[str] = []
-        seen: set[str] = set()
-
-        for provider, result in zip(PROVIDERS, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning("Could not discover %s models: %s", provider, result)
-                continue
-            specs, commit = result
-            try:
-                commit()
-            except Exception as exc:
-                logger.warning("Could not discover %s models: %s", provider, exc)
-                continue
-            for spec in specs:
-                spec_id = spec.id
-                if spec_id in seen:
-                    spec_id = f"{spec.provider}/{spec.raw_id}"
-                if spec_id in seen:
-                    continue
-                seen.add(spec_id)
-                models.append(spec_id)
-                model_labels[spec_id] = spec.label
-                model_providers[spec_id] = spec.provider
-                model_raw_ids[spec_id] = spec.raw_id
-                model_efforts[spec_id] = list(spec.efforts)
-                provider_models[spec.provider].append(spec_id)
-                if spec.is_default:
-                    provider_defaults.append(spec_id)
-                    provider_default_models.setdefault(spec.provider, spec_id)
-
-        previous_providers = dict(self.model_providers)
-        previous_raw_ids = dict(self.model_raw_ids)
-
-        def previous_selection(
-            model_id: str | None, fallback_provider: ProviderId | None = None
-        ) -> tuple[str | None, ProviderId | None]:
-            if model_id and model_id in previous_providers:
-                return previous_raw_ids.get(model_id, model_id), previous_providers[
-                    model_id
-                ]
-            return model_id, fallback_provider
-
-        self.models = models
-        self.model_labels = model_labels
-        self.model_providers = model_providers
-        self.model_raw_ids = model_raw_ids
-        self.model_efforts = model_efforts
-        self._provider_models = provider_models
-        self._provider_default_models = provider_default_models
-        self._models_discovered = True
-        self.sdk_default_model = (
-            provider_defaults[0] if provider_defaults else models[0] if models else None
-        )
-        if self.model is not None:
-            model_pref, model_prov = previous_selection(self.model)
-            self.model = self._select_model(model_pref, model_prov)
-        else:
-            self.model = self._select_model(self.startup_default_model)
-        self.effort = self._select_effort(self.model, self.effort)
-        if self.agents:
-            for session in self.agents.values():
-                session.model_providers = dict(self.model_providers)
-                session.model_raw_ids = dict(self.model_raw_ids)
-            if self._workspace_defaults_pending:
-                self._apply_workspace_defaults()
-            else:
-                for session in self.agents.values():
-                    default_model, default_effort, default_provider = (
-                        self._workspace_defaults(session)
+        try:
+            results = await asyncio.gather(
+                *(
+                    self.backends[provider].discover_models_staged(
+                        auth_snapshot[provider]
                     )
-                    session.default_model = default_model
-                    session.default_provider = default_provider
-                    session.default_effort = default_effort
-                    resolved_current: str | None = None
-                    if session.model is not None:
-                        sess_pref, sess_prov = previous_selection(session.model)
-                        if sess_prov is not None:
-                            resolved_current = self.resolve_model(sess_pref, sess_prov)
-                            if resolved_current is None:
-                                prov_models = self._provider_models.get(sess_prov, [])
-                                if prov_models:
-                                    resolved_current = (
-                                        self._provider_default_models.get(sess_prov)
-                                        or prov_models[0]
+                    for provider in PROVIDERS
+                ),
+                return_exceptions=True,
+            )
+            if (
+                auth_rev != self._auth_revision
+                or run_seq < self._published_discovery_seq
+            ):
+                return
+            self._published_discovery_seq = run_seq
+
+            models: list[str] = []
+            model_labels: dict[str, str] = {}
+            model_providers: dict[str, ProviderId] = {}
+            model_raw_ids: dict[str, str] = {}
+            model_efforts: dict[str, list[str]] = {}
+            provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+            provider_default_models: dict[ProviderId, str] = {}
+            provider_defaults: list[str] = []
+            seen: set[str] = set()
+
+            for provider, result in zip(PROVIDERS, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.warning("Could not discover %s models: %s", provider, result)
+                    continue
+                specs, commit = result
+                try:
+                    commit()
+                except Exception as exc:
+                    logger.warning("Could not discover %s models: %s", provider, exc)
+                    continue
+                for spec in specs:
+                    spec_id = spec.id
+                    if spec_id in seen:
+                        spec_id = f"{spec.provider}/{spec.raw_id}"
+                    if spec_id in seen:
+                        continue
+                    seen.add(spec_id)
+                    models.append(spec_id)
+                    model_labels[spec_id] = spec.label
+                    model_providers[spec_id] = spec.provider
+                    model_raw_ids[spec_id] = spec.raw_id
+                    model_efforts[spec_id] = list(spec.efforts)
+                    provider_models[spec.provider].append(spec_id)
+                    if spec.is_default:
+                        provider_defaults.append(spec_id)
+                        provider_default_models.setdefault(spec.provider, spec_id)
+
+            previous_providers = dict(self.model_providers)
+            previous_raw_ids = dict(self.model_raw_ids)
+
+            def previous_selection(
+                model_id: str | None, fallback_provider: ProviderId | None = None
+            ) -> tuple[str | None, ProviderId | None]:
+                if model_id and model_id in previous_providers:
+                    return previous_raw_ids.get(model_id, model_id), previous_providers[
+                        model_id
+                    ]
+                return model_id, fallback_provider
+
+            self.models = models
+            self.model_labels = model_labels
+            self.model_providers = model_providers
+            self.model_raw_ids = model_raw_ids
+            self.model_efforts = model_efforts
+            self._provider_models = provider_models
+            self._provider_default_models = provider_default_models
+            self._models_discovered = True
+            self.sdk_default_model = (
+                provider_defaults[0]
+                if provider_defaults
+                else models[0]
+                if models
+                else None
+            )
+            if self.model is not None:
+                model_pref, model_prov = previous_selection(self.model)
+                self.model = self._select_model(model_pref, model_prov)
+            else:
+                self.model = self._select_model(self.startup_default_model)
+            self.effort = self._select_effort(self.model, self.effort)
+            if self.agents:
+                for session in self.agents.values():
+                    session.model_providers = dict(self.model_providers)
+                    session.model_raw_ids = dict(self.model_raw_ids)
+                if self._workspace_defaults_pending:
+                    self._apply_workspace_defaults()
+                else:
+                    for session in self.agents.values():
+                        default_model, default_effort, default_provider = (
+                            self._workspace_defaults(session)
+                        )
+                        session.default_model = default_model
+                        session.default_provider = default_provider
+                        session.default_effort = default_effort
+                        resolved_current: str | None = None
+                        if session.model is not None:
+                            sess_pref, sess_prov = previous_selection(session.model)
+                            if sess_prov is not None:
+                                resolved_current = self.resolve_model(
+                                    sess_pref, sess_prov
+                                )
+                                if resolved_current is None:
+                                    prov_models = self._provider_models.get(
+                                        sess_prov, []
                                     )
-                        else:
-                            resolved_current = self.resolve_model(sess_pref, None)
-                    if resolved_current is not None:
-                        session.model = resolved_current
-                        session.effort = self._select_effort(
-                            session.model, session.effort
-                        )
-                    else:
-                        owner_provider = (
-                            session._active_provider or session._owner_provider
-                        )
-                        owner_model, owner_effort = (
-                            self._select_provider_model(
-                                owner_provider,
-                                session._active_model,
-                                session._active_effort,
+                                    if prov_models:
+                                        resolved_current = (
+                                            self._provider_default_models.get(sess_prov)
+                                            or prov_models[0]
+                                        )
+                            else:
+                                resolved_current = self.resolve_model(sess_pref, None)
+                        if resolved_current is not None:
+                            session.model = resolved_current
+                            session.effort = self._select_effort(
+                                session.model, session.effort
                             )
-                            if owner_provider is not None
-                            else (None, None)
-                        )
-                        if owner_model is not None:
-                            session.model = owner_model
-                            session.effort = owner_effort
                         else:
-                            session.model = default_model
-                            session.effort = default_effort
-                if self.session is not None:
-                    self.model = self.session.model
-                    self.effort = self.session.effort
+                            owner_provider = (
+                                session._active_provider or session._owner_provider
+                            )
+                            owner_model, owner_effort = (
+                                self._select_provider_model(
+                                    owner_provider,
+                                    session._active_model,
+                                    session._active_effort,
+                                )
+                                if owner_provider is not None
+                                else (None, None)
+                            )
+                            if owner_model is not None:
+                                session.model = owner_model
+                                session.effort = owner_effort
+                            else:
+                                session.model = default_model
+                                session.effort = default_effort
+                    if self.session is not None:
+                        self.model = self.session.model
+                        self.effort = self.session.effort
+        finally:
+            self._discovering_models = max(0, self._discovering_models - 1)
         self._wake_slurm_monitor()
 
     def resolve_model(
@@ -822,6 +843,11 @@ class Runtime:
     ) -> dict[str, Any]:
         """Resume a recorded chat onto the active explorer and restore its owner model."""
         session = self.require_session()
+        existing = self.find_agent_for_session(session_id)
+        if existing is not None and self.agents.get(existing) is not session:
+            raise RuntimeError(
+                f"Session {session_id} is already open in another explorer."
+            )
         data = session.resume_session(session_id, restore_kernel)
         if self.models or self._models_discovered:
             default_model, default_effort, default_provider = self._workspace_defaults(
@@ -833,7 +859,13 @@ class Runtime:
         self._apply_resumed_owner_model(session)
         self.model = session.model
         self.effort = session.effort
-        return {**data, "model": session.model, "effort": session.effort}
+        return {
+            **data,
+            "session_id": session.workspace.session_id,
+            "can_compact": session.can_compact,
+            "model": session.model,
+            "effort": session.effort,
+        }
 
     async def authenticate(
         self, provider: ProviderId, method: str, credential: str | None = None
@@ -986,6 +1018,8 @@ class Runtime:
             except Exception:
                 session.shutdown()
                 raise
+        session.model_providers = dict(self.model_providers)
+        session.model_raw_ids = dict(self.model_raw_ids)
         agent_id = self._new_agent_id()
         self.agents[agent_id] = session
         if self.primary_agent_id is None:
@@ -1008,6 +1042,41 @@ class Runtime:
             ):
                 self._apply_resumed_owner_model(session)
         self._subscribe_to_agent(agent_id, session)
+        return agent_id
+
+    async def create_agent_async(self) -> str:
+        """Create a new explorer asynchronously while guarding concurrent transitions."""
+        if self.changing:
+            raise RuntimeError(
+                "The research environment is being prepared. Please wait."
+            )
+        target_workspace = self.require_session().workspace_path
+        self._creating_agents += 1
+        task = asyncio.create_task(
+            asyncio.to_thread(self.create_agent, target_workspace)
+        )
+        try:
+            agent_id = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            agent_id = await task
+            if not self._started:
+                self._unsubscribe_agent(agent_id)
+                created = self.agents.pop(agent_id, None)
+                if created is not None:
+                    created.shutdown()
+            raise
+        finally:
+            self._creating_agents = max(0, self._creating_agents - 1)
+        if not self._started and self.agents.get(agent_id) is not None:
+            self._unsubscribe_agent(agent_id)
+            created = self.agents.pop(agent_id, None)
+            if created is not None:
+                created.shutdown()
+            raise RuntimeError("Runtime has stopped.")
+        created_session = self.agents.get(agent_id)
+        if created_session is not None:
+            created_session.model_providers = dict(self.model_providers)
+            created_session.model_raw_ids = dict(self.model_raw_ids)
         return agent_id
 
     def get_agent(self, agent_id: str | None = None) -> ExplorationSession:
@@ -1051,6 +1120,8 @@ class Runtime:
         if self.primary_agent_id == agent_id:
             self.primary_agent_id = next(iter(self.agents))
             self.session = self.agents[self.primary_agent_id]
+            self.model = self.session.model
+            self.effort = self.session.effort
 
     def find_agent_for_session(self, session_id: str) -> str | None:
         for agent_id, session in self.agents.items():
@@ -1089,6 +1160,8 @@ class Runtime:
         except Exception:
             replacement.shutdown()
             raise
+        replacement.model_providers = dict(self.model_providers)
+        replacement.model_raw_ids = dict(self.model_raw_ids)
         if self.models or self._models_discovered:
             default_model, default_effort, default_provider = self._workspace_defaults(
                 replacement
@@ -1120,6 +1193,7 @@ class Runtime:
                 "models": self.models,
                 "model_labels": self.model_labels,
                 "model_providers": self.model_providers,
+                "model_raw_ids": self.model_raw_ids,
                 "model_efforts": self.model_efforts,
                 "session_defaults": None,
                 "prompt_mode": DEFAULT_PROMPT_MODE,
@@ -1135,7 +1209,9 @@ class Runtime:
             "path": str(session.workspace_path),
             # Legacy single-explorer fields keep the terminal-adjacent HTTP
             # surface useful while web clients consume ``agents`` below.
-            "session_id": session.workspace.session_id,
+            "session_id": None
+            if session.workspace.session_pending
+            else session.workspace.session_id,
             "records": session.workspace.current_records(),
             "environment": {
                 "python": str(session.environment.python),
@@ -1146,6 +1222,7 @@ class Runtime:
             "models": self.models,
             "model_labels": self.model_labels,
             "model_providers": self.model_providers,
+            "model_raw_ids": self.model_raw_ids,
             "model_efforts": self.model_efforts,
             "session_defaults": {
                 "model": session.default_model,
@@ -1191,7 +1268,7 @@ class Runtime:
         return self.session
 
     def require_all_idle(self, action: str):
-        if self._changing_agents:
+        if self._changing_agents or self._creating_agents:
             raise RuntimeError(f"Cannot {action} while an explorer is changing.")
         for session in self.agents.values():
             session.require_idle(action)
@@ -1241,17 +1318,34 @@ class Runtime:
             raise RuntimeError("This explorer is already changing. Please wait.")
         session = self.get_agent(agent_id)
         session.require_idle("compact this explorer")
-        self._changing_agents.add(agent_id)
+        session.status = "compacting"
         task = asyncio.create_task(session.compact())
+        session._current_task = task
+        succeeded = False
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
+            succeeded = True
+            return result
         except asyncio.CancelledError:
-            await task
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            await session.clear_pending_prompts()
+            raise
+        except Exception:
+            await session.clear_pending_prompts()
             raise
         finally:
-            self._changing_agents.discard(agent_id)
+            if session._current_task is task:
+                session._current_task = None
             if (
-                self._started
+                not succeeded
+                and not session._is_busy
+                and session.status == "compacting"
+            ):
+                session.status = "idle"
+            if (
+                succeeded
+                and self._started
                 and not self.changing
                 and session._pending_prompts
                 and session._current_task is None
@@ -1410,12 +1504,19 @@ class Runtime:
             batch_raw_model: str | None = None
             for item in batch:
                 if item.model is not None:
-                    batch_model = item.model
-                    batch_provider = item.provider or session.provider_for_model(
+                    item_provider = item.provider or session.provider_for_model(
                         item.model
                     )
-                    batch_raw_model = item.raw_model or session.raw_model_id(item.model)
-                    batch_effort = item.effort
+                    item_raw_model = item.raw_model or session.raw_model_id(item.model)
+                    same_target = batch_model is not None and (
+                        item_provider,
+                        item_raw_model,
+                    ) == (batch_provider, batch_raw_model)
+                    batch_model = item.model
+                    batch_provider = item_provider
+                    batch_raw_model = item_raw_model
+                    if item.effort is not None or not same_target:
+                        batch_effort = item.effort
                 elif item.effort is not None:
                     batch_effort = item.effort
             if (
@@ -1529,8 +1630,9 @@ class Runtime:
                     ):
                         await session.emit("status_change", status="idle")
         except asyncio.CancelledError:
-            failed = True
-            await session.clear_pending_prompts()
+            if not self._started:
+                failed = True
+                await session.clear_pending_prompts()
         except Exception as exc:
             failed = True
             await session.clear_pending_prompts()
