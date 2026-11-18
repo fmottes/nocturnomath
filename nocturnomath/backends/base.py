@@ -18,6 +18,7 @@ from ..auth import ProviderAuth, ProviderId
 from ..tools import ToolSpec
 
 DEFAULT_EFFORT = "high"
+DEFAULT_TOOL_TIMEOUT_S = 660
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 
@@ -50,6 +51,11 @@ class SessionStarted:
     """Native provider conversation/thread identifier emitted during a turn."""
 
     session_id: str
+
+
+@dataclass(frozen=True)
+class TurnStarted:
+    """Signal that the provider accepted the turn and model execution has begun."""
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,7 @@ class TurnResult:
 
 TurnEvent = (
     SessionStarted
+    | TurnStarted
     | TextDelta
     | TextBlockDone
     | CompactionNotice
@@ -130,6 +137,7 @@ class AgentBackend(Protocol):
         effort: str | None,
         auth: ProviderAuth,
         resume_session_id: str | None = None,
+        tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]: ...
 
     async def compact(

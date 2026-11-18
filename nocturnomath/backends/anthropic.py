@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ from ..auth import ProviderAuth, ProviderId
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
+    DEFAULT_TOOL_TIMEOUT_S,
     EFFORT_LEVELS,
     CompactionNotice,
     CompactResult,
@@ -40,8 +41,33 @@ logger = logging.getLogger("nocturnomath.backends.anthropic")
 
 CLAUDE_CLI_NAME = "claude.exe" if sys.platform == "win32" else "claude"
 DISCOVERY_TIMEOUT_S = 15.0
-COMPACT_TIMEOUT_S = 120.0
+COMPACT_TIMEOUT_S = 600.0
 CONTEXT_USAGE_TIMEOUT_S = 10.0
+
+_CLAUDE_CREDENTIAL_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _has_claude_credentials(
+    resp: dict[str, Any], auth: ProviderAuth, env: Mapping[str, str]
+) -> bool:
+    if auth.method != "cli":
+        return True
+    if any(env.get(name) for name in _CLAUDE_CREDENTIAL_VARS):
+        return True
+    account = resp.get("account")
+    return not (
+        isinstance(account, dict)
+        and account.get("tokenSource") == "none"
+        and account.get("apiProvider") in (None, "firstParty")
+    )
 
 
 def _is_missing_session_error(text: str) -> bool:
@@ -259,6 +285,9 @@ class AnthropicBackend:
                     resp = await self._await_initialize(
                         proc, read_jsonl(proc.stdout), req_id, stderr
                     )
+                    if not _has_claude_credentials(resp, auth, env):
+                        self.cli_path = candidate
+                        return []
                     raw_models = resp.get("models")
                     entries = raw_models if isinstance(raw_models, list) else []
                     models = _parse_models(entries)
@@ -396,6 +425,7 @@ class AnthropicBackend:
         effort: str | None,
         auth: ProviderAuth,
         resume_session_id: str | None = None,
+        tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]:
         cli_path = self._resolve_cli()
         env = {
@@ -403,6 +433,8 @@ class AnthropicBackend:
             **auth.sdk_env(),
             "NOCTURNOMATH_WORKSPACE_PATH": str(workspace_path),
         }
+        if not env.get("MCP_TOOL_TIMEOUT"):
+            env["MCP_TOOL_TIMEOUT"] = str(max(1, int(tool_timeout_s)) * 1000)
         async with McpToolBridge(tools) as bridge:
             cmd = self._build_turn_cmd(
                 cli_path,
@@ -607,54 +639,61 @@ class AnthropicBackend:
                 messages = read_jsonl(proc.stdout)
                 compacted = False
                 latest_session_id: str | None = resume_session_id
-                async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                    try:
-                        init_id = await self._send_control(
-                            proc, "initialize", {"skills": []}
+                try:
+                    async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                        try:
+                            init_id = await self._send_control(
+                                proc, "initialize", {"skills": []}
+                            )
+                        except (BrokenPipeError, ConnectionResetError) as exc:
+                            detail = await stderr.text()
+                            if _is_missing_session_error(detail):
+                                raise SessionResumeError(detail) from exc
+                            raise RuntimeError(detail or str(exc)) from exc
+                        await self._await_initialize(
+                            proc,
+                            messages,
+                            init_id,
+                            stderr,
+                            resume_session_id=resume_session_id,
                         )
-                    except (BrokenPipeError, ConnectionResetError) as exc:
-                        detail = await stderr.text()
-                        if _is_missing_session_error(detail):
-                            raise SessionResumeError(detail) from exc
-                        raise RuntimeError(detail or str(exc)) from exc
-                    await self._await_initialize(
-                        proc,
-                        messages,
-                        init_id,
-                        stderr,
-                        resume_session_id=resume_session_id,
-                    )
 
-                    await self._write_json(
-                        proc,
-                        {
-                            "type": "user",
-                            "message": {"role": "user", "content": "/compact"},
-                            "parent_tool_use_id": None,
-                            "session_id": resume_session_id,
-                        },
-                    )
+                        await self._write_json(
+                            proc,
+                            {
+                                "type": "user",
+                                "message": {"role": "user", "content": "/compact"},
+                                "parent_tool_use_id": None,
+                                "session_id": resume_session_id,
+                            },
+                        )
 
-                    async for msg in messages:
-                        sid = msg.get("session_id")
-                        if isinstance(sid, str) and sid:
-                            latest_session_id = sid
-                        msg_type = msg.get("type")
-                        if msg_type == "control_request":
-                            await self._handle_control_request(proc, msg)
-                            continue
-                        if (
-                            msg_type == "system"
-                            and msg.get("subtype") == "compact_boundary"
-                        ):
-                            compacted = True
-                        elif msg_type == "result":
-                            if msg.get("is_error"):
-                                detail = _error_result_text(msg)
-                                if not compacted and _is_missing_session_error(detail):
-                                    raise SessionResumeError(detail)
-                                raise RuntimeError(detail)
-                            break
+                        async for msg in messages:
+                            sid = msg.get("session_id")
+                            if isinstance(sid, str) and sid:
+                                latest_session_id = sid
+                            msg_type = msg.get("type")
+                            if msg_type == "control_request":
+                                await self._handle_control_request(proc, msg)
+                                continue
+                            if (
+                                msg_type == "system"
+                                and msg.get("subtype") == "compact_boundary"
+                            ):
+                                compacted = True
+                            elif msg_type == "result":
+                                if msg.get("is_error"):
+                                    detail = _error_result_text(msg)
+                                    if not compacted and _is_missing_session_error(
+                                        detail
+                                    ):
+                                        raise SessionResumeError(detail)
+                                    raise RuntimeError(detail)
+                                break
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        f"Claude compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
+                    ) from exc
 
                 if not compacted:
                     detail = await stderr.text()

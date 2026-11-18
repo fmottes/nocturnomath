@@ -12,7 +12,7 @@ import socket
 import sys
 import tempfile
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -24,6 +24,7 @@ logger = logging.getLogger("nocturnomath.mcp_bridge")
 
 _PROTOCOL_VERSION_RE = re.compile(r"^20\d\d-\d\d-\d\d$")
 _DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+MCP_PROGRESS_INTERVAL_S = 15.0
 
 
 def _package_version() -> str:
@@ -130,17 +131,20 @@ class McpToolBridge:
             write_lock = asyncio.Lock()
             in_flight: set[asyncio.Task[None]] = set()
 
+            async def send_json(payload: dict[str, Any]) -> None:
+                async with write_lock:
+                    writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+                    await writer.drain()
+
             async def handle_line(raw: str) -> None:
                 try:
                     request = json.loads(raw)
                 except json.JSONDecodeError:
                     response = _jsonrpc_error(None, -32700, "Parse error")
                 else:
-                    response = await self._dispatch(request)
+                    response = await self._dispatch(request, notify=send_json)
                 if response is not None:
-                    async with write_lock:
-                        writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                        await writer.drain()
+                    await send_json(response)
 
             try:
                 async for line in lines:
@@ -186,7 +190,12 @@ class McpToolBridge:
                 del buffer[: newline + 1]
                 yield line.decode("utf-8", errors="replace").strip()
 
-    async def _dispatch(self, request: Any) -> dict[str, Any] | None:
+    async def _dispatch(
+        self,
+        request: Any,
+        *,
+        notify: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any] | None:
         if not isinstance(request, dict):
             return _jsonrpc_error(None, -32600, "Invalid Request")
         msg_id = request.get("id")
@@ -249,6 +258,33 @@ class McpToolBridge:
                 return _jsonrpc_error(
                     msg_id, -32602, "Tool arguments must be an object"
                 )
+            meta = params.get("_meta")
+            progress_token = (
+                meta.get("progressToken") if isinstance(meta, dict) else None
+            )
+
+            async def send_progress() -> None:
+                step = 0
+                while True:
+                    await asyncio.sleep(MCP_PROGRESS_INTERVAL_S)
+                    step += 1
+                    with suppress(Exception):
+                        await notify(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {
+                                    "progressToken": progress_token,
+                                    "progress": step,
+                                },
+                            }
+                        )
+
+            progress_task = (
+                asyncio.create_task(send_progress())
+                if progress_token is not None and notify is not None
+                else None
+            )
             try:
                 result = await spec.handler(arguments)
             except asyncio.CancelledError:
@@ -261,6 +297,11 @@ class McpToolBridge:
                         "isError": True,
                     },
                 )
+            finally:
+                if progress_task is not None:
+                    progress_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await progress_task
             return _jsonrpc_result(
                 msg_id,
                 {

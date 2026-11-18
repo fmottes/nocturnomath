@@ -188,3 +188,64 @@ async def test_mcp_bridge_serves_stdio_subprocess_roundtrip():
             proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5)
     assert not auth_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_emits_progress_notifications(monkeypatch):
+    from nocturnomath import mcp_bridge
+
+    monkeypatch.setattr(mcp_bridge, "MCP_PROGRESS_INTERVAL_S", 0.03)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @tool("slow", "Wait for release.", {})
+    async def slow(_args):
+        started.set()
+        await release.wait()
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    async with McpToolBridge([slow]) as bridge:
+        cfg = bridge.stdio_server_config()
+        proc = await asyncio.create_subprocess_exec(
+            cfg["command"],
+            *cfg["args"],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **cfg["env"]},
+        )
+        try:
+            proc.stdin.write(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "slow",
+                                "arguments": {},
+                                "_meta": {"progressToken": "tok-1"},
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            await proc.stdin.drain()
+            await asyncio.wait_for(started.wait(), timeout=5)
+            progress_msg = json.loads(
+                await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+            )
+            assert progress_msg["method"] == "notifications/progress"
+            assert progress_msg["params"]["progressToken"] == "tok-1"
+            assert progress_msg["params"]["progress"] >= 1
+            release.set()
+            result_msg = json.loads(
+                await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+            )
+            assert result_msg["id"] == 1
+            assert result_msg["result"]["content"][0]["text"] == "done"
+        finally:
+            proc.stdin.close()
+            await asyncio.wait_for(proc.wait(), timeout=5)

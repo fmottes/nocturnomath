@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -671,3 +672,189 @@ for line in sys.stdin:
     logs = json.loads(log_path.read_text())
     assert logs[3]["perm_outcome"] == {"outcome": "cancelled"}
     assert logs[-1]["set_model"] == "gemini-4-carbon-high"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_discovery_rejects_unauthenticated_cli_without_env(
+    tmp_path, monkeypatch
+):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    fake = _write_fake_cli(
+        tmp_path / "claude_unauth",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": msg["request_id"],
+                "response": {
+                    "account": {"tokenSource": "none", "apiProvider": "firstParty"},
+                    "models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-5-5"}],
+                },
+            },
+        }), flush=True)
+""",
+    )
+    backend = AnthropicBackend()
+    with patch(
+        "nocturnomath.backends.anthropic.claude_cli_candidates", return_value=[fake]
+    ):
+        assert await backend.discover_models(ProviderAuth("anthropic", "cli")) == []
+        api_models = await backend.discover_models(
+            ProviderAuth.interactive("anthropic", "api_key", "sk-ant-test")
+        )
+        assert [m.id for m in api_models] == ["claude-sonnet-5-5"]
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_timeout_early_compaction_and_transient_resume_error(
+    tmp_path,
+):
+    log_path = tmp_path / "codex_opts.json"
+    fake = _write_fake_cli(
+        tmp_path / "codex_timeout_test",
+        f"""
+import json, sys
+open({str(log_path)!r}, "w").write(json.dumps(sys.argv[1:]))
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"thread": {{"id": "thr-1"}}}}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"turn": {{"id": "turn-1"}}}}}}), flush=True)
+        print(json.dumps({{"jsonrpc": "2.0", "method": "turn/completed", "params": {{"turn": {{"id": "turn-1", "status": "completed"}}}}}}), flush=True)
+    elif method == "thread/resume":
+        if msg["params"]["threadId"] == "crash":
+            sys.stderr.write("fatal transport error\\n")
+            sys.stderr.flush()
+            sys.exit(1)
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"thread": {{"id": "thr-1"}}}}}}), flush=True)
+    elif method == "thread/compact/start":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+        # Emit contextCompaction without turn/completed or thread/compacted and stay open.
+        print(json.dumps({{"jsonrpc": "2.0", "method": "item/completed", "params": {{"item": {{"type": "contextCompaction"}}}}}}), flush=True)
+""",
+    )
+    backend = OpenAIBackend(cli_path=fake)
+    auth = ProviderAuth("openai", "cli")
+
+    events = [
+        e
+        async for e in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gpt-5.6-sol",
+            effort=None,
+            auth=auth,
+            tool_timeout_s=720,
+        )
+    ]
+    assert isinstance(events[-1], TurnResult)
+    argv = json.loads(log_path.read_text())
+    assert any("tool_timeout_sec=720" in arg for arg in argv)
+
+    # A crash during thread/resume must NOT be converted into SessionResumeError.
+    with pytest.raises(RuntimeError, match="fatal transport error") as exc_info:
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gpt-5.6-sol",
+            effort=None,
+            auth=auth,
+            resume_session_id="crash",
+        ):
+            pass
+    assert not isinstance(exc_info.value, SessionResumeError)
+
+    # Compaction with contextCompaction item finishes after the short trailing wait.
+    result = await asyncio.wait_for(
+        backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gpt-5.6-sol",
+            effort=None,
+            auth=auth,
+            resume_session_id="thr-1",
+        ),
+        timeout=6.0,
+    )
+    assert result.session_id == "thr-1"
+
+
+@pytest.mark.asyncio
+async def test_google_transient_resume_error_and_compact_timeout_message(tmp_path):
+    fake = _write_fake_cli(
+        tmp_path / "agy_timeout",
+        """
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/resume":
+        if msg["params"]["sessionId"] == "crash":
+            sys.stderr.write("unexpected rpc crash\\n")
+            sys.stderr.flush()
+            sys.exit(1)
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "agy-1"}}), flush=True)
+    elif method == "session/set_model":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+    elif method == "session/prompt":
+        time.sleep(1.0)
+""",
+    )
+    backend = GoogleBackend(cli_path=fake)
+    auth = ProviderAuth("google", "cli")
+
+    with pytest.raises(RuntimeError, match="unexpected rpc crash") as exc_info:
+        async for _ in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort=None,
+            auth=auth,
+            resume_session_id="crash",
+        ):
+            pass
+    assert not isinstance(exc_info.value, SessionResumeError)
+
+    with (
+        patch("nocturnomath.backends.google.COMPACT_TIMEOUT_S", 0.05),
+        pytest.raises(RuntimeError, match="timed out"),
+    ):
+        await backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort=None,
+            auth=auth,
+            resume_session_id="agy-1",
+        )

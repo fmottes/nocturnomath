@@ -20,6 +20,7 @@ from ..auth import ProviderAuth, ProviderId
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
+    DEFAULT_TOOL_TIMEOUT_S,
     EFFORT_LEVELS,
     CompactionNotice,
     CompactResult,
@@ -32,6 +33,7 @@ from .base import (
     TextDelta,
     TurnEvent,
     TurnResult,
+    TurnStarted,
     find_cli_executables,
     package_version,
     terminate_process,
@@ -41,7 +43,7 @@ logger = logging.getLogger("nocturnomath.backends.openai")
 
 CODEX_CLI_NAME = "codex.exe" if sys.platform == "win32" else "codex"
 DISCOVERY_TIMEOUT_S = 15.0
-COMPACT_TIMEOUT_S = 120.0
+COMPACT_TIMEOUT_S = 600.0
 
 CODEX_DISABLE_FLAGS = (
     "--disable",
@@ -76,17 +78,34 @@ def codex_cli_candidates() -> list[Path]:
     return find_cli_executables(CODEX_CLI_NAME)
 
 
-def _toml_mcp_override(cfg: dict[str, Any]) -> str:
+def _is_missing_thread_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "no rollout found",
+            "thread not found",
+            "conversation not found",
+            "does not exist",
+        )
+    )
+
+
+def _toml_mcp_override(
+    cfg: dict[str, Any], *, tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S
+) -> str:
     env_items = ", ".join(
         f"{key}={json.dumps(val)}" for key, val in (cfg.get("env") or {}).items()
     )
     args_toml = ", ".join(json.dumps(str(arg)) for arg in (cfg.get("args") or ()))
+    timeout_sec = max(1, int(tool_timeout_s))
     return (
         "mcp_servers={explore={"
         f"command={json.dumps(cfg['command'])}, "
         f"args=[{args_toml}], "
         f"env={{{env_items}}}, "
-        "startup_timeout_sec=30"
+        "startup_timeout_sec=30, "
+        f"tool_timeout_sec={timeout_sec}"
         "}}"
     )
 
@@ -428,6 +447,7 @@ class OpenAIBackend:
         effort: str | None,
         auth: ProviderAuth,
         resume_session_id: str | None = None,
+        tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]:
         cli_path = self._resolve_cli()
         env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
@@ -442,7 +462,7 @@ class OpenAIBackend:
                     *CODEX_DISABLE_FLAGS,
                     *auth_flags,
                     "-c",
-                    _toml_mcp_override(cfg),
+                    _toml_mcp_override(cfg, tool_timeout_s=tool_timeout_s),
                     *_disabled_mcp_overrides(codex_home),
                     "--listen",
                     "stdio://",
@@ -475,7 +495,9 @@ class OpenAIBackend:
                                 stderr,
                             )
                         except RuntimeError as exc:
-                            raise SessionResumeError(str(exc)) from exc
+                            if _is_missing_thread_error(str(exc)):
+                                raise SessionResumeError(str(exc)) from exc
+                            raise
                     else:
                         res = await self._rpc(
                             proc, messages, "thread/start", thread_params, stderr
@@ -513,7 +535,15 @@ class OpenAIBackend:
                             continue
                         method = msg.get("method")
                         params = msg.get("params") or {}
-                        if method == "item/agentMessage/delta":
+                        if method == "item/started":
+                            item = params.get("item") or {}
+                            if item.get("type") in (
+                                "reasoning",
+                                "mcpToolCall",
+                                "agentMessage",
+                            ):
+                                yield TurnStarted()
+                        elif method == "item/agentMessage/delta":
                             delta = params.get("delta")
                             if isinstance(delta, str) and delta:
                                 yield TextDelta(delta)
@@ -662,75 +692,103 @@ class OpenAIBackend:
                 messages = JsonMessageStream(proc.stdout)
                 compacted = False
                 context_usage: dict[str, Any] | None = None
-                async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                    await self._initialize_session(proc, messages, auth, stderr)
-                    try:
+                try:
+                    async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                        await self._initialize_session(proc, messages, auth, stderr)
+                        try:
+                            await self._rpc(
+                                proc,
+                                messages,
+                                "thread/resume",
+                                {
+                                    "threadId": resume_session_id,
+                                    "cwd": isolated_cwd,
+                                    "baseInstructions": system_prompt,
+                                    **({"model": model} if model else {}),
+                                    "sandbox": "read-only",
+                                    "approvalPolicy": "never",
+                                },
+                                stderr,
+                            )
+                        except RuntimeError as exc:
+                            if _is_missing_thread_error(str(exc)):
+                                raise SessionResumeError(str(exc)) from exc
+                            raise
                         await self._rpc(
                             proc,
                             messages,
-                            "thread/resume",
-                            {
-                                "threadId": resume_session_id,
-                                "cwd": isolated_cwd,
-                                "baseInstructions": system_prompt,
-                                **({"model": model} if model else {}),
-                                "sandbox": "read-only",
-                                "approvalPolicy": "never",
-                            },
+                            "thread/compact/start",
+                            {"threadId": resume_session_id},
                             stderr,
                         )
-                    except RuntimeError as exc:
-                        raise SessionResumeError(str(exc)) from exc
-                    await self._rpc(
-                        proc,
-                        messages,
-                        "thread/compact/start",
-                        {"threadId": resume_session_id},
-                        stderr,
-                    )
-                    async for msg in messages:
-                        if "id" in msg and "method" in msg:
-                            await self._handle_server_request(proc, msg)
-                            continue
-                        method = msg.get("method")
-                        params = msg.get("params") or {}
-                        if method == "thread/tokenUsage/updated":
-                            ctx = _extract_context_usage(
-                                params.get("tokenUsage") or {}, model
-                            )
-                            if ctx is not None:
-                                context_usage = ctx
-                        elif method == "item/completed":
-                            item = params.get("item") or {}
-                            if item.get("type") == "contextCompaction":
+                        deadline: float | None = None
+                        while True:
+                            if deadline is None:
+                                try:
+                                    msg = await messages.__anext__()
+                                except StopAsyncIteration:
+                                    break
+                            else:
+                                remaining = deadline - asyncio.get_running_loop().time()
+                                if remaining <= 0:
+                                    break
+                                try:
+                                    msg = await asyncio.wait_for(
+                                        messages.__anext__(), timeout=remaining
+                                    )
+                                except (TimeoutError, StopAsyncIteration):
+                                    break
+                            if "id" in msg and "method" in msg:
+                                await self._handle_server_request(proc, msg)
+                                continue
+                            method = msg.get("method")
+                            params = msg.get("params") or {}
+                            if method == "thread/tokenUsage/updated":
+                                ctx = _extract_context_usage(
+                                    params.get("tokenUsage") or {}, model
+                                )
+                                if ctx is not None:
+                                    context_usage = ctx
+                            elif method == "item/completed":
+                                item = params.get("item") or {}
+                                if item.get("type") == "contextCompaction":
+                                    compacted = True
+                                    if deadline is None:
+                                        deadline = (
+                                            asyncio.get_running_loop().time() + 2.0
+                                        )
+                            elif method == "thread/compacted":
                                 compacted = True
-                        elif method == "thread/compacted":
-                            compacted = True
-                            break
-                        elif method == "turn/completed":
-                            turn = params.get("turn") or {}
-                            if turn.get("status") == "failed":
-                                err = turn.get("error") or {}
+                                break
+                            elif method == "turn/completed":
+                                turn = params.get("turn") or {}
+                                if turn.get("status") == "failed":
+                                    err = turn.get("error") or {}
+                                    message = (
+                                        err.get("message")
+                                        if isinstance(err, dict)
+                                        else None
+                                    )
+                                    raise RuntimeError(
+                                        message or "Codex compaction failed."
+                                    )
+                                break
+                            elif method == "error":
+                                err = params.get("error") or {}
                                 message = (
                                     err.get("message")
                                     if isinstance(err, dict)
-                                    else None
+                                    else str(err)
                                 )
-                                raise RuntimeError(
-                                    message or "Codex compaction failed."
-                                )
-                            break
-                        elif method == "error":
-                            err = params.get("error") or {}
-                            message = (
-                                err.get("message")
-                                if isinstance(err, dict)
-                                else str(err)
-                            )
-                            if not params.get("willRetry"):
-                                raise RuntimeError(
-                                    message or "Codex compaction failed."
-                                )
+                                if not params.get("willRetry"):
+                                    raise RuntimeError(
+                                        message or "Codex compaction failed."
+                                    )
+                except TimeoutError as exc:
+                    if not compacted:
+                        raise RuntimeError(
+                            f"OpenAI Codex compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
+                        ) from exc
                 if not compacted:
                     detail = await stderr.text()
                     raise RuntimeError(
