@@ -335,6 +335,8 @@ async def terminate_process(
                         await asyncio.wait_for(wait_task, timeout=0.5)
                 except TimeoutError:
                     wait_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await wait_task
     finally:
         if stdout_drain is not None:
             if not stdout_drain.done():
@@ -343,6 +345,10 @@ async def terminate_process(
                 await stdout_drain
         if stderr is not None:
             await stderr.close()
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            with suppress(Exception):
+                transport.close()
     if cancelled_exc is not None:
         raise cancelled_exc
 
@@ -353,6 +359,10 @@ class JsonMessageStream:
     def __init__(self, stream: asyncio.StreamReader | None):
         self._iter = read_jsonl(stream)
         self._buffered: deque[dict[str, Any]] = deque()
+
+    def clear_buffered(self) -> None:
+        """Discard notifications buffered before the current phase begins."""
+        self._buffered.clear()
 
     async def next_wire(self) -> dict[str, Any] | None:
         """Read the next object directly from the underlying stdout stream."""

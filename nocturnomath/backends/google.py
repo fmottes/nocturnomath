@@ -15,7 +15,7 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-from ..auth import ProviderAuth, ProviderId
+from ..auth import ProviderAuth, ProviderId, env_flag_enabled
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
@@ -161,7 +161,7 @@ def _mcp_server_entry(cfg: dict[str, Any]) -> dict[str, Any]:
 def _uses_api_key_mode(auth: ProviderAuth, env: Mapping[str, str]) -> bool:
     if auth.method == "api_key":
         return True
-    if env.get("GOOGLE_GENAI_USE_VERTEXAI"):
+    if env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", env):
         return False
     return bool(env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY"))
 
@@ -394,7 +394,7 @@ class GoogleBackend:
                 flags.extend(["--gemini-dir", probe_dir])
             for candidate in candidates:
                 with tempfile.TemporaryDirectory(
-                    prefix="nocturnomath-agy-cwd-"
+                    prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
                 ) as isolated_cwd:
                     proc: asyncio.subprocess.Process | None = None
                     stderr: StderrCollector | None = None
@@ -423,9 +423,7 @@ class GoogleBackend:
                                 {
                                     "cwd": isolated_cwd,
                                     "mcpServers": [],
-                                    "_meta": {
-                                        "antigravity": {"disableBuiltInTools": True}
-                                    },
+                                    "_meta": {"disableBuiltInTools": True},
                                 },
                                 stderr=stderr,
                             )
@@ -531,7 +529,7 @@ class GoogleBackend:
             for name in (spec.name, f"mcp_explore_{spec.name}", f"explore/{spec.name}")
         }
         with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-agy-cwd-"
+            prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             async with McpToolBridge(tools) as bridge:
                 mcp_servers = [_mcp_server_entry(bridge.stdio_server_config())]
@@ -555,10 +553,8 @@ class GoogleBackend:
                         "cwd": isolated_cwd,
                         "mcpServers": mcp_servers,
                         "_meta": {
-                            "antigravity": {
-                                "disableBuiltInTools": True,
-                                "systemPrompt": {"append": system_prompt},
-                            }
+                            "disableBuiltInTools": True,
+                            "antigravity": {"systemPrompt": {"append": system_prompt}},
                         },
                     }
                     if resume_session_id:
@@ -675,6 +671,10 @@ class GoogleBackend:
                                 yield TextBlockDone("".join(current_block))
                                 current_block.clear()
                             result = msg.get("result") or {}
+                            if result.get("stopReason") == "cancelled":
+                                raise asyncio.CancelledError(
+                                    "Google Antigravity turn was cancelled."
+                                )
                             usage = result.get("usage")
                             if last_context_usage is None:
                                 last_context_usage = _usage_to_context(usage, model)
@@ -693,14 +693,17 @@ class GoogleBackend:
                         )
                 except (asyncio.CancelledError, GeneratorExit):
                     if session_id:
-                        with suppress(Exception):
-                            await self._send(
-                                proc,
-                                {
-                                    "jsonrpc": "2.0",
-                                    "method": "session/cancel",
-                                    "params": {"sessionId": session_id},
-                                },
+                        with suppress(Exception, TimeoutError):
+                            await asyncio.wait_for(
+                                self._send(
+                                    proc,
+                                    {
+                                        "jsonrpc": "2.0",
+                                        "method": "session/cancel",
+                                        "params": {"sessionId": session_id},
+                                    },
+                                ),
+                                timeout=0.5,
                             )
                     await bridge.cancel_in_flight()
                     raise
@@ -721,7 +724,7 @@ class GoogleBackend:
         cli_path = self._resolve_cli()
         env, flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-agy-cwd-"
+            prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             proc = await asyncio.create_subprocess_exec(
                 str(cli_path),
@@ -755,10 +758,10 @@ class GoogleBackend:
                                     "cwd": isolated_cwd,
                                     "mcpServers": [],
                                     "_meta": {
+                                        "disableBuiltInTools": True,
                                         "antigravity": {
-                                            "disableBuiltInTools": True,
-                                            "systemPrompt": {"append": system_prompt},
-                                        }
+                                            "systemPrompt": {"append": system_prompt}
+                                        },
                                     },
                                 },
                                 stderr=stderr,
@@ -771,6 +774,7 @@ class GoogleBackend:
                             await self._configure_model(
                                 proc, messages, resume_session_id, model, effort, stderr
                             )
+                        messages.clear_buffered()
                         req_id = self._next_id()
                         try:
                             await self._send(
@@ -850,6 +854,10 @@ class GoogleBackend:
                                 if unexpected_chunks:
                                     raise RuntimeError(" ".join(unexpected_chunks))
                                 result = msg.get("result") or {}
+                                if result.get("stopReason") == "cancelled":
+                                    raise asyncio.CancelledError(
+                                        "Google Antigravity compaction was cancelled."
+                                    )
                                 raw_usage = result.get("usage")
                                 if context_usage is None:
                                     context_usage = _usage_to_context(raw_usage, model)

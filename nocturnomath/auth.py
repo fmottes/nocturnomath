@@ -76,11 +76,30 @@ _PROVIDER_SECRET_ENV: dict[ProviderId, tuple[str, ...]] = {
     "google": _CREDENTIAL_ENV["google"],
 }
 
+_BOOL_TOGGLE_ENV = frozenset(
+    {
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    }
+)
+
+
+def env_flag_enabled(name: str, env: Mapping[str, str] | None = None) -> bool:
+    """Return True if an environment toggle variable is set to an enabled value."""
+    source = os.environ if env is None else env
+    raw = (source.get(name) or "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
 
 def inherited_credential(provider: ProviderId = "anthropic") -> str | None:
     """Name the environment variable a CLI uses instead of its saved login."""
     for name in _INHERITED_ENV[provider]:
-        if os.environ.get(name):
+        if name in _BOOL_TOGGLE_ENV:
+            if env_flag_enabled(name):
+                return name
+        elif os.environ.get(name):
             return name
     return None
 

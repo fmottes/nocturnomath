@@ -1077,7 +1077,7 @@ for line in sys.stdin:
     )
     monkeypatch.setenv("GEMINI_API_KEY", "gem-from-shell")
     monkeypatch.setenv("OPENAI_API_KEY", "other-provider-secret")
-    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
     backend = GoogleBackend(cli_path=fake)
     cli_auth = ProviderAuth("google", "cli")
     assert "OPENAI_API_KEY" not in cli_auth.process_env()
@@ -1100,7 +1100,8 @@ for line in sys.stdin:
     entry = json.loads(log_path.read_text())
     assert "--gemini-dir" in entry["argv"]
     assert "authenticate" in entry["methods"]
-    assert entry["meta"]["antigravity"]["disableBuiltInTools"] is True
+    assert entry["meta"]["disableBuiltInTools"] is True
+    assert "disableBuiltInTools" not in entry["meta"].get("antigravity", {})
     backend._cleanup_api_dir()
 
 
@@ -1160,3 +1161,135 @@ for line in sys.stdin:
     ]
     assert json.loads(log_path.read_text()) == ["deny", "allow"]
     assert [e.text for e in events if isinstance(e, TextBlockDone)] == ["main reply"]
+
+
+def test_openai_toml_mcp_override_handles_non_bmp_unicode_and_enables_explore():
+    import tomllib
+
+    from nocturnomath.backends.openai import _toml_mcp_override
+
+    override = _toml_mcp_override(
+        {
+            "command": "/opt/🚀/python",
+            "args": ["-m", "nocturnomath.mcp_bridge", "/tmp/🧪/bridge.json"],
+            "env": {"FOO": "bar\nbaz"},
+        },
+        tool_timeout_s=660,
+    )
+    parsed = tomllib.loads(override)["mcp_servers"]["explore"]
+    assert parsed["enabled"] is True
+    assert parsed["command"] == "/opt/🚀/python"
+    assert parsed["args"][-1] == "/tmp/🧪/bridge.json"
+    assert parsed["env"] == {"FOO": "bar\nbaz"}
+
+
+@pytest.mark.asyncio
+async def test_compact_discards_buffered_precompaction_usage_and_handles_agy_cancel(
+    tmp_path,
+):
+    fake_codex = _write_fake_cli(
+        tmp_path / "codex_compact_buf",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+    elif method == "thread/resume":
+        print(json.dumps({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated", "params": {"turnId": "old", "tokenUsage": {"modelContextWindow": 200000, "last": {"totalTokens": 190000}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"thread": {"id": "thr-1"}}}), flush=True)
+    elif method == "thread/compact/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "thread/compacted", "params": {}}), flush=True)
+""",
+    )
+    compact_codex = await OpenAIBackend(cli_path=fake_codex).compact(
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="gpt-5.6-sol",
+        effort=None,
+        auth=ProviderAuth("openai", "cli"),
+        resume_session_id="thr-1",
+    )
+    assert compact_codex.context_usage is None
+
+    fake_agy = _write_fake_cli(
+        tmp_path / "agy_compact_buf",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/resume":
+        sid = msg["params"]["sessionId"]
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "usage_update", "used": 180000, "size": 1000000}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": sid}}), flush=True)
+    elif method == "session/set_model":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+    elif method == "session/prompt":
+        prompt_text = msg["params"]["prompt"][0]["text"]
+        if msg["params"]["sessionId"] == "agy-cancel":
+            print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "cancelled"}}), flush=True)
+            continue
+        assert prompt_text == "/compact"
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 400}}}), flush=True)
+""",
+    )
+    agy_backend = GoogleBackend(cli_path=fake_agy)
+    compact_agy = await agy_backend.compact(
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model="gemini-4-carbon",
+        effort="high",
+        auth=ProviderAuth("google", "cli"),
+        resume_session_id="agy-1",
+    )
+    assert compact_agy.context_usage == {
+        "used_tokens": 400,
+        "window_tokens": None,
+        "model": "gemini-4-carbon",
+    }
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in agy_backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=ProviderAuth("google", "cli"),
+            resume_session_id="agy-cancel",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_closes_transport_for_already_exited_process_with_stdout():
+    from nocturnomath.backends.base import StderrCollector, terminate_process
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('READY\\n' + 'x' * 160 * 1024); sys.stdout.flush()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr = StderrCollector(proc.stderr)
+    assert await asyncio.wait_for(proc.stdout.readline(), timeout=5.0) == b"READY\n"
+    for _ in range(50):
+        if proc.returncode is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert proc.returncode == 0
+    await terminate_process(proc, stderr)
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        assert transport.is_closing()

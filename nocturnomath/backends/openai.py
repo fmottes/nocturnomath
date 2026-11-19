@@ -71,6 +71,10 @@ CODEX_DISABLE_FLAGS = (
     "memories",
     "--disable",
     "code_mode",
+    "--disable",
+    "hooks",
+    "--disable",
+    "sleep_tool",
     "-c",
     'web_search="disabled"',
 )
@@ -97,17 +101,46 @@ def _is_missing_thread_error(text: str) -> bool:
     )
 
 
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_quote(value: str) -> str:
+    out = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04x}")
+        elif code > 0xFFFF:
+            out.append(f"\\U{code:08x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
 def _toml_mcp_override(
     cfg: dict[str, Any], *, tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S
 ) -> str:
     env_items = ", ".join(
-        f"{key}={json.dumps(val)}" for key, val in (cfg.get("env") or {}).items()
+        f"{key if re.fullmatch(r'[A-Za-z0-9_-]+', str(key)) else _toml_quote(str(key))}={_toml_quote(str(val))}"
+        for key, val in (cfg.get("env") or {}).items()
     )
-    args_toml = ", ".join(json.dumps(str(arg)) for arg in (cfg.get("args") or ()))
+    args_toml = ", ".join(_toml_quote(str(arg)) for arg in (cfg.get("args") or ()))
     timeout_sec = max(1, int(tool_timeout_s))
     return (
         "mcp_servers={explore={"
-        f"command={json.dumps(cfg['command'])}, "
+        "enabled=true, "
+        f"command={_toml_quote(str(cfg['command']))}, "
         f"args=[{args_toml}], "
         f"env={{{env_items}}}, "
         "startup_timeout_sec=30, "
@@ -130,7 +163,7 @@ def _disabled_mcp_overrides(codex_home: Path) -> list[str]:
     for name in sorted(names):
         if name == "explore":
             continue
-        key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else json.dumps(name)
+        key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_quote(name)
         flags.extend(["-c", f"mcp_servers.{key}.enabled=false"])
     return flags
 
@@ -508,7 +541,7 @@ class OpenAIBackend:
         cli_path = self._resolve_cli()
         env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-codex-cwd-"
+            prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             async with McpToolBridge(tools) as bridge:
                 cfg = bridge.stdio_server_config()
@@ -714,18 +747,21 @@ class OpenAIBackend:
                         )
                 except (asyncio.CancelledError, GeneratorExit):
                     if thread_id and turn_id:
-                        with suppress(Exception):
-                            await self._send(
-                                proc,
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": self._next_id(),
-                                    "method": "turn/interrupt",
-                                    "params": {
-                                        "threadId": thread_id,
-                                        "turnId": turn_id,
+                        with suppress(Exception, TimeoutError):
+                            await asyncio.wait_for(
+                                self._send(
+                                    proc,
+                                    {
+                                        "jsonrpc": "2.0",
+                                        "id": self._next_id(),
+                                        "method": "turn/interrupt",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "turnId": turn_id,
+                                        },
                                     },
-                                },
+                                ),
+                                timeout=0.5,
                             )
                     await bridge.cancel_in_flight()
                     raise
@@ -746,7 +782,7 @@ class OpenAIBackend:
         cli_path = self._resolve_cli()
         env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-codex-cwd-"
+            prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             proc = await asyncio.create_subprocess_exec(
                 str(cli_path),
@@ -792,6 +828,7 @@ class OpenAIBackend:
                             if _is_missing_thread_error(str(exc)):
                                 raise SessionResumeError(str(exc)) from exc
                             raise
+                        messages.clear_buffered()
                         await self._rpc(
                             proc,
                             messages,

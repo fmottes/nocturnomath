@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -344,7 +345,12 @@ class AnthropicBackend:
         effort: str | None,
         resume_session_id: str | None,
     ) -> list[str]:
-        compact_hook = shlex.join([sys.executable, "-m", "nocturnomath.compaction"])
+        hook_argv = [sys.executable, "-m", "nocturnomath.compaction"]
+        compact_hook = (
+            subprocess.list2cmdline(hook_argv)
+            if sys.platform == "win32"
+            else shlex.join(hook_argv)
+        )
         settings = json.dumps(
             {
                 "hooks": {
@@ -658,8 +664,10 @@ class AnthropicBackend:
                         or f"Claude CLI exited without completing the turn (status {rc})."
                     )
             except (asyncio.CancelledError, GeneratorExit):
-                with suppress(Exception):
-                    await self._send_control(proc, "interrupt")
+                with suppress(Exception, TimeoutError):
+                    await asyncio.wait_for(
+                        self._send_control(proc, "interrupt"), timeout=0.5
+                    )
                 await bridge.cancel_in_flight()
                 raise
             finally:

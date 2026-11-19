@@ -140,3 +140,14 @@ def test_auth_store_tracks_multiple_providers_and_redacts_secrets():
     assert public["providers"]["openai"]["method"] == "api_key"
     assert public["providers"]["openai"]["models_count"] == 2
     assert public["providers"]["google"]["models_count"] == 0
+
+
+def test_falsey_provider_toggles_do_not_report_inherited_credentials(monkeypatch):
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
+    assert ProviderAuth("google").public()["note"] is None
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-secret")
+    assert "GEMINI_API_KEY" in ProviderAuth("google").public()["note"]
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "0")
+    assert ProviderAuth("anthropic").public()["note"] is None
