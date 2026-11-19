@@ -6,8 +6,16 @@ const ALLOWED_TAGS = new Set([
 
 function safeUrl(value, image = false) {
   const source = value.trim();
-  if (!source || source.startsWith("#") || source.startsWith("/") || source.startsWith("./") || source.startsWith("../")) {
-    return source;
+  if (!source) return source;
+  if (source.startsWith("//") || source.startsWith("\\\\")) return null;
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(source.replace(/[\u0000-\u0020]+/g, ""));
+  if (!hasScheme) {
+    try {
+      const resolved = new URL(source, "https://workspace.invalid/");
+      return resolved.origin === "https://workspace.invalid" ? source : null;
+    } catch (error) {
+      return null;
+    }
   }
   try {
     const protocol = new URL(source).protocol;

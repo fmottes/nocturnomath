@@ -921,3 +921,23 @@ async def test_command_compact_handles_interrupt_and_cancelled_error(terminal):
     terminal.runtime.compact_agent = direct_cancel
     await terminal.run("/compact")
     assert "Compaction cancelled." in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_resume_command_reclaims_session_opened_by_background_batch_review(
+    terminal,
+):
+    terminal.session.log_transcript("user", text="batch work")
+    await terminal.run("/new")
+    bg_id = terminal.runtime.create_agent(
+        terminal.session.workspace_path, session_id="S001"
+    )
+    assert len(terminal.runtime.agents) == 2
+    assert terminal.runtime.find_agent_for_session("S001") == bg_id
+
+    terminal.output()
+    await terminal.run("/resume S001")
+    out = terminal.output()
+    assert "S001: Resumed this chat." in out
+    assert len(terminal.runtime.agents) == 1
+    assert terminal.session.workspace.session_id == "S001"

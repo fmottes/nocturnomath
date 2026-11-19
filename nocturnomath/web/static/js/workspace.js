@@ -596,19 +596,19 @@ export function rewriteDocumentLinks(container, documentPath) {
 }
 
 export function rewriteEmbeddedImageUrls(container, documentPath) {
-  const documentDir = documentPath.includes("/")
-    ? documentPath.slice(0, documentPath.lastIndexOf("/"))
-    : "";
-
   container.querySelectorAll("img[src]").forEach((image) => {
     const source = image.getAttribute("src")?.trim();
     if (!source || source.startsWith("/") || source.startsWith("//") ||
       source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
       return;
     }
-
-    const assetPath = documentDir ? `${documentDir}/${source}` : source;
-    image.src = `/api/asset?path=${encodeURIComponent(assetPath)}`;
+    try {
+      const target = new URL(source, `https://workspace.invalid/${documentPath}`);
+      const assetPath = decodeURIComponent(target.pathname.slice(1));
+      image.src = `/api/asset?path=${encodeURIComponent(assetPath)}`;
+    } catch (error) {
+      // Leave malformed image paths unchanged.
+    }
   });
 }
 

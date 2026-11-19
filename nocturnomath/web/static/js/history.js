@@ -111,12 +111,16 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
   });
   try {
     if (!state.activeAgentId && !openAgentId) throw new Error("No explorer is selected");
-    if (openAgentId && !(restoreKernel && openAgentId === state.activeAgentId)) {
+    if (openAgentId && !restoreKernel) {
       window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
       elements.historyModal.classList.add("hidden");
       return;
     }
-    const res = await fetch(`/api/agents/${encodeURIComponent(state.activeAgentId)}/resume`, {
+    const targetAgentId = openAgentId || state.activeAgentId;
+    if (openAgentId && openAgentId !== state.activeAgentId) {
+      window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
+    }
+    const res = await fetch(`/api/agents/${encodeURIComponent(targetAgentId)}/resume`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: sessionId, restore_kernel: restoreKernel }),

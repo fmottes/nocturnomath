@@ -340,7 +340,7 @@ def create_app(
             "effort": runtime.session.effort if runtime.session else runtime.effort,
             "agent_models": {
                 agent_id: {"model": agent.model, "effort": agent.effort}
-                for agent_id, agent in runtime.agents.items()
+                for agent_id, agent in list(runtime.agents.items())
             },
             "session_defaults": (
                 {
@@ -494,7 +494,7 @@ def create_app(
     ):
         session = active_session(agent_id)
         session.set_documents_default(request.enabled)
-        for other in runtime.agents.values():
+        for other in list(runtime.agents.values()):
             if other is not session and other.workspace_path == session.workspace_path:
                 other.documents_default = session.documents_default
                 other.document_choices = {}
@@ -528,7 +528,7 @@ def create_app(
         session = active_session(agent_id)
         try:
             session.delete_document(name)
-            for other in runtime.agents.values():
+            for other in list(runtime.agents.values()):
                 if (
                     other is not session
                     and other.workspace_path == session.workspace_path
@@ -695,7 +695,7 @@ def create_app(
         session = active_session()
         open_agents = {
             candidate.workspace.session_id: agent_id
-            for agent_id, candidate in runtime.agents.items()
+            for agent_id, candidate in list(runtime.agents.items())
             if not candidate.workspace.session_pending
         }
         sessions = session.list_sessions()

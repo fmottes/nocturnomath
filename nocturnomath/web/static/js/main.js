@@ -176,8 +176,11 @@ function applyExplorer(agent, repaint = false) {
   renderExplorerTabs();
 }
 
+let explorerSelectSeq = 0;
+
 async function selectExplorer(agentId) {
   if (!state.agents.has(agentId) || agentId === state.activeAgentId) return;
+  const seq = ++explorerSelectSeq;
   saveExplorerView();
   state.activeAgentId = agentId;
   const cached = state.agents.get(agentId);
@@ -185,9 +188,10 @@ async function selectExplorer(agentId) {
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
     if (!response.ok) throw new Error("Explorer no longer exists");
-    if (state.activeAgentId === agentId) {
+    const snapshot = await response.json();
+    if (state.activeAgentId === agentId && seq === explorerSelectSeq) {
       saveExplorerView();
-      applyExplorer(await response.json(), true);
+      applyExplorer(snapshot, true);
     }
     loadPlots();
   } catch (error) {
@@ -217,10 +221,17 @@ function installExplorers(agents = [], preserveView = true) {
 }
 
 async function refreshContextUsage(agentId) {
+  const seqBefore = state.agents.get(agentId)?.stateSeq || 0;
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
     if (!response.ok) return;
     const agent = await response.json();
+    const current = state.agents.get(agentId);
+    if (current && (current.stateSeq || 0) !== seqBefore) {
+      delete agent.is_busy;
+      delete agent.status;
+      delete agent.kernel_busy;
+    }
     applyExplorer(agent);
   } catch (error) {
     // The next websocket snapshot will reconcile an unavailable local service.
@@ -245,6 +256,10 @@ async function createExplorer() {
 async function closeExplorer(agentId) {
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+    if (response.status === 404 && state.agents.size > 1) {
+      handleServerEvent({ type: "agent_removed", agent_id: agentId });
+      return;
+    }
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Unable to close explorer");
   } catch (error) {
@@ -283,47 +298,57 @@ function handleServerEvent(event) {
     return;
   }
   if (event.agent_id && event.type !== "agent_removed") {
-    const current = state.agents.get(event.agent_id) || { agent_id: event.agent_id };
-    if (event.type === "status_change") {
-      current.is_busy = !["idle", "cancelled"].includes(event.status);
-      current.status = event.status;
-    }
-    if (event.type === "probe_start" && event.kernel_alive !== undefined && event.backend !== "slurm") {
-      current.kernel_alive = event.kernel_alive;
-      current.kernel_busy = true;
-      if (current.is_busy) current.status = "probing";
-    }
-    if (event.type === "probe_finish" && event.backend !== "slurm" && event.status !== "slurm-error") {
-      current.kernel_busy = false;
-      if (current.is_busy && current.status === "probing") current.status = "thinking";
-    }
-    if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
-      current.kernel_alive = true;
-      current.kernel_busy = false;
-    }
-    if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
-    if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
-    if (event.type === "user_message") {
-      if (event.session_id) current.session_id = event.session_id;
-      if (event.model) {
-        current.model = event.model;
-        current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
+    const current = state.agents.get(event.agent_id);
+    if (!current) {
+      if (event.type === "error") appendErrorMessage(event.message);
+      else if (event.type === "system_message") appendSystemMessage(event.text);
+      if (!["session_resumed", "session_reset"].includes(event.type)) return;
+    } else {
+      if (event.type === "status_change") {
+        current.is_busy = !["idle", "cancelled"].includes(event.status);
+        current.status = event.status;
+        current.stateSeq = (current.stateSeq || 0) + 1;
       }
-      if (event.effort !== undefined) current.effort = event.effort;
-    }
-    state.agents.set(event.agent_id, current);
-    renderExplorerTabs();
-    if (
-      event.agent_id !== state.activeAgentId
-      && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
-    ) {
-      if (event.type === "record_changed" && state.activeTab !== "plots") {
-        loadDocument(state.activeDoc, "", true);
+      if (event.type === "probe_start" && event.kernel_alive !== undefined && event.backend !== "slurm") {
+        current.kernel_alive = event.kernel_alive;
+        current.kernel_busy = true;
+        if (current.is_busy) current.status = "probing";
+        current.stateSeq = (current.stateSeq || 0) + 1;
       }
-      if (event.type === "turn_complete") {
-        refreshContextUsage(event.agent_id);
+      if (event.type === "probe_finish" && event.backend !== "slurm" && event.status !== "slurm-error") {
+        current.kernel_busy = false;
+        if (current.is_busy && current.status === "probing") current.status = "thinking";
+        current.stateSeq = (current.stateSeq || 0) + 1;
       }
-      return;
+      if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
+        current.kernel_alive = true;
+        current.kernel_busy = false;
+        current.stateSeq = (current.stateSeq || 0) + 1;
+      }
+      if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
+      if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
+      if (event.type === "user_message") {
+        if (event.session_id) current.session_id = event.session_id;
+        if (event.model) {
+          current.model = event.model;
+          current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
+        }
+        if (event.effort !== undefined) current.effort = event.effort;
+      }
+      state.agents.set(event.agent_id, current);
+      renderExplorerTabs();
+      if (
+        event.agent_id !== state.activeAgentId
+        && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
+      ) {
+        if (event.type === "record_changed" && state.activeTab !== "plots") {
+          loadDocument(state.activeDoc, "", true);
+        }
+        if (event.type === "turn_complete") {
+          refreshContextUsage(event.agent_id);
+        }
+        return;
+      }
     }
   }
   switch (event.type) {
@@ -523,6 +548,7 @@ function handleServerEvent(event) {
       break;
 
     case "session_resumed": {
+      ++explorerSelectSeq;
       const resumedId = event.session_id || event.id || null;
       if (state.agents.has(event.agent_id)) {
         Object.assign(state.agents.get(event.agent_id), {
@@ -647,7 +673,7 @@ function setupEventListeners() {
     if (!selectedModel) return;
     const selectedProvider = state.modelProviders[selectedModel] || null;
 
-    sendWs("query", {
+    const sent = sendWs("query", {
       agent_id: state.activeAgentId,
       text,
       model: selectedModel,
@@ -655,6 +681,10 @@ function setupEventListeners() {
       raw_model: rawModelId(selectedModel, selectedProvider),
       effort: elements.effortSelect.value || null,
     });
+    if (!sent) {
+      appendErrorMessage("WebSocket is reconnecting; your message was kept in the input box.");
+      return;
+    }
     elements.promptInput.value = "";
     elements.promptInput.style.height = "44px";
     const agent = state.agents.get(state.activeAgentId);

@@ -26,7 +26,8 @@ export function initWebSocket(onMessage, onOpen, onClose) {
 export function sendWs(action, payload = {}) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({ action, ...payload }));
-  } else {
-    console.warn("WebSocket is not connected");
+    return true;
   }
+  console.warn("WebSocket is not connected");
+  return false;
 }

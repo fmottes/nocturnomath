@@ -709,6 +709,11 @@ class TerminalApp:
             self.error("Name a chat to resume, such as /resume S001.")
             return True
         self.require_idle("resume")
+        existing_id = self.runtime.find_agent_for_session(ids[0])
+        if existing_id is not None and existing_id != self.runtime.primary_agent_id:
+            await self.runtime.transition_agent(
+                existing_id, self.runtime.close_agent, existing_id
+            )
         data = await self.runtime.transition(
             self.runtime.resume_session, ids[0], restore_kernel
         )

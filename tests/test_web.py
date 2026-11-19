@@ -1509,3 +1509,61 @@ def test_websocket_interrupt_is_nonblocking_and_second_stop_breaks_shield(
                 break
         assert cancelled_seen and idle_seen
         assert not rt.get_agent(agent_id).has_active_query()
+
+
+def test_agent_snapshot_is_idle_immediately_upon_turn_complete(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_turn_idle"
+    workspace.mkdir()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        is_default=True,
+    )
+
+    class SimpleTurnBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-turn")
+            yield TextBlockDone("Done.")
+            yield TurnResult(
+                context_usage={"used_tokens": 120, "window_tokens": 200000}
+            )
+
+    backend_model_catalog["anthropic"] = SimpleTurnBackend("anthropic", models=[spec])
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        agent_id = client.app.state.runtime.primary_agent_id
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "check snapshot on turn_complete",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+            }
+        )
+        while websocket.receive_json()["type"] != "turn_complete":
+            pass
+        snap = client.get(f"/api/agents/{agent_id}").json()
+        assert snap["is_busy"] is False
+        assert snap["status"] == "idle"
+        assert snap["can_compact"] is True
