@@ -1319,12 +1319,11 @@ class Runtime:
             raise RuntimeError("This explorer is already changing. Please wait.")
         session = self.get_agent(agent_id)
         session.require_idle("compact this explorer")
-        if not session._sdk_session_id or session._active_provider is None:
-            raise RuntimeError("This explorer has no conversation context to compact.")
+        session._compaction_reserved = True
         session._is_busy = True
         session.status = "compacting"
         compact_epoch = session._interrupt_epoch
-        task = asyncio.create_task(session.compact(_reserved=True))
+        task = asyncio.create_task(session.compact())
         session._current_task = task
         succeeded = False
         outer = asyncio.current_task()
@@ -1354,10 +1353,10 @@ class Runtime:
         finally:
             if session._current_task is task:
                 session._current_task = None
-            if not succeeded:
-                session._is_busy = False
-                if session.status == "compacting":
-                    session.status = "idle"
+            session._compaction_reserved = False
+            session._is_busy = False
+            if session.status == "compacting":
+                session.status = "idle"
             if (
                 self._started
                 and not self.changing

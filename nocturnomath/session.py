@@ -101,6 +101,7 @@ class ExplorationSession:
         )
         self.event_subscribers: list[Callable[[str, dict[str, Any]], Any]] = []
         self._is_busy = False
+        self._compaction_reserved = False
         self.status = "idle"
         self._current_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
@@ -839,8 +840,10 @@ class ExplorationSession:
         self.log_transcript("compaction", record_reloaded=record_reloaded)
         await self.emit("context_compacted", record_reloaded=record_reloaded)
 
-    async def compact(self, *, _reserved: bool = False):
-        if not _reserved:
+    async def compact(self):
+        reserved = self._compaction_reserved
+        self._compaction_reserved = False
+        if not reserved:
             self.require_idle("compact this explorer")
         if not self._sdk_session_id or self._active_provider is None:
             raise RuntimeError("This explorer has no conversation context to compact.")
