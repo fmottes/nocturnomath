@@ -151,14 +151,18 @@ def _toml_mcp_override(
 
 
 def _disabled_mcp_overrides(codex_home: Path) -> list[str]:
-    names: set[str] = {"node_repl"}
+    names: set[str] = set()
     config_file = codex_home / "config.toml"
     if config_file.is_file():
         with suppress(Exception):
             parsed = tomllib.loads(config_file.read_text(encoding="utf-8"))
             mcp_servers = parsed.get("mcp_servers")
             if isinstance(mcp_servers, dict):
-                names.update(str(k) for k in mcp_servers if k != "explore")
+                names.update(
+                    str(k)
+                    for k, v in mcp_servers.items()
+                    if k != "explore" and isinstance(v, dict)
+                )
     flags: list[str] = []
     for name in sorted(names):
         if name == "explore":

@@ -16,7 +16,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from ..auth import ProviderAuth, ProviderId
+from ..auth import ProviderAuth, ProviderId, env_flag_enabled
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
@@ -53,6 +53,8 @@ _CLAUDE_CREDENTIAL_VARS = (
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+)
+_CLAUDE_TOGGLE_VARS = (
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
@@ -64,7 +66,9 @@ def _has_claude_credentials(
 ) -> bool:
     if auth.method != "cli":
         return True
-    if any(env.get(name) for name in _CLAUDE_CREDENTIAL_VARS):
+    if any(env.get(name) for name in _CLAUDE_CREDENTIAL_VARS) or any(
+        env_flag_enabled(name, env) for name in _CLAUDE_TOGGLE_VARS
+    ):
         return True
     account = resp.get("account")
     if isinstance(account, dict):

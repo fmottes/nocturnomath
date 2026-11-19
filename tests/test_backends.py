@@ -257,7 +257,9 @@ for line in sys.stdin:
     assert "baseInstructions" in logs[1]["thread_params"]
     assert "NOCTURNOMATH_MCP_TOKEN" not in json.dumps(logs[1]["argv"])
     assert 'default_tools_approval_mode="approve"' in " ".join(logs[1]["argv"])
-    assert "mcp_servers.node_repl.enabled=false" in logs[3]["argv"]
+    assert "mcp_servers.node_repl.enabled=false" not in logs[1]["argv"]
+    assert "mcp_servers.node_repl.enabled=false" not in logs[3]["argv"]
+    assert "mcp_servers.user_extra.enabled=false" not in logs[1]["argv"]
     assert "mcp_servers.user_extra.enabled=false" in logs[3]["argv"]
     assert (real_home / "auth.json").read_text() == '{"keep":"untouched"}\n'
     backend._cleanup_api_home()
@@ -1293,3 +1295,118 @@ async def test_terminate_process_closes_transport_for_already_exited_process_wit
     transport = getattr(proc, "_transport", None)
     if transport is not None:
         assert transport.is_closing()
+
+
+def test_openai_disabled_mcp_overrides_skips_undefined_node_repl(tmp_path):
+    from nocturnomath.backends.openai import _disabled_mcp_overrides
+
+    empty_home = tmp_path / "empty"
+    empty_home.mkdir()
+    assert _disabled_mcp_overrides(empty_home) == []
+
+    configured_home = tmp_path / "configured"
+    configured_home.mkdir()
+    (configured_home / "config.toml").write_text(
+        '[mcp_servers.explore]\ncommand = "keep"\n'
+        '[mcp_servers.node_repl]\ncommand = "node"\n'
+        '[mcp_servers.other]\nurl = "https://example.test"\n',
+        encoding="utf-8",
+    )
+    assert _disabled_mcp_overrides(configured_home) == [
+        "-c",
+        "mcp_servers.node_repl.enabled=false",
+        "-c",
+        "mcp_servers.other.enabled=false",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_falsey_toggle_env_does_not_treat_cli_as_authenticated(
+    tmp_path, monkeypatch
+):
+    from nocturnomath.backends.anthropic import AnthropicBackend
+
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "0")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "false")
+    monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "off")
+
+    fake_claude = _write_fake_cli(
+        tmp_path / "claude_falsey_toggle",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "control_request":
+        print(json.dumps({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": msg["request_id"],
+                "response": {
+                    "account": {"tokenSource": "none", "apiProvider": "firstParty"},
+                    "models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-5-5"}],
+                },
+            },
+        }), flush=True)
+""",
+    )
+    backend = AnthropicBackend()
+    with patch(
+        "nocturnomath.backends.anthropic.claude_cli_candidates",
+        return_value=[fake_claude],
+    ):
+        assert await backend.discover_models(ProviderAuth("anthropic", "cli")) == []
+        monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+        models = await backend.discover_models(ProviderAuth("anthropic", "cli"))
+        assert [model.id for model in models] == ["claude-sonnet-5-5"]
+
+
+@pytest.mark.asyncio
+async def test_google_run_turn_clears_buffered_resume_usage_update(tmp_path):
+    fake_agy = _write_fake_cli(
+        tmp_path / "agy_buffered_turn",
+        """
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/resume":
+        sid = msg["params"]["sessionId"]
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "usage_update", "used": 180000, "size": 1000000}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": sid}}), flush=True)
+    elif method == "session/set_model":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}}), flush=True)
+    elif method == "session/prompt":
+        print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 450}}}), flush=True)
+""",
+    )
+    backend = GoogleBackend(cli_path=fake_agy)
+    events = [
+        event
+        async for event in backend.run_turn(
+            "hi",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="high",
+            auth=ProviderAuth("google", "cli"),
+            resume_session_id="agy-resume",
+        )
+    ]
+    result = next(event for event in events if isinstance(event, TurnResult))
+    assert result.context_usage == {
+        "used_tokens": 450,
+        "window_tokens": None,
+        "model": "gemini-4-carbon",
+    }

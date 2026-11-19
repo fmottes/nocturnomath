@@ -589,6 +589,7 @@ class GoogleBackend:
                     await self._configure_model(
                         proc, messages, session_id, model, effort, stderr
                     )
+                    messages.clear_buffered()
 
                     prompt_req_id = self._next_id()
                     try:
