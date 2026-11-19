@@ -620,15 +620,26 @@ def test_history_replaces_the_selected_idle_explorer(session):
         with patch("nocturnomath.session.Kernel", FakeKernel):
             return ExplorationSession(**kwargs)
 
-    with TestClient(create_app(session, session_factory=factory)) as client:
+    with (
+        TestClient(create_app(session, session_factory=factory)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
         agent_id = client.get("/api/workspace").json()["agents"][0]["agent_id"]
         response = client.post(
             f"/api/agents/{agent_id}/resume",
             json={"id": "S001", "restore_kernel": False},
         )
+        resumed_evt = websocket.receive_json()
     assert response.status_code == 200
-    assert response.json()["agent_id"] == agent_id
-    assert response.json()["session_id"] == "S001"
+    body = response.json()
+    assert body["agent_id"] == agent_id
+    assert body["session_id"] == "S001"
+    assert body["is_busy"] is False
+    assert body["status"] == "idle"
+    assert resumed_evt["type"] == "session_resumed"
+    assert resumed_evt["is_busy"] is False
+    assert resumed_evt["status"] == "idle"
 
 
 def test_resume_session_can_restore_kernel(session):

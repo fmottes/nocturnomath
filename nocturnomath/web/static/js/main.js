@@ -566,6 +566,9 @@ function handleServerEvent(event) {
         });
       }
       applyExplorer({
+        is_busy: false,
+        status: "idle",
+        kernel_busy: false,
         ...event,
         session_id: resumedId,
         can_compact: event.can_compact ?? Boolean(event.context_restored),

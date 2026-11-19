@@ -1957,3 +1957,58 @@ async def test_turn_complete_and_idle_handoff_do_not_clobber_next_turn_or_pendin
     finally:
         await runtime.drain()
         runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_discover_models_handles_concurrent_agent_creation_and_closure(session):
+    from nocturnomath.session import ExplorationSession
+
+    spec = ModelSpec(
+        id="claude-sonnet-5",
+        raw_id="claude-sonnet-5",
+        provider="anthropic",
+        label="Claude Sonnet 5",
+        efforts=["high"],
+        is_default=True,
+    )
+
+    def factory(**kwargs):
+        with (
+            patch("nocturnomath.session.Kernel", FakeKernel),
+            patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+        ):
+            return ExplorationSession(**kwargs)
+
+    runtime = Runtime(
+        session,
+        session_factory=factory,
+        backends=stub_backends(anthropic=StubBackend("anthropic", [[spec]])),
+    )
+    runtime.start()
+    try:
+        await runtime.discover_models()
+        stop_churn = threading.Event()
+        churn_errors = []
+
+        def churn():
+            try:
+                while not stop_churn.is_set():
+                    aid = runtime.create_agent(session.workspace_path)
+                    runtime.close_agent(aid)
+            except Exception as exc:
+                churn_errors.append(exc)
+
+        worker = threading.Thread(target=churn)
+        worker.start()
+        try:
+            for _ in range(15):
+                await runtime.authenticate("anthropic", "cli")
+        finally:
+            stop_churn.set()
+            worker.join(timeout=5)
+
+        assert churn_errors == []
+        assert runtime.models == ["claude-sonnet-5"]
+    finally:
+        await runtime.drain()
+        runtime.shutdown()
