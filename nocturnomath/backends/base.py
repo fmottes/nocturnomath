@@ -357,16 +357,54 @@ class JsonMessageStream:
     """JSON-RPC stream allowing RPC calls to buffer concurrent notifications."""
 
     def __init__(self, stream: asyncio.StreamReader | None):
-        self._iter = read_jsonl(stream)
+        self._stream = stream
+        self._raw = bytearray()
+        self._eof = stream is None
         self._buffered: deque[dict[str, Any]] = deque()
 
     def clear_buffered(self) -> None:
         """Discard notifications buffered before the current phase begins."""
         self._buffered.clear()
 
-    async def next_wire(self) -> dict[str, Any] | None:
+    def _pop_raw_object(self) -> dict[str, Any] | None:
+        while True:
+            newline = self._raw.find(b"\n")
+            if newline == -1:
+                if not self._eof or not self._raw:
+                    return None
+                line = bytes(self._raw).decode("utf-8", errors="replace").strip()
+                self._raw.clear()
+            else:
+                line = (
+                    bytes(self._raw[:newline]).decode("utf-8", errors="replace").strip()
+                )
+                del self._raw[: newline + 1]
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                return item
+
+    async def next_wire(self, timeout: float | None = None) -> dict[str, Any] | None:
         """Read the next object directly from the underlying stdout stream."""
-        return await anext(self._iter, None)
+        while True:
+            item = self._pop_raw_object()
+            if item is not None or self._eof:
+                return item
+            assert self._stream is not None
+            if timeout is None:
+                chunk = await self._stream.read(65536)
+            else:
+                chunk = await asyncio.wait_for(
+                    self._stream.read(65536), timeout=timeout
+                )
+            if not chunk:
+                self._eof = True
+            else:
+                self._raw.extend(chunk)
 
     def buffer_notification(self, message: dict[str, Any]) -> None:
         """Queue a notification observed during an RPC so later loops process it."""
@@ -378,4 +416,7 @@ class JsonMessageStream:
     async def __anext__(self) -> dict[str, Any]:
         if self._buffered:
             return self._buffered.popleft()
-        return await self._iter.__anext__()
+        item = await self.next_wire()
+        if item is None:
+            raise StopAsyncIteration
+        return item

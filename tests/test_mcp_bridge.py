@@ -436,3 +436,25 @@ async def test_mcp_bridge_single_cancel_shield_and_malformed_ids():
         finally:
             proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_aexit_cleans_server_and_temp_dir_when_cancelled():
+    bridge = McpToolBridge([])
+    await bridge.__aenter__()
+    temp_dir_path = bridge._auth_file.parent
+    server = bridge._server
+    assert temp_dir_path.is_dir()
+    assert server is not None and server.is_serving()
+
+    async def raise_cancelled() -> None:
+        raise asyncio.CancelledError
+
+    bridge.cancel_in_flight = raise_cancelled  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await bridge.__aexit__(None, None, None)
+
+    assert not server.is_serving()
+    assert not temp_dir_path.exists()
+    assert bridge.port is None
+    assert bridge._auth_file is None

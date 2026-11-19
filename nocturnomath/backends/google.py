@@ -507,6 +507,41 @@ class GoogleBackend:
                 stderr=stderr,
             )
 
+    async def _drain_setup_updates(
+        self,
+        proc: asyncio.subprocess.Process,
+        messages: JsonMessageStream,
+        allowed_tools: set[str] = frozenset(),
+    ) -> set[str] | None:
+        available_commands: set[str] | None = None
+
+        def inspect(msg: dict[str, Any]) -> None:
+            nonlocal available_commands
+            if msg.get("method") != "session/update":
+                return
+            update = (msg.get("params") or {}).get("update") or {}
+            if update.get("sessionUpdate") == "available_commands_update":
+                available_commands = {
+                    str(cmd.get("name"))
+                    for cmd in (update.get("availableCommands") or [])
+                    if isinstance(cmd, dict) and cmd.get("name")
+                }
+
+        while messages._buffered:
+            inspect(messages._buffered.popleft())
+        while True:
+            try:
+                msg = await messages.next_wire(timeout=0.02)
+            except TimeoutError:
+                break
+            if msg is None:
+                break
+            if msg.get("id") is not None and "method" in msg:
+                await self._handle_request(proc, msg, allowed_tools)
+                continue
+            inspect(msg)
+        return available_commands
+
     async def run_turn(
         self,
         prompt: str,
@@ -589,7 +624,7 @@ class GoogleBackend:
                     await self._configure_model(
                         proc, messages, session_id, model, effort, stderr
                     )
-                    messages.clear_buffered()
+                    await self._drain_setup_updates(proc, messages, allowed_tools)
 
                     prompt_req_id = self._next_id()
                     try:
@@ -775,7 +810,11 @@ class GoogleBackend:
                             await self._configure_model(
                                 proc, messages, resume_session_id, model, effort, stderr
                             )
-                        messages.clear_buffered()
+                        commands = await self._drain_setup_updates(proc, messages)
+                        if commands is not None and "compact" not in commands:
+                            raise RuntimeError(
+                                "Antigravity ACP does not support /compact for this session."
+                            )
                         req_id = self._next_id()
                         try:
                             await self._send(

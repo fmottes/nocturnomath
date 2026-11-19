@@ -151,3 +151,21 @@ def test_falsey_provider_toggles_do_not_report_inherited_credentials(monkeypatch
 
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "0")
     assert ProviderAuth("anthropic").public()["note"] is None
+
+
+def test_google_cli_mode_forwards_google_api_key_when_gemini_api_key_is_unset(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-shell-key")
+    auth = ProviderAuth("google", "cli")
+    assert "GOOGLE_API_KEY" in auth.public()["note"]
+    env = auth.process_env()
+    assert env["GEMINI_API_KEY"] == "google-shell-key"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "explicit-gemini-key")
+    assert "GEMINI_API_KEY" in auth.public()["note"]
+    assert auth.process_env()["GEMINI_API_KEY"] == "explicit-gemini-key"
+
+    monkeypatch.delenv("GEMINI_API_KEY")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    assert "GEMINI_API_KEY" not in auth.process_env()

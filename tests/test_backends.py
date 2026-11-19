@@ -1410,3 +1410,105 @@ for line in sys.stdin:
         "window_tokens": None,
         "model": "gemini-4-carbon",
     }
+
+
+@pytest.mark.asyncio
+async def test_google_drains_post_rpc_setup_updates_and_honors_google_api_key(
+    tmp_path, monkeypatch
+):
+    prompts_seen: list[str] = []
+    prompt_log = tmp_path / "prompts.json"
+    fake_agy = _write_fake_cli(
+        tmp_path / "agy_post_rpc",
+        f"""
+import json, os, sys
+log_file = {str(prompt_log)!r}
+seen = []
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"protocolVersion": 1}}}}), flush=True)
+    elif method == "authenticate":
+        if not os.environ.get("GEMINI_API_KEY"):
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "error": {{"code": -32000, "message": "GEMINI_API_KEY is not set"}}}}), flush=True)
+        else:
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+    elif method in ("session/new", "session/resume"):
+        sid = (msg.get("params") or {{}}).get("sessionId") or "agy-s1"
+        cmds = [] if sid == "no-compact" else [{{"name": "compact"}}]
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": sid, "models": {{"availableModels": [{{"modelId": "gemini-4-carbon-low", "name": "Gemini 4 Carbon (Low)"}}]}}}}}}), flush=True)
+        # Real agy writes available_commands_update and usage_update AFTER the RPC response.
+        print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "available_commands_update", "availableCommands": cmds}}}}}}), flush=True)
+        print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "usage_update", "used": 180000, "size": 1000000}}}}}}), flush=True)
+    elif method == "session/set_model":
+        sid = msg["params"]["sessionId"]
+        cmds = [] if sid == "no-compact" else [{{"name": "compact"}}]
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
+        print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "available_commands_update", "availableCommands": cmds}}}}}}), flush=True)
+        print(json.dumps({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": sid, "update": {{"sessionUpdate": "usage_update", "used": 180000, "size": 1000000}}}}}}), flush=True)
+    elif method == "session/prompt":
+        seen.append(msg["params"]["prompt"][0]["text"])
+        open(log_file, "w").write(json.dumps(seen))
+        if msg["params"]["sessionId"] == "unconfirmed":
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn"}}}}), flush=True)
+        else:
+            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn", "usage": {{"inputTokens": 320}}}}}}), flush=True)
+""",
+    )
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-only-key")
+    auth = ProviderAuth("google", "cli")
+    backend = GoogleBackend(cli_path=fake_agy)
+
+    with patch(
+        "nocturnomath.backends.google.agy_cli_candidates", return_value=[fake_agy]
+    ):
+        models = await backend.discover_models(auth)
+        assert [m.id for m in models] == ["gemini-4-carbon"]
+
+    with pytest.raises(RuntimeError, match="does not support /compact"):
+        await backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="low",
+            auth=auth,
+            resume_session_id="no-compact",
+        )
+    assert not prompt_log.exists()
+
+    with pytest.raises(RuntimeError, match="did not confirm that compaction completed"):
+        await backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="low",
+            auth=auth,
+            resume_session_id="unconfirmed",
+        )
+
+    events = [
+        event
+        async for event in backend.run_turn(
+            "hello",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-4-carbon",
+            effort="low",
+            auth=auth,
+            resume_session_id="agy-s1",
+        )
+    ]
+    turn_res = next(event for event in events if isinstance(event, TurnResult))
+    assert turn_res.context_usage == {
+        "used_tokens": 320,
+        "window_tokens": None,
+        "model": "gemini-4-carbon",
+    }
+    del prompts_seen
+    backend._cleanup_api_dir()

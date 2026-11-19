@@ -196,17 +196,22 @@ class McpToolBridge:
             raise
 
     async def __aexit__(self, *args: object) -> None:
-        await self.cancel_in_flight()
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        self.port = None
-        if self._temp_dir is not None:
-            with suppress(Exception):
-                self._temp_dir.cleanup()
-            self._temp_dir = None
-        self._auth_file = None
+        try:
+            await self.cancel_in_flight()
+        finally:
+            try:
+                if self._server is not None:
+                    self._server.close()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await self._server.wait_closed()
+                    self._server = None
+            finally:
+                self.port = None
+                if self._temp_dir is not None:
+                    with suppress(Exception):
+                        self._temp_dir.cleanup()
+                    self._temp_dir = None
+                self._auth_file = None
 
     def stdio_server_config(self) -> dict[str, Any]:
         """Return standard MCP stdio server configuration for CLI subprocesses."""

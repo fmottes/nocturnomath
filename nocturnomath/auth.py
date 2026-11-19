@@ -65,8 +65,8 @@ _INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
     ),
     "google": (
         "GOOGLE_GENAI_USE_VERTEXAI",
-        "GOOGLE_API_KEY",
         "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
     ),
 }
 
@@ -172,6 +172,13 @@ class ProviderAuth:
             elif self.provider == "google":
                 env["GOOGLE_GENAI_USE_VERTEXAI"] = ""
             env.update(self.sdk_env())
+        elif (
+            self.provider == "google"
+            and not env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", env)
+            and not env.get("GEMINI_API_KEY")
+            and env.get("GOOGLE_API_KEY")
+        ):
+            env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
         return env
 
     def public(self) -> dict[str, Any]:
