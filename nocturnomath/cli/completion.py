@@ -1,7 +1,7 @@
 """Complete slash commands and their arguments in the terminal client."""
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 from prompt_toolkit.completion import (
     CompleteEvent,
@@ -20,9 +20,16 @@ logger = logging.getLogger("nocturnomath.cli")
 class CommandCompleter(Completer):
     """Suggest the slash commands, then the arguments each of them accepts."""
 
-    def __init__(self, runtime: Runtime, commands: Iterable[tuple[str, str, str]]):
+    def __init__(
+        self,
+        runtime: Runtime,
+        commands: Iterable[tuple[str, str, str]],
+        *,
+        pending_model: Callable[[], str | None] | None = None,
+    ):
         self.runtime = runtime
         self.commands = list(commands)
+        self._pending_model = pending_model
         self.files = PathCompleter(expanduser=True)
         self.directories = PathCompleter(only_directories=True, expanduser=True)
 
@@ -81,7 +88,7 @@ class CommandCompleter(Completer):
         if name == "/effort":
             if " " in argument.lstrip():
                 return []
-            current = (
+            current = (self._pending_model() if self._pending_model else None) or (
                 self.runtime.session.model
                 if self.runtime.session
                 else self.runtime.model

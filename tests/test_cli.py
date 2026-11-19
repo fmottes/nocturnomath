@@ -862,3 +862,62 @@ async def test_effort_command_lists_and_applies_next_turn_effort(terminal):
     await terminal.run("test with low effort")
     assert terminal.app.pending_effort is None
     assert terminal.session.effort == "low"
+
+
+def test_effort_completion_uses_pending_model_and_build_prompt_session_wires_it(
+    terminal,
+):
+    from nocturnomath.cli.terminal import build_prompt_session
+
+    captured = {}
+
+    def fake_prompt_session(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("nocturnomath.cli.terminal.PromptSession", fake_prompt_session):
+        build_prompt_session(terminal.app)
+
+    completer = captured["completer"]
+    terminal.session.model = "claude-active"
+    terminal.runtime.model_efforts = {
+        "claude-active": ["low"],
+        "gpt-pending": ["medium", "high"],
+    }
+    terminal.app.pending_model = "gpt-pending"
+
+    items = [
+        item.text
+        for item in completer.get_completions(Document("/effort "), CompleteEvent())
+    ]
+    assert items == ["medium", "high"]
+
+    terminal.app.pending_model = None
+    items_active = [
+        item.text
+        for item in completer.get_completions(Document("/effort "), CompleteEvent())
+    ]
+    assert items_active == ["low"]
+
+
+@pytest.mark.asyncio
+async def test_command_compact_handles_interrupt_and_cancelled_error(terminal):
+    entered = asyncio.Event()
+
+    async def slow_compact():
+        entered.set()
+        await asyncio.Event().wait()
+
+    terminal.session.compact = slow_compact
+    compact_run = asyncio.create_task(terminal.run("/compact"))
+    await entered.wait()
+    await terminal.session.interrupt()
+    await compact_run
+    assert "Compaction was cancelled." in terminal.output()
+
+    async def direct_cancel(_agent_id):
+        raise asyncio.CancelledError()
+
+    terminal.runtime.compact_agent = direct_cancel
+    await terminal.run("/compact")
+    assert "Compaction cancelled." in terminal.output()

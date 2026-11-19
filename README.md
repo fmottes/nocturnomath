@@ -115,6 +115,7 @@ Enter sends; Esc then Enter (or Alt+Enter) inserts a newline. Ctrl-C interrupts 
 | `/resume <S001> [--kernel]` | Reopen a chat; optionally replay its probes |
 | `/export [path]` | Export the chat as a Jupyter notebook |
 | `/model [name]` | Show or select a model for the next message |
+| `/effort [level]` | Show or select reasoning effort for the next message |
 | `/auth [status\|<provider> <method>]` | Show or change authentication (`anthropic`, `openai`, `google`) |
 | `/compact` | Compact the current chat context |
 | `/env <python>\|managed` | Switch research environment |
@@ -172,7 +173,7 @@ When a batch probe fails, including when required output files are missing, the 
 
 Automatic review completion is saved separately from the verdict. If review is interrupted after recording a verdict, reopening the workspace resumes the unfinished correction while preserving that verdict. Replacement jobs save their source probe as `correction_of`, so a submitted replacement is monitored rather than submitted again after interruption. Set that field when continuing a correction manually too.
 
-Conversation context is kept within each chat. Select the model and reasoning effort for the next message with the web selectors or `/model` and `/effort` in the terminal; switching providers mid-session keeps the live kernel running and rebuilds conversation context from the scientific record. In the web interface, messages sent while an explorer is working either **steer** before the next probe or **queue** for after the current turn (configured in Settings → Prompt delivery).
+Conversation context is kept within each chat. Select the model and reasoning effort for the next message with the web selectors or `/model` and `/effort` in the terminal; switching providers mid-session keeps the live kernel running and rebuilds conversation context from the scientific record. In the web interface, messages sent while an explorer is working either **steer** before the next probe or **queue** for after the current turn (configured in Settings → Prompts while working).
 
 ## Research environments
 

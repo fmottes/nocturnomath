@@ -652,6 +652,8 @@ class TerminalApp:
     async def _command_compact(self, argument: str) -> bool:
         try:
             await self.runtime.compact_agent(self.runtime.primary_agent_id)
+        except asyncio.CancelledError:
+            self.write("Compaction cancelled.", style="dim")
         except Exception as exc:
             self.error(f"Compaction failed: {exc}")
         return True
@@ -971,7 +973,9 @@ def build_prompt_session(app: TerminalApp) -> PromptSession:
         history=FileHistory(str(history_path)),
         multiline=True,
         key_bindings=bindings,
-        completer=CommandCompleter(app.runtime, COMMANDS),
+        completer=CommandCompleter(
+            app.runtime, COMMANDS, pending_model=lambda: app.pending_model
+        ),
         complete_while_typing=True,
         bottom_toolbar=app.bottom_toolbar,
     )
