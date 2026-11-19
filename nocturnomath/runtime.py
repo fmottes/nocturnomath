@@ -440,6 +440,7 @@ class Runtime:
         model: str | None = None,
         effort: str | None = None,
     ):
+        review_failed = False
         try:
             with slurm.review_lock(session.workspace, probe_id) as claimed:
                 if not claimed or not slurm.needs_review(session.workspace, probe_id):
@@ -482,32 +483,41 @@ class Runtime:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
+            review_failed = True
             logger.exception("Slurm review failed for %s", probe_id)
             await session.emit("error", message=f"Review of {probe_id} failed: {exc}")
         finally:
+            current = asyncio.current_task()
             session._bound_turn = None
             session._slurm_review_probe_id = None
-            if session._current_task is asyncio.current_task():
-                if session._finishing_task is session._current_task:
-                    session._finishing_task = None
+            if session._current_task is current:
                 session._current_task = None
-            if (
-                self._started
-                and not self.changing
-                and session._pending_prompts
-                and session._current_task is None
-            ):
-                agent_id = next(
-                    (
-                        aid
-                        for aid, candidate in self.agents.items()
-                        if candidate is session
-                    ),
-                    None,
-                )
-                session._current_task = asyncio.create_task(
-                    self._drain_pending_queries(session, agent_id)
-                )
+            if session._pending_prompts:
+                if (
+                    self._started
+                    and not review_failed
+                    and not self.changing
+                    and session._current_task is None
+                ):
+                    with self._agents_lock:
+                        agent_id = next(
+                            (
+                                aid
+                                for aid, candidate in self.agents.items()
+                                if candidate is session
+                            ),
+                            None,
+                        )
+                    session._current_task = asyncio.create_task(
+                        self._drain_pending_queries(session, agent_id)
+                    )
+                elif review_failed or not self._started or self.changing:
+                    await session.clear_pending_prompts()
+            need_idle = session._pending_idle_emit or session.status != "idle"
+            if not session._is_busy and session._current_task is None:
+                session._pending_idle_emit = False
+                if need_idle:
+                    await session.emit("status_change", status="idle")
             if key in self._slurm_review_attempts:
                 self._wake_slurm_monitor()
 
@@ -1409,8 +1419,6 @@ class Runtime:
                 session._current_task = None
             session._compaction_reserved = False
             session._is_busy = False
-            if session.status == "compacting":
-                session.status = "idle"
             if (
                 self._started
                 and not self.changing
@@ -1425,6 +1433,12 @@ class Runtime:
                     )
                 else:
                     await session.clear_pending_prompts()
+            if not session._is_busy and session._current_task is None:
+                if session._pending_idle_emit:
+                    session._pending_idle_emit = False
+                    await session.emit("status_change", status="idle")
+                elif session.status == "compacting":
+                    session.status = "idle"
             self._wake_slurm_monitor()
 
     async def set_prompt_mode(self, mode: str) -> str:
@@ -1707,12 +1721,6 @@ class Runtime:
                     if not await self._drain_pending_loop(session, agent_id):
                         failed = True
                         break
-                    if (
-                        not session._pending_prompts
-                        and not session._is_busy
-                        and session.status != "idle"
-                    ):
-                        await session.emit("status_change", status="idle")
         except asyncio.CancelledError:
             if not self._started:
                 failed = True
@@ -1726,22 +1734,29 @@ class Runtime:
                 payload["agent_id"] = agent_id
             await self.emit("error", payload)
         finally:
+            current = asyncio.current_task()
             session._bound_turn = None
             session._pending_user_logs = None
             session._draining_queries = False
-            if not session._is_busy and session.status != "idle":
-                await session.emit("status_change", status="idle")
-            if session._current_task is asyncio.current_task():
-                if session._finishing_task is session._current_task:
-                    session._finishing_task = None
+            if session._current_task is current:
                 session._current_task = None
             if session._pending_prompts:
-                if not failed and not self.changing and session._current_task is None:
+                if (
+                    self._started
+                    and not failed
+                    and not self.changing
+                    and session._current_task is None
+                ):
                     session._current_task = asyncio.create_task(
                         self._drain_pending_queries(session, agent_id)
                     )
                 else:
                     await session.clear_pending_prompts()
+            need_idle = session._pending_idle_emit or session.status != "idle"
+            if not session._is_busy and session._current_task is None:
+                session._pending_idle_emit = False
+                if need_idle:
+                    await session.emit("status_change", status="idle")
 
     async def _run_query(
         self, session: ExplorationSession, text: str, agent_id: str | None

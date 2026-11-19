@@ -1511,7 +1511,7 @@ def test_websocket_interrupt_is_nonblocking_and_second_stop_breaks_shield(
         assert not rt.get_agent(agent_id).has_active_query()
 
 
-def test_agent_snapshot_is_idle_immediately_upon_turn_complete(
+def test_agent_snapshot_is_idle_immediately_upon_idle_status_change(
     tmp_path, backend_model_catalog
 ):
     from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
@@ -1555,14 +1555,16 @@ def test_agent_snapshot_is_idle_immediately_upon_turn_complete(
             {
                 "action": "query",
                 "agent_id": agent_id,
-                "text": "check snapshot on turn_complete",
+                "text": "check snapshot on idle status_change",
                 "model": "claude-test",
                 "provider": "anthropic",
                 "raw_model": "claude-test",
             }
         )
-        while websocket.receive_json()["type"] != "turn_complete":
-            pass
+        while True:
+            evt = websocket.receive_json()
+            if evt["type"] == "status_change" and evt.get("status") == "idle":
+                break
         snap = client.get(f"/api/agents/{agent_id}").json()
         assert snap["is_busy"] is False
         assert snap["status"] == "idle"

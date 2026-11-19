@@ -1832,3 +1832,128 @@ async def test_open_workspace_validation_failure_preserves_explorers_and_concurr
     finally:
         await runtime.drain()
         runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_and_idle_handoff_do_not_clobber_next_turn_or_pending_prompts(
+    session,
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    observed_calls = []
+
+    class TrackingBackend(StubBackend):
+        def __init__(self, provider: str, models: list[ModelSpec]):
+            super().__init__(provider)
+            self._specs = models
+
+        async def discover_models(self, auth):
+            return list(self._specs)
+
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            await asyncio.sleep(0.01)
+            observed_calls.append(
+                (
+                    self.provider,
+                    model,
+                    effort,
+                    prompt.splitlines()[-1],
+                    session._query_task is not None,
+                    session.active_model,
+                )
+            )
+            yield SessionStarted(f"{self.provider}-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    ant = TrackingBackend(
+        "anthropic",
+        [
+            ModelSpec(
+                id="claude-sonnet-5",
+                raw_id="claude-sonnet-5",
+                provider="anthropic",
+                label="Claude",
+                efforts=["high"],
+                is_default=True,
+            )
+        ],
+    )
+    oai = TrackingBackend(
+        "openai",
+        [
+            ModelSpec(
+                id="gpt-5.4",
+                raw_id="gpt-5.4",
+                provider="openai",
+                label="GPT",
+                efforts=["low", "high"],
+                is_default=True,
+            )
+        ],
+    )
+    runtime = Runtime(
+        session,
+        backends={"anthropic": ant, "openai": oai, "google": StubBackend("google")},
+    )
+    runtime.start()
+    try:
+        await runtime.discover_models()
+        triggered_on_complete = False
+        triggered_on_idle = False
+
+        async def listener(event_type, payload):
+            nonlocal triggered_on_complete, triggered_on_idle
+            await asyncio.sleep(0)
+            if event_type == "turn_complete" and not triggered_on_complete:
+                triggered_on_complete = True
+                assert (
+                    runtime.start_query(
+                        "from-turn-complete",
+                        model="gpt-5.4",
+                        provider="openai",
+                        raw_model="gpt-5.4",
+                        effort="low",
+                    )
+                    == "pending"
+                )
+            elif (
+                event_type == "status_change"
+                and payload.get("status") == "idle"
+                and not triggered_on_idle
+            ):
+                triggered_on_idle = True
+                assert (
+                    runtime.start_query(
+                        "from-idle-status",
+                        model="claude-sonnet-5",
+                        provider="anthropic",
+                        raw_model="claude-sonnet-5",
+                        effort="high",
+                    )
+                    == "started"
+                )
+                await asyncio.sleep(0)
+                assert runtime.start_query("queued-during-turn-3") == "pending"
+
+        runtime.subscribe(listener)
+        assert runtime.start_query("initial-turn") == "started"
+        for _ in range(5):
+            await runtime.wait_for_query()
+            await asyncio.sleep(0.02)
+        assert [item[:4] for item in observed_calls] == [
+            ("anthropic", "claude-sonnet-5", "high", "initial-turn"),
+            ("openai", "gpt-5.4", "low", "from-turn-complete"),
+            ("anthropic", "claude-sonnet-5", "high", "from-idle-status"),
+            ("anthropic", "claude-sonnet-5", "high", "queued-during-turn-3"),
+        ]
+        assert all(item[4] is True for item in observed_calls)
+        assert [item[5] for item in observed_calls] == [
+            "claude-sonnet-5",
+            "gpt-5.4",
+            "claude-sonnet-5",
+            "claude-sonnet-5",
+        ]
+    finally:
+        await runtime.drain()
+        runtime.shutdown()

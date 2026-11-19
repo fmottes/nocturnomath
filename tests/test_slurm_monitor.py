@@ -1432,3 +1432,53 @@ async def test_cross_session_slurm_check_does_not_block_resumed_checking_session
     runtime.reset_session()
     session.resume_session("S002")
     assert session._pending_verdict is None
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_finished_slurm_jobs_in_same_session_both_get_reviewed(
+    session, runtime, cluster, monkeypatch
+):
+    probe_1, job_1 = await submit(session)
+    probe_2, job_2 = await submit(session)
+    complete(session, cluster, probe_1, job_1)
+    complete(session, cluster, probe_2, job_2)
+    both_verdicts = asyncio.Event()
+    reviewed_ids = []
+
+    class RealReviewBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            tool_map = {spec.name: spec for spec in tools}
+            checked = await tool_map["check_slurm_job"].handler({"probe_id": target})
+            assert not checked.get("is_error")
+            recorded = await tool_map["verdict"].handler(
+                {"text": f"Reviewed {target} cleanly."}
+            )
+            assert not recorded.get("is_error")
+            reviewed_ids.append(target)
+            if len(reviewed_ids) == 2:
+                both_verdicts.set()
+            yield SessionStarted("ant-slurm")
+            yield TextBlockDone("Done.")
+            yield TurnResult()
+
+    session.backends["anthropic"] = RealReviewBackend()
+    runtime.backends["anthropic"] = RealReviewBackend()
+    monkeypatch.setattr("nocturnomath.runtime.SLURM_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(
+        runtime, "_wake_slurm_monitor", Runtime._wake_slurm_monitor.__get__(runtime)
+    )
+    runtime.start()
+    await asyncio.wait_for(both_verdicts.wait(), timeout=5)
+    for _ in range(10):
+        await finish_reviews(runtime)
+        if not slurm.pending_jobs(session.workspace):
+            break
+        await asyncio.sleep(0.02)
+    assert set(reviewed_ids) == {probe_1, probe_2}
+    assert slurm.has_verdict(session.workspace, probe_1)
+    assert slurm.has_verdict(session.workspace, probe_2)
+    assert slurm.pending_jobs(session.workspace) == []

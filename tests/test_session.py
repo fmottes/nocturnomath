@@ -1382,17 +1382,19 @@ async def test_interrupted_probe_not_resurrected_and_unsolicited_tool_cancel_spa
             yield TurnResult()
 
     attach_backend(session, ClientTimeoutBackend(provider="anthropic"), "anthropic")
-    saw_idle_on_turn_complete = []
+    busy_states = {}
     session.subscribe(
-        lambda kind, _payload: (
-            saw_idle_on_turn_complete.append(session.has_active_query())
+        lambda kind, payload: (
+            busy_states.__setitem__("turn_complete", session.has_active_query())
             if kind == "turn_complete"
+            else busy_states.__setitem__("idle", session.has_active_query())
+            if kind == "status_change" and payload.get("status") == "idle"
             else None
         )
     )
     assert await session.query("run 4m probe") is True
     assert interrupts_called == 0
-    assert saw_idle_on_turn_complete == [False]
+    assert busy_states == {"turn_complete": True, "idle": False}
     assert session._pending_verdict_probe_id == "S001/P003"
     p3_meta = json.loads(
         (

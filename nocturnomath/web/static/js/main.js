@@ -344,7 +344,7 @@ function handleServerEvent(event) {
         if (event.type === "record_changed" && state.activeTab !== "plots") {
           loadDocument(state.activeDoc, "", true);
         }
-        if (event.type === "turn_complete") {
+        if (event.type === "status_change" && event.status === "idle") {
           refreshContextUsage(event.agent_id);
         }
         return;
@@ -458,7 +458,6 @@ function handleServerEvent(event) {
     case "turn_complete":
       finalizeAssistantTurn();
       refreshDocuments();
-      refreshContextUsage(event.agent_id);
       break;
 
     case "status_change": {
@@ -475,6 +474,9 @@ function handleServerEvent(event) {
       }
       updateAgentStatus(event.status);
       renderExplorerTabs();
+      if (event.status === "idle") {
+        refreshContextUsage(event.agent_id);
+      }
       break;
     }
 

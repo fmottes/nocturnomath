@@ -104,7 +104,7 @@ class ExplorationSession:
         self._compaction_reserved = False
         self.status = "idle"
         self._current_task: asyncio.Task | None = None
-        self._finishing_task: asyncio.Task | None = None
+        self._pending_idle_emit = False
         self._query_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_operation_lock = asyncio.Lock()
@@ -195,11 +195,7 @@ class ExplorationSession:
             or self._probe_operation_lock.locked()
             or bool(self._pending_prompts)
             or (self._probe_task is not None and not self._probe_task.done())
-            or (
-                self._current_task is not None
-                and self._current_task is not self._finishing_task
-                and not self._current_task.done()
-            )
+            or (self._current_task is not None and not self._current_task.done())
         )
 
     def require_idle(self, action: str):
@@ -331,6 +327,7 @@ class ExplorationSession:
         self._turn_selection = None
         self._bound_turn = None
         self._pending_user_logs = None
+        self._pending_idle_emit = False
         self.context_usage = None
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
@@ -774,6 +771,7 @@ class ExplorationSession:
         self._turn_selection = None
         self._bound_turn = None
         self._pending_user_logs = None
+        self._pending_idle_emit = False
         self._restore_pending_verdict(records)
         latest_ctx_record = (
             next(
@@ -928,7 +926,10 @@ class ExplorationSession:
             await self.emit("context_usage_changed", context_usage=self.context_usage)
         finally:
             self._is_busy = False
-            await self.emit("status_change", status="idle")
+            if reserved:
+                self._pending_idle_emit = True
+            else:
+                await self.emit("status_change", status="idle")
 
     def _owner_turn_model(
         self, owner_provider: ProviderId
@@ -1032,13 +1033,10 @@ class ExplorationSession:
         turn_auth = bound.auth
         backend = self.backends[provider]
         self._is_busy = True
-        self._finishing_task = None
         self._query_task = asyncio.current_task()
         self._turn_model = turn_catalogue_model
         self._turn_selection = (provider, turn_raw_model, turn_effort)
         turn_epoch = self._interrupt_epoch
-        finishing_done = False
-        finishing_task: asyncio.Task | None = None
         try:
             prior_records = self.workspace.current_records()
             switching_provider = (
@@ -1344,15 +1342,6 @@ class ExplorationSession:
                     self.workspace,
                     self.workspace.session_id,
                 )
-            if not (self._draining_queries and self._pending_prompts):
-                finishing_done = True
-                finishing_task = self._current_task
-                self._finishing_task = finishing_task
-                self._turn_model = None
-                self._turn_selection = None
-                self._query_task = None
-                self._is_busy = False
-                self.status = "idle"
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
@@ -1370,25 +1359,11 @@ class ExplorationSession:
             self._query_task = None
             self._turn_model = None
             self._turn_selection = None
-            if finishing_done and (
-                self._is_busy
-                or self._pending_prompts
-                or (
-                    self._current_task is not None
-                    and self._current_task is not finishing_task
-                )
-            ):
-                if self._finishing_task is finishing_task:
-                    self._finishing_task = None
+            self._is_busy = False
+            if self._draining_queries or self._slurm_review_probe_id is not None:
+                self._pending_idle_emit = True
             else:
-                self._is_busy = False
-                if not (self._draining_queries and self._pending_prompts):
-                    await self.emit("status_change", status="idle")
-                if (
-                    self._finishing_task is finishing_task
-                    and self._current_task is None
-                ):
-                    self._finishing_task = None
+                await self.emit("status_change", status="idle")
 
     def _track_session_id(
         self,
@@ -1477,6 +1452,7 @@ class ExplorationSession:
         self._turn_selection = None
         self._bound_turn = None
         self._pending_user_logs = None
+        self._pending_idle_emit = False
         self.context_usage = None
         self.model = self.default_model
         self.effort = self.default_effort
