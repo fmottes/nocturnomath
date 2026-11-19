@@ -9,7 +9,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It com
 
 ## Quick start
 
-Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to Claude through Claude Code or an API key.
+Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to at least one supported CLI backend (`claude` for Anthropic, `codex` for OpenAI, or `agy` for Google) through a CLI login or API key.
 
 Install the current version directly from GitHub:
 
@@ -51,10 +51,10 @@ Both interfaces accept:
 - `--version`: print the installed Nocturnomath version and exit
 - `--path`, `-p`: starting folder; the terminal opens it immediately
 - `--python`: research Python executable, or `managed`
-- `--default-model`: exact Claude model identifier for new sessions; when omitted, uses the model reported as the SDK default
-- `--default-effort`: reasoning effort for new sessions (`low`, `medium`, `high`, `xhigh`, or `max`); when omitted, Nocturnomath uses `high`
+- `--default-model`: exact model identifier for new sessions (or `provider/id` if disambiguated across providers); when omitted, uses the default reported by the first available backend
+- `--default-effort`: reasoning effort for new sessions (`low`, `medium`, `high`, `xhigh`, `max`, or `ultra`, as supported by the selected model); when omitted, Nocturnomath uses `high`
 - `--timeout`: kernel-run limit in seconds (default: `600`)
-- `--images`: plots returned to Claude per run (default: `2`)
+- `--images`: plots returned to the model per run (default: `2`)
 
 The web app also accepts `--port` (default `8000`), a loopback-only `--host` (default `127.0.0.1`), and `--no-browser`.
 
@@ -77,17 +77,17 @@ The web launcher refuses non-loopback bind addresses.
 
 The web Settings panel can override the model and effort used for each new session in the current workspace. The message composer still controls only the next message.
 
-### Claude authentication
+### Model provider authentication
 
-By default, Nocturnomath uses Claude Code's current authentication. If `claude` works in your terminal, no additional login is needed. Environment settings such as `ANTHROPIC_API_KEY`, cloud-provider configuration, `ANTHROPIC_BASE_URL`, and `apiKeyHelper` continue to follow Claude Code's precedence rules.
+By default, Nocturnomath uses whatever each installed provider CLI (`claude`, `codex`, `agy`) is already signed in with. Models across all signed-in providers appear together in the model selector, grouped under **Anthropic**, **OpenAI**, and **Google**. If `claude`, `codex`, or `agy` works in your terminal, no additional login is needed for that provider.
 
-Use the web app's **Claude** button or the terminal's `/auth` command to choose:
+Use the web app's **Auth** button (or **Settings → Model providers**) or the terminal's `/auth` command to inspect or configure each provider:
 
-- **Claude subscription:** Run `claude setup-token`, then enter the resulting token.
-- **Claude API key:** Enter a key from the [Claude Console](https://platform.claude.com/settings/keys). API usage is billed separately from a subscription.
-- **Claude Code (automatic):** Return to Claude Code's default authentication.
+- **Anthropic (`anthropic`):** **Claude CLI (automatic)**, **Claude subscription** (run `claude setup-token`, then enter the token), or **Anthropic API key**.
+- **OpenAI (`openai`):** **Codex CLI (automatic)** or **OpenAI API key** (runs `codex` with an isolated temporary `CODEX_HOME`).
+- **Google (`google`):** **Antigravity CLI (automatic)** (`agy`) or **Google Gemini API key** (runs `agy` with an isolated temporary `--gemini-dir`).
 
-Manually entered credentials override credential environment variables only for the launched Claude client. They are not written to browser storage, shell history, transcripts, or workspace files, and must be re-entered after restarting. Selecting a method does not validate it or make a billable request; errors appear when you send the next message. Authentication changes do not restart the kernel or conversation.
+Manually entered credentials override environment variables only for the launched provider CLI process. They are kept in memory only, never written to browser storage, shell history, transcripts, `~/.claude*`, `~/.codex/`, `~/.gemini/`, or workspace files, and must be re-entered after restarting. Selecting a method does not validate it or make a billable request; errors appear when you send the next message. Authentication changes do not restart the kernel or conversation.
 
 ### Terminal mode
 
@@ -115,7 +115,9 @@ Enter sends; Esc then Enter (or Alt+Enter) inserts a newline. Ctrl-C interrupts 
 | `/resume <S001> [--kernel]` | Reopen a chat; optionally replay its probes |
 | `/export [path]` | Export the chat as a Jupyter notebook |
 | `/model [name]` | Show or select a model for the next message |
-| `/auth [status\|subscription\|api-key\|claude-code]` | Show or change authentication |
+| `/effort [level]` | Show or select reasoning effort for the next message |
+| `/auth [status\|<provider> <method>]` | Show or change authentication (`anthropic`, `openai`, `google`) |
+| `/compact` | Compact the current chat context |
 | `/env <python>\|managed` | Switch research environment |
 | `/workspace <path>` | Open another workspace |
 | `/docs [name]` | List the documents folder or render one |
@@ -171,13 +173,13 @@ When a batch probe fails, including when required output files are missing, the 
 
 Automatic review completion is saved separately from the verdict. If review is interrupted after recording a verdict, reopening the workspace resumes the unfinished correction while preserving that verdict. Replacement jobs save their source probe as `correction_of`, so a submitted replacement is monitored rather than submitted again after interruption. Set that field when continuing a correction manually too.
 
-Conversation context is kept within each chat. Select the model for the next message with the web model selector or `/model` in the terminal.
+Conversation context is kept within each chat. Select the model and reasoning effort for the next message with the web selectors or `/model` and `/effort` in the terminal; switching providers mid-session keeps the live kernel running and rebuilds conversation context from the scientific record. In the web interface, messages sent while an explorer is working either **steer** before the next probe or **queue** for after the current turn (configured in Settings → Prompts while working).
 
 ## Research environments
 
 Opening a workspace prepares `.nocturnomath/venv`, separate from any project `.venv`, with ipykernel, matplotlib, NumPy, and pandas. Packages persist across sessions; kernel variables do not. The first setup may download packages, while later openings reuse the environment.
 
-Kernels start in the workspace with their home, temporary, cache, configuration, and history locations redirected under `.nocturnomath/runtime/`. Nocturnomath also removes its Claude credentials and SSH-agent access from the kernel environment. This keeps routine library and shell activity local to the workspace, but it is not an operating-system sandbox: code using an explicit absolute path can still access files allowed to your user account.
+Kernels start in the workspace with their home, temporary, cache, configuration, and history locations redirected under `.nocturnomath/runtime/`. Nocturnomath also removes provider API/OAuth credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `CODEX_ACCESS_TOKEN`, `CODEX_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`) and SSH-agent access from the kernel environment. This keeps routine library and shell activity local to the workspace, but it is not an operating-system sandbox: code using an explicit absolute path can still access files allowed to your user account.
 
 Select another Python executable in Settings → Research environment, with `/env /path/to/venv/bin/python`, or through `--python`. A custom environment must already contain ipykernel and matplotlib and is not modified during selection. The choice is saved in `.nocturnomath/config.json`; choose **Use managed environment**, `/env managed`, or `--python managed` to return to the default. Switching environments starts a new session.
 

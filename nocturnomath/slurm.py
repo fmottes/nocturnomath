@@ -134,7 +134,7 @@ def submit(
     probe = workspace.start_probe(
         code,
         expected,
-        session.model,
+        session.active_model,
         backend="slurm",
         environment=session.environment_record,
         python=str(session.environment.python),
@@ -318,8 +318,12 @@ def needs_review(workspace, probe_id):
     if not has_verdict(workspace, probe_id):
         return True
     _, metadata = _probe(workspace, probe_id)
-    return metadata.get("review_pending", False) and not any(
-        job.get("correction_of") == probe_id for job in list_jobs(workspace)
+    return (
+        metadata.get("status") == "error"
+        and metadata.get("review_pending", False)
+        and not any(
+            job.get("correction_of") == probe_id for job in list_jobs(workspace)
+        )
     )
 
 
@@ -327,6 +331,18 @@ def set_review_pending(workspace, probe_id, pending):
     with _locked_workspace(workspace):
         probe, _ = _probe(workspace, probe_id)
         _save_metadata(probe, review_pending=pending)
+
+
+def clear_reviewed_pending(workspace, session_id):
+    """Clear review_pending on verdicted probes of a session after a manual turn."""
+    with _locked_workspace(workspace):
+        for job in list_jobs(workspace):
+            probe_id = job.get("probe_id", "")
+            if not probe_id.startswith(f"{session_id}/"):
+                continue
+            probe, metadata = _probe(workspace, probe_id)
+            if metadata.get("review_pending") and has_verdict(workspace, probe_id):
+                _save_metadata(probe, review_pending=False)
 
 
 @contextmanager

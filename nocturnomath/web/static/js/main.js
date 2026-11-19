@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20261016-3";
+import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261016-3";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261030-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261030-1";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261118-2";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
-import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261016-3";
+import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-2";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -97,28 +97,90 @@ function restoreExplorerView(agent) {
     : (agent.scrollTop || 0);
 }
 
+function renderPendingPrompts(prompts = []) {
+  if (!elements.pendingPrompts) return;
+  elements.pendingPrompts.classList.toggle("hidden", !prompts.length);
+  elements.pendingPrompts.replaceChildren(...prompts.map((item) => {
+    const row = document.createElement("div");
+    row.className = "pending-prompt-item";
+
+    const mode = document.createElement("span");
+    mode.className = "pending-prompt-mode";
+    mode.textContent = item.mode === "queue" ? "Queue" : "Steer";
+
+    const text = document.createElement("span");
+    text.className = "pending-prompt-text";
+    text.textContent = item.text;
+    text.title = item.text;
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn btn-xs btn-ghost pending-prompt-cancel";
+    cancel.textContent = "×";
+    cancel.title = "Cancel pending prompt";
+    cancel.setAttribute("aria-label", "Cancel pending prompt");
+    cancel.addEventListener("click", () => {
+      sendWs("cancel_pending_prompt", { agent_id: state.activeAgentId, prompt_id: item.id });
+    });
+
+    row.append(mode, text, cancel);
+    return row;
+  }));
+}
+
 function applyExplorer(agent, repaint = false) {
   if (!agent?.agent_id) return;
   const prior = state.agents.get(agent.agent_id) || {};
-  state.agents.set(agent.agent_id, { ...prior, ...agent });
+  const merged = {
+    ...prior,
+    ...agent,
+    modelProvider: agent.model !== undefined
+      ? (state.modelProviders[agent.model] || agent.modelProvider || prior.modelProvider || null)
+      : (prior.modelProvider || null),
+  };
+  let resolvedDraft = null;
+  if (merged.draftModel || merged.draftRawModel) {
+    resolvedDraft = resolveCatalogueModel(
+      merged.draftRawModel || merged.draftModel,
+      merged.draftProvider,
+    );
+    if (resolvedDraft) {
+      merged.draftModel = resolvedDraft;
+      merged.draftProvider = state.modelProviders[resolvedDraft] || merged.draftProvider || null;
+      merged.draftRawModel = rawModelId(resolvedDraft, merged.draftProvider);
+    } else {
+      merged.draftModel = null;
+      merged.draftProvider = null;
+      merged.draftRawModel = null;
+      merged.draftEffort = null;
+    }
+  }
+  state.agents.set(agent.agent_id, merged);
   if (agent.agent_id === state.activeAgentId) {
-    setSessionId(agent.session_id);
-    setActiveModelAndEffort(agent.draftModel || agent.model, agent.draftEffort || agent.effort);
-    setContextUsage(agent.context_usage);
-    updateKernelStatus(agent.kernel_alive, agent.kernel_busy);
-    updateAgentStatus(agent.is_busy && (!agent.status || agent.status === "idle")
-      ? "thinking" : (agent.status || "idle"));
+    setSessionId(merged.session_id);
+    setActiveModelAndEffort(
+      resolvedDraft || merged.model,
+      resolvedDraft ? (merged.draftEffort || merged.effort) : merged.effort,
+    );
+    setContextUsage(merged.context_usage);
+    updateKernelStatus(merged.kernel_alive, merged.kernel_busy);
+    updateAgentStatus(merged.is_busy && (!merged.status || merged.status === "idle")
+      ? "thinking" : (merged.status || "idle"));
+    renderPendingPrompts(merged.pending_prompts || []);
     if (agent.documents) refreshDocuments();
     if (repaint) {
-      restoreChat(agent.records || [], agent.kernel_busy);
-      restoreExplorerView(state.agents.get(agent.agent_id));
+      restoreChat(merged.records || [], merged.kernel_busy);
+      restoreExplorerView(merged);
     }
   }
   renderExplorerTabs();
 }
 
+let explorerSelectSeq = 0;
+
 async function selectExplorer(agentId) {
   if (!state.agents.has(agentId) || agentId === state.activeAgentId) return;
+  const seq = ++explorerSelectSeq;
   saveExplorerView();
   state.activeAgentId = agentId;
   const cached = state.agents.get(agentId);
@@ -126,9 +188,10 @@ async function selectExplorer(agentId) {
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
     if (!response.ok) throw new Error("Explorer no longer exists");
-    if (state.activeAgentId === agentId) {
+    const snapshot = await response.json();
+    if (state.activeAgentId === agentId && seq === explorerSelectSeq) {
       saveExplorerView();
-      applyExplorer(await response.json(), true);
+      applyExplorer(snapshot, true);
     }
     loadPlots();
   } catch (error) {
@@ -139,20 +202,36 @@ async function selectExplorer(agentId) {
 function installExplorers(agents = [], preserveView = true) {
   if (preserveView) saveExplorerView();
   const previous = preserveView ? state.agents : new Map();
-  state.agents = new Map(agents.map((agent) => [
-    agent.agent_id,
-    { ...(previous.get(agent.agent_id) || {}), ...agent },
-  ]));
+  state.agents = new Map(agents.map((agent) => {
+    const prior = previous.get(agent.agent_id) || {};
+    return [
+      agent.agent_id,
+      {
+        ...prior,
+        ...agent,
+        modelProvider: agent.model
+          ? (state.modelProviders[agent.model] || prior.modelProvider || null)
+          : null,
+      },
+    ];
+  }));
   if (!state.agents.has(state.activeAgentId)) state.activeAgentId = agents[0]?.agent_id || null;
   if (state.activeAgentId) applyExplorer(state.agents.get(state.activeAgentId), true);
   renderExplorerTabs();
 }
 
 async function refreshContextUsage(agentId) {
+  const seqBefore = state.agents.get(agentId)?.stateSeq || 0;
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
     if (!response.ok) return;
     const agent = await response.json();
+    const current = state.agents.get(agentId);
+    if (current && (current.stateSeq || 0) !== seqBefore) {
+      delete agent.is_busy;
+      delete agent.status;
+      delete agent.kernel_busy;
+    }
     applyExplorer(agent);
   } catch (error) {
     // The next websocket snapshot will reconcile an unavailable local service.
@@ -177,6 +256,10 @@ async function createExplorer() {
 async function closeExplorer(agentId) {
   try {
     const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+    if (response.status === 404 && state.agents.size > 1) {
+      handleServerEvent({ type: "agent_removed", agent_id: agentId });
+      return;
+    }
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Unable to close explorer");
   } catch (error) {
@@ -194,6 +277,7 @@ async function compactExplorer() {
     if (!response.ok) throw new Error(data.detail || "Unable to compact explorer");
     await refreshContextUsage(agentId);
   } catch (error) {
+    await refreshContextUsage(agentId);
     if (state.activeAgentId === agentId) appendErrorMessage(error.message);
   } finally {
     updateCompactButton();
@@ -214,23 +298,57 @@ function handleServerEvent(event) {
     return;
   }
   if (event.agent_id && event.type !== "agent_removed") {
-    const current = state.agents.get(event.agent_id) || { agent_id: event.agent_id };
-    if (event.type === "status_change") {
-      current.is_busy = !["idle", "cancelled"].includes(event.status);
-      current.status = event.status;
-    }
-    if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
-      current.kernel_alive = true;
-      current.kernel_busy = false;
-    }
-    if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
-    state.agents.set(event.agent_id, current);
-    renderExplorerTabs();
-    if (event.agent_id !== state.activeAgentId && event.type !== "agent_focused") {
-      if (event.type === "record_changed" && state.activeTab !== "plots") {
-        loadDocument(state.activeDoc, "", true);
+    const current = state.agents.get(event.agent_id);
+    if (!current) {
+      if (event.type === "error") appendErrorMessage(event.message);
+      else if (event.type === "system_message") appendSystemMessage(event.text);
+      if (!["session_resumed", "session_reset"].includes(event.type)) return;
+    } else {
+      if (event.type === "status_change") {
+        current.is_busy = !["idle", "cancelled"].includes(event.status);
+        current.status = event.status;
+        current.stateSeq = (current.stateSeq || 0) + 1;
       }
-      return;
+      if (event.type === "probe_start" && event.kernel_alive !== undefined && event.backend !== "slurm") {
+        current.kernel_alive = event.kernel_alive;
+        current.kernel_busy = true;
+        if (current.is_busy) current.status = "probing";
+        current.stateSeq = (current.stateSeq || 0) + 1;
+      }
+      if (event.type === "probe_finish" && event.backend !== "slurm" && event.status !== "slurm-error") {
+        current.kernel_busy = false;
+        if (current.is_busy && current.status === "probing") current.status = "thinking";
+        current.stateSeq = (current.stateSeq || 0) + 1;
+      }
+      if (event.type === "kernel_restarted" || event.type === "kernel_interrupted") {
+        current.kernel_alive = true;
+        current.kernel_busy = false;
+        current.stateSeq = (current.stateSeq || 0) + 1;
+      }
+      if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
+      if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
+      if (event.type === "user_message") {
+        if (event.session_id) current.session_id = event.session_id;
+        if (event.model) {
+          current.model = event.model;
+          current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
+        }
+        if (event.effort !== undefined) current.effort = event.effort;
+      }
+      state.agents.set(event.agent_id, current);
+      renderExplorerTabs();
+      if (
+        event.agent_id !== state.activeAgentId
+        && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
+      ) {
+        if (event.type === "record_changed" && state.activeTab !== "plots") {
+          loadDocument(state.activeDoc, "", true);
+        }
+        if (event.type === "status_change" && event.status === "idle") {
+          refreshContextUsage(event.agent_id);
+        }
+        return;
+      }
     }
   }
   switch (event.type) {
@@ -253,28 +371,45 @@ function handleServerEvent(event) {
     case "agent_removed": {
       const removedActive = event.agent_id === state.activeAgentId;
       state.agents.delete(event.agent_id);
-      if (removedActive) state.activeAgentId = state.agents.keys().next().value || null;
-      if (state.activeAgentId) applyExplorer(state.agents.get(state.activeAgentId), true);
+      if (removedActive) {
+        state.activeAgentId = null;
+        const nextId = state.agents.keys().next().value || null;
+        if (nextId) selectExplorer(nextId);
+      }
       renderExplorerTabs();
       break;
     }
 
-    case "auth_changed":
+    case "auth_changed": {
       applyAuthChange(event);
-      appendSystemMessage(`Claude authentication changed to ${event.auth?.label || "the selected method"}.`);
+      const changed = event.provider ? event.auth?.providers?.[event.provider] : null;
+      const summary = changed
+        ? `${changed.title} authentication changed to ${changed.label}.`
+        : `Authentication changed to ${event.auth?.label || "the selected method"}.`;
+      appendSystemMessage(summary);
       break;
+    }
 
-    case "user_message":
-      if (event.session_id && state.agents.has(event.agent_id)) {
-        state.agents.get(event.agent_id).session_id = event.session_id;
+    case "user_message": {
+      const agent = state.agents.get(event.agent_id);
+      if (agent && (event.model !== undefined || event.effort !== undefined) && !agent.draftModel && !agent.draftRawModel) {
+        setActiveModelAndEffort(agent.model, agent.effort);
+      }
+      if (event.session_id && agent) {
+        agent.session_id = event.session_id;
         setSessionId(event.session_id);
         renderExplorerTabs();
       }
       appendUserMessage(event.text);
       break;
+    }
 
     case "probe_start":
       appendProbeStart(event.expected, event.code, event.probe_id, event.backend);
+      if (event.kernel_alive !== undefined && event.backend !== "slurm") {
+        updateKernelStatus(event.kernel_alive, true);
+        if (state.agents.get(event.agent_id)?.is_busy) updateAgentStatus("probing");
+      }
       break;
 
     case "probe_update":
@@ -282,7 +417,14 @@ function handleServerEvent(event) {
       // Preserve the web app's existing probe card contract: `output` includes
       // source paths and any guidance emitted alongside the raw kernel text.
       appendProbeFinish(event.expected, event.code, event.output, event.plot_urls, event.plot_images, event.probe_id, event.status, event.backend);
-      if (event.type === "probe_finish") loadPlots();
+      if (event.type === "probe_finish") {
+        if (event.backend !== "slurm" && event.status !== "slurm-error") {
+          const current = state.agents.get(event.agent_id);
+          updateKernelStatus(current?.kernel_alive ?? true, false);
+          if (current?.is_busy) updateAgentStatus(current.status || "thinking");
+        }
+        loadPlots();
+      }
       break;
 
     case "record_changed":
@@ -316,14 +458,27 @@ function handleServerEvent(event) {
     case "turn_complete":
       finalizeAssistantTurn();
       refreshDocuments();
-      refreshContextUsage(event.agent_id);
       break;
 
-    case "status_change":
-      state.agents.get(event.agent_id).is_busy = !["idle", "cancelled"].includes(event.status);
+    case "status_change": {
+      const agent = state.agents.get(event.agent_id);
+      if (agent) {
+        agent.is_busy = !["idle", "cancelled"].includes(event.status);
+        if (
+          ["cancelled", "idle"].includes(event.status) &&
+          !agent.draftModel &&
+          !agent.draftRawModel
+        ) {
+          setActiveModelAndEffort(agent.model, agent.effort);
+        }
+      }
       updateAgentStatus(event.status);
       renderExplorerTabs();
+      if (event.status === "idle") {
+        refreshContextUsage(event.agent_id);
+      }
       break;
+    }
 
     case "kernel_restarted":
       appendSystemMessage("Kernel restarted. In-memory variables and state cleared.");
@@ -340,22 +495,43 @@ function handleServerEvent(event) {
       break;
 
     case "context_compacted":
-      appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
+      appendSystemMessage(
+        event.record_reloaded === false
+          ? "This Explorer's conversation was compacted. The latest scientific record will be attached on the next message."
+          : "This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing."
+      );
       break;
 
-    case "session_reset":
-      if (state.agents.has(event.agent_id)) {
-        state.agents.get(event.agent_id).context_usage = null;
-        state.agents.get(event.agent_id).session_id = event.session_id;
-        state.agents.get(event.agent_id).can_compact = false;
+    case "session_reset": {
+      const targetId = event.agent_id || state.activeAgentId;
+      if (state.agents.has(targetId)) {
+        Object.assign(state.agents.get(targetId), {
+          context_usage: null,
+          session_id: event.session_id ?? null,
+          records: [],
+          can_compact: false,
+          pending_prompts: [],
+          model: event.model,
+          modelProvider: state.modelProviders[event.model] || null,
+          effort: event.effort,
+          draftModel: null,
+          draftProvider: null,
+          draftRawModel: null,
+          draftEffort: null,
+        });
       }
-      setContextUsage(null);
-      setSessionId(event.session_id);
       renderExplorerTabs();
-      setActiveModelAndEffort(event.model, event.effort);
-      clearChat();
-      updateKernelStatus(true, false);
+      if (!event.agent_id || event.agent_id === state.activeAgentId) {
+        renderPendingPrompts([]);
+        setContextUsage(null);
+        setSessionId(event.session_id ?? null);
+        setActiveModelAndEffort(event.model, event.effort);
+        clearChat();
+        updateKernelStatus(true, false);
+        updateCompactButton();
+      }
       break;
+    }
 
     case "session_defaults_changed":
       setSessionDefaults(event.session_defaults);
@@ -365,23 +541,51 @@ function handleServerEvent(event) {
       setExplorationPrompt(event.exploration_prompt, event.exploration_prompt_is_custom);
       break;
 
-    case "session_resumed":
+    case "prompt_mode_changed":
+      setPromptMode(event.prompt_mode);
+      break;
+
+    case "pending_prompts_changed":
+      renderPendingPrompts(event.pending_prompts || []);
+      break;
+
+    case "session_resumed": {
+      ++explorerSelectSeq;
+      const resumedId = event.session_id || event.id || null;
       if (state.agents.has(event.agent_id)) {
         Object.assign(state.agents.get(event.agent_id), {
-          draftText: "", scrollTop: 0, followChat: true,
+          session_id: resumedId,
+          can_compact: event.can_compact ?? Boolean(event.context_restored),
+          draftText: "",
+          scrollTop: 0,
+          followChat: true,
+          draftModel: null,
+          draftProvider: null,
+          draftRawModel: null,
+          draftEffort: null,
         });
       }
-      applyExplorer(event);
-      restoreExplorerView(state.agents.get(event.agent_id));
-      setSessionId(event.id);
-      replaySession(
-        event.records || [],
-        event.context_restored,
-        event.kernel_reset,
-        event.kernel_restored,
-        event.probes_replayed
-      );
+      applyExplorer({
+        is_busy: false,
+        status: "idle",
+        kernel_busy: false,
+        ...event,
+        session_id: resumedId,
+        can_compact: event.can_compact ?? Boolean(event.context_restored),
+      });
+      if (!event.agent_id || event.agent_id === state.activeAgentId) {
+        restoreExplorerView(state.agents.get(event.agent_id));
+        setSessionId(resumedId);
+        replaySession(
+          event.records || [],
+          event.context_restored,
+          event.kernel_reset,
+          event.kernel_restored,
+          event.probes_replayed
+        );
+      }
       break;
+    }
 
     case "system_message":
       appendSystemMessage(event.text);
@@ -401,6 +605,7 @@ function handleServerEvent(event) {
 // ============================================================================
 function setupEventListeners() {
   window.addEventListener("nocturnomath:focus-explorer", (event) => selectExplorer(event.detail));
+  window.addEventListener("nocturnomath:workspace-opened", (event) => installExplorers(event.detail?.agents || [], false));
   elements.chatMessages.addEventListener("scroll", () => {
     const log = elements.chatMessages;
     state.followChat = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
@@ -414,6 +619,13 @@ function setupEventListeners() {
   elements.btnCompact.addEventListener("click", compactExplorer);
   [elements.btnAuth, elements.btnAuthLanding, elements.btnAuthSettings].forEach((button) => {
     button.addEventListener("click", openAuthModal);
+  });
+  elements.authProvider.addEventListener("change", () => {
+    elements.authCredential.value = "";
+    elements.authError.textContent = "";
+    elements.authError.classList.add("hidden");
+    populateAuthMethods(elements.authProvider.value);
+    updateAuthForm();
   });
   elements.authMethod.addEventListener("change", updateAuthForm);
   elements.authModalClose.addEventListener("click", closeAuthModal);
@@ -462,18 +674,32 @@ function setupEventListeners() {
     e.preventDefault();
     const text = elements.promptInput.value.trim();
     if (!text) return;
-    if (!elements.modelSelect.value) return;
+    const selectedModel = elements.modelSelect.value;
+    if (!selectedModel) return;
+    const selectedProvider = state.modelProviders[selectedModel] || null;
 
-    sendWs("query", {
+    const sent = sendWs("query", {
       agent_id: state.activeAgentId,
       text,
-      model: elements.modelSelect.value,
+      model: selectedModel,
+      provider: selectedProvider,
+      raw_model: rawModelId(selectedModel, selectedProvider),
       effort: elements.effortSelect.value || null,
     });
+    if (!sent) {
+      appendErrorMessage("WebSocket is reconnecting; your message was kept in the input box.");
+      return;
+    }
     elements.promptInput.value = "";
     elements.promptInput.style.height = "44px";
     const agent = state.agents.get(state.activeAgentId);
-    if (agent) agent.draftText = "";
+    if (agent) {
+      agent.draftText = "";
+      agent.draftModel = null;
+      agent.draftProvider = null;
+      agent.draftRawModel = null;
+      agent.draftEffort = null;
+    }
   });
 
   // Prompt Enter / Shift+Enter handling
@@ -491,18 +717,21 @@ function setupEventListeners() {
     const agent = state.agents.get(state.activeAgentId);
     if (agent) agent.draftText = elements.promptInput.value;
   });
+  const recordModelDraft = () => {
+    const agent = state.agents.get(state.activeAgentId);
+    if (!agent) return;
+    const selected = elements.modelSelect.value;
+    const provider = state.modelProviders[selected] || null;
+    agent.draftModel = selected;
+    agent.draftProvider = provider;
+    agent.draftRawModel = rawModelId(selected, provider);
+    agent.draftEffort = elements.effortSelect.value || null;
+  };
   elements.modelSelect.addEventListener("change", () => {
     setEffortForModel(elements.effortSelect, elements.modelSelect.value);
-    const agent = state.agents.get(state.activeAgentId);
-    if (agent) {
-      agent.draftModel = elements.modelSelect.value;
-      agent.draftEffort = elements.effortSelect.value || null;
-    }
+    recordModelDraft();
   });
-  elements.effortSelect.addEventListener("change", () => {
-    const agent = state.agents.get(state.activeAgentId);
-    if (agent) agent.draftEffort = elements.effortSelect.value || null;
-  });
+  elements.effortSelect.addEventListener("change", recordModelDraft);
   elements.defaultModelSelect.addEventListener("change", () => {
     setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value);
   });
@@ -512,6 +741,9 @@ function setupEventListeners() {
     saveExplorationPrompt(elements.explorationPromptInput.value);
   });
   elements.explorationPromptReset.addEventListener("click", () => saveExplorationPrompt(null));
+  if (elements.promptModeSelect) {
+    elements.promptModeSelect.addEventListener("change", () => savePromptMode(elements.promptModeSelect.value));
+  }
 
   // Figures session filter
   elements.plotsFilterBtn.addEventListener("click", () => togglePlotsFilterMenu());
@@ -681,6 +913,9 @@ function applyAuthChange(data) {
     data.model,
     data.model_efforts || {},
     data.effort,
+    data.model_providers || {},
+    data.agent_models || null,
+    data.model_raw_ids || {},
   );
   if (data.session_defaults) setSessionDefaults(data.session_defaults);
   refreshSendButton();
@@ -691,11 +926,15 @@ async function saveSessionDefaults(event) {
   elements.sessionDefaultsSave.disabled = true;
   elements.sessionDefaultsStatus.textContent = "Saving…";
   try {
+    const selectedModel = elements.defaultModelSelect.value;
+    const selectedProvider = state.modelProviders[selectedModel] || null;
     const response = await fetch("/api/session/defaults", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: elements.defaultModelSelect.value,
+        model: selectedModel,
+        provider: selectedProvider,
+        raw_model: rawModelId(selectedModel, selectedProvider),
         effort: elements.defaultEffortSelect.value || null,
       }),
     });
@@ -732,8 +971,93 @@ async function saveExplorationPrompt(prompt) {
   }
 }
 
+async function savePromptMode(mode) {
+  const previous = state.promptMode;
+  elements.promptModeSelect.disabled = true;
+  elements.promptModeStatus.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/settings/prompt-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Unable to save prompt mode");
+    setPromptMode(data.prompt_mode);
+    elements.promptModeStatus.textContent = "Saved for this workspace.";
+  } catch (error) {
+    setPromptMode(previous);
+    elements.promptModeStatus.textContent = error.message;
+  } finally {
+    elements.promptModeSelect.disabled = false;
+  }
+}
+
+const AUTH_PROVIDER_METHODS = {
+  anthropic: [
+    {
+      value: "cli",
+      label: "Claude CLI (automatic)",
+      help: "Use whatever Claude Code is already signed in with on this machine.",
+    },
+    {
+      value: "subscription",
+      label: "Claude subscription",
+      credentialLabel: "Subscription token",
+      placeholder: "Token from claude setup-token",
+      help: "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.",
+    },
+    {
+      value: "api_key",
+      label: "Anthropic API key",
+      credentialLabel: "API key",
+      placeholder: "sk-ant-api…",
+      help: "Create a key in the Anthropic Console. API usage is billed separately from a subscription.",
+    },
+  ],
+  openai: [
+    {
+      value: "cli",
+      label: "Codex CLI (automatic)",
+      help: "Use whatever Codex CLI is already signed in with on this machine.",
+    },
+    {
+      value: "api_key",
+      label: "OpenAI API key",
+      credentialLabel: "API key",
+      placeholder: "sk-…",
+      help: "Create an OpenAI API key. It overrides environment keys only for the Codex CLI launched by Nocturnomath.",
+    },
+  ],
+  google: [
+    {
+      value: "cli",
+      label: "Antigravity CLI (automatic)",
+      help: "Use whatever Antigravity (`agy`) is already signed in with on this machine.",
+    },
+    {
+      value: "api_key",
+      label: "Google Gemini API key",
+      credentialLabel: "Gemini API key",
+      placeholder: "AIza…",
+      help: "Create a Gemini API key in Google AI Studio. It runs in an isolated Antigravity state directory while keeping your local login untouched.",
+    },
+  ],
+};
+
+function populateAuthMethods(provider) {
+  const methods = AUTH_PROVIDER_METHODS[provider] || AUTH_PROVIDER_METHODS.anthropic;
+  elements.authMethod.replaceChildren(...methods.map((item) => new Option(item.label, item.value)));
+  const currentMethod = state.auth?.providers?.[provider]?.method || "cli";
+  elements.authMethod.value = methods.some((item) => item.value === currentMethod)
+    ? currentMethod
+    : methods[0].value;
+}
+
 function openAuthModal() {
-  elements.authMethod.value = state.auth?.method || "claude_code";
+  const provider = state.modelProviders[elements.modelSelect.value] || "anthropic";
+  elements.authProvider.value = AUTH_PROVIDER_METHODS[provider] ? provider : "anthropic";
+  populateAuthMethods(elements.authProvider.value);
   elements.authCredential.value = "";
   elements.authError.textContent = "";
   elements.authError.classList.add("hidden");
@@ -748,20 +1072,25 @@ function closeAuthModal() {
 }
 
 function updateAuthForm() {
-  const method = elements.authMethod.value;
-  elements.authCredentialGroup.classList.toggle("hidden", method === "claude_code");
-  elements.authCredential.required = method !== "claude_code";
-  if (method === "subscription") {
-    elements.authCredentialLabel.textContent = "Subscription token";
-    elements.authCredential.placeholder = "Token from claude setup-token";
-    elements.authHelp.textContent = "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.";
-  } else if (method === "api_key") {
-    elements.authCredentialLabel.textContent = "API key";
-    elements.authCredential.placeholder = "sk-ant-api…";
-    elements.authHelp.textContent = "Create a key in the Claude Console. API usage is billed separately from a subscription.";
-  } else {
-    elements.authHelp.textContent = "Use whatever Claude Code is already signed in with, exactly as the Agent SDK would on its own.";
+  const provider = elements.authProvider.value || "anthropic";
+  const method = elements.authMethod.value || "cli";
+  const methods = AUTH_PROVIDER_METHODS[provider] || AUTH_PROVIDER_METHODS.anthropic;
+  const spec = methods.find((item) => item.value === method) || methods[0];
+  const needsSecret = method !== "cli";
+  elements.authCredentialGroup.classList.toggle("hidden", !needsSecret);
+  elements.authCredential.required = needsSecret;
+  if (needsSecret) {
+    elements.authCredentialLabel.textContent = spec.credentialLabel || "Credential";
+    elements.authCredential.placeholder = spec.placeholder || "";
   }
+  elements.authHelp.textContent = spec.help || "";
+  const providerInfo = state.auth?.providers?.[provider];
+  elements.authCurrent.textContent = providerInfo
+    ? `Current (${providerInfo.title}): ${providerInfo.label}`
+    : "";
+  const noteText = providerInfo?.note || "";
+  elements.authNote.textContent = noteText;
+  elements.authNote.classList.toggle("hidden", !noteText);
 }
 
 async function submitAuth(event) {
@@ -769,9 +1098,10 @@ async function submitAuth(event) {
   elements.authSubmit.disabled = true;
   elements.authSubmit.textContent = "Applying…";
   elements.authError.classList.add("hidden");
-  const method = elements.authMethod.value;
-  const body = { method };
-  if (method !== "claude_code") body.credential = elements.authCredential.value;
+  const provider = elements.authProvider.value || "anthropic";
+  const method = elements.authMethod.value || "cli";
+  const body = { provider, method };
+  if (method !== "cli") body.credential = elements.authCredential.value;
   try {
     const response = await fetch("/api/auth", {
       method: "POST",
@@ -779,7 +1109,7 @@ async function submitAuth(event) {
       body: JSON.stringify(body),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to authenticate with Claude");
+    if (!response.ok) throw new Error(data.detail || "Unable to update authentication");
     applyAuthChange(data);
     elements.authCredential.value = "";
     elements.authModal.classList.add("hidden");

@@ -134,6 +134,8 @@ EVENT_PAYLOAD = {
         "path": "/tmp/workspace",
         "environment": {"python": "/tmp/venv/bin/python", "version": "3.12"},
     },
+    "name": "summary.md",
+    "action": "created",
 }
 
 EVENT_TYPES = [
@@ -159,10 +161,17 @@ EVENT_TYPES = [
     "workspace_updated",
     "context_compacted",
     "context_usage_changed",
+    "pending_prompts_changed",
+    "document_saved",
 ]
 
 
-SILENT_EVENTS = ["assistant_delta", "status_change", "turn_complete"]
+SILENT_EVENTS = [
+    "assistant_delta",
+    "status_change",
+    "turn_complete",
+    "pending_prompts_changed",
+]
 
 
 @pytest.mark.parametrize(
@@ -339,8 +348,11 @@ async def test_model_needs_a_catalogue_and_applies_to_the_next_message(terminal)
 
     terminal.runtime.models = ["sonnet"]
     terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
+    terminal.runtime.model_providers = {"sonnet": "anthropic"}
     await terminal.run("/model")
-    assert "claude-sonnet-5" in terminal.output()
+    model_list_output = terminal.output()
+    assert "claude-sonnet-5" in model_list_output
+    assert "[Anthropic]" in model_list_output
 
     await terminal.run("/model haiku")
     assert "Choose a model from the catalogue" in terminal.output()
@@ -373,34 +385,56 @@ async def test_auth_command_reads_secrets_outside_command_history(terminal):
     terminal.app.credential_reader = lambda prompt: prompts.append(prompt) or "secret"
 
     async def discover_models():
-        terminal.runtime.models = ["sonnet"]
-        terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
+        terminal.runtime.models = ["sonnet", "gpt-6"]
+        terminal.runtime.model_labels = {
+            "sonnet": "claude-sonnet-5",
+            "gpt-6": "gpt-6",
+        }
+        terminal.runtime.model_providers = {
+            "sonnet": "anthropic",
+            "gpt-6": "openai",
+        }
         return True
 
     terminal.runtime.discover_models = discover_models
     terminal.session._sdk_session_id = "resumed-session"
     terminal.app.pending_model = "sonnet"
 
-    await terminal.run("/auth subscription")
+    await terminal.run("/auth anthropic subscription")
     output = terminal.output()
-    assert terminal.runtime.auth.method == "subscription"
-    assert terminal.runtime.auth.credential == "secret"
+    assert terminal.runtime.auth.get("anthropic").method == "subscription"
+    assert terminal.runtime.auth.get("anthropic").credential == "secret"
     assert terminal.session._sdk_session_id == "resumed-session"
     assert terminal.app.pending_model == "sonnet"
     assert prompts and "setup-token" in prompts[0]
     assert "secret" not in output
-    assert "Selected Claude subscription" in output
+    assert "Selected Anthropic: Claude subscription." in output
     assert "checked on your next message" in output
 
+    terminal.app.credential_reader = lambda prompt: (
+        prompts.append(prompt) or "openai-secret"
+    )
+    await terminal.run("/auth openai api-key")
+    openai_output = terminal.output()
+    assert terminal.runtime.auth.get("openai").method == "api_key"
+    assert terminal.runtime.auth.get("openai").credential == "openai-secret"
+    assert "openai-secret" not in openai_output
+    assert "Selected OpenAI: OpenAI API key." in openai_output
+
     await terminal.run("/auth status")
-    assert "Claude subscription" in terminal.output()
+    status_output = terminal.output()
+    assert "Claude subscription" in status_output
+    assert "OpenAI API key" in status_output
 
     terminal.app.credential_reader = lambda prompt: pytest.fail(
-        "Claude Code login must not prompt for a secret"
+        "CLI login must not prompt for a secret"
     )
-    await terminal.run("/auth claude-code")
-    assert terminal.runtime.auth.method == "claude_code"
-    assert "Claude Code (automatic)" in terminal.output()
+    await terminal.run("/auth anthropic cli")
+    assert terminal.runtime.auth.get("anthropic").method == "cli"
+    assert "Claude CLI (automatic)" in terminal.output()
+
+    await terminal.run("/auth google subscription")
+    assert "Use /auth google <cli|api-key>." in terminal.output()
 
 
 @pytest.mark.asyncio
@@ -410,10 +444,10 @@ async def test_auth_prompt_can_be_abandoned_with_eof(terminal):
 
     terminal.app.credential_reader = abandon
     terminal.runtime.discover_models = lambda: pytest.fail("must not re-authenticate")
-    previous = terminal.runtime.auth
+    previous = terminal.runtime.auth.get("google")
 
-    assert await terminal.run("/auth api-key") is True
-    assert terminal.runtime.auth is previous
+    assert await terminal.run("/auth google api-key") is True
+    assert terminal.runtime.auth.get("google") is previous
     assert "Authentication unchanged" in terminal.output()
 
 
@@ -440,9 +474,14 @@ async def test_manual_compaction_uses_shared_runtime_and_renders_notice(terminal
     terminal.session.compact = compact
     await terminal.run("/compact")
     output = terminal.output()
-    assert "Claude compacted this chat" in output
+    assert (
+        "Chat context compacted. The current scientific record was reloaded." in output
+    )
     assert "Context: 2%" in output
     assert "[context_compacted]" not in output
+
+    await terminal.session.emit("context_compacted", record_reloaded=False)
+    assert "will be attached on the next message." in terminal.output()
 
     terminal.session._is_busy = True
     await terminal.run("/compact")
@@ -600,8 +639,12 @@ def test_bottom_toolbar_reports_the_live_state(terminal):
     resting = terminal.app.bottom_toolbar()
     assert "kernel ready" in resting
     assert f"model {terminal.session.model}" in resting
+    assert "auth cli" in resting
     assert "chat new" in resting
     assert resting.endswith("idle")
+
+    terminal.runtime.auth.set("openai", "api_key", "openai-secret")
+    assert "auth openai:api_key" in terminal.app.bottom_toolbar()
 
     terminal.session.activate_session()
     terminal.app.pending_model = "sonnet"
@@ -646,14 +689,30 @@ def test_completer_suggests_command_arguments(completer, terminal):
     assert complete(completer, "/context") == []
     assert [text for text, _ in complete(completer, "/auth ")] == [
         "status",
+        "anthropic",
+        "openai",
+        "google",
+    ]
+    assert [text for text, _ in complete(completer, "/auth anthropic ")] == [
+        "cli",
         "subscription",
         "api-key",
-        "claude-code",
+    ]
+    assert [text for text, _ in complete(completer, "/auth openai ")] == [
+        "cli",
+        "api-key",
+    ]
+    assert [text for text, _ in complete(completer, "/auth google ")] == [
+        "cli",
+        "api-key",
     ]
 
     terminal.runtime.models = ["sonnet", "opus"]
     terminal.runtime.model_labels = {"sonnet": "claude-sonnet-5"}
-    assert complete(completer, "/model son") == [("sonnet", "claude-sonnet-5")]
+    terminal.runtime.model_providers = {"sonnet": "anthropic"}
+    assert complete(completer, "/model son") == [
+        ("sonnet", "Anthropic · claude-sonnet-5")
+    ]
 
     terminal.session.log_transcript("user", text="how large is the effect?")
     resumable = dict(complete(completer, "/resume "))
@@ -684,3 +743,201 @@ def test_completer_suggests_paths_for_env_and_workspace(completer, terminal):
     completions = list(completer.get_completions(document, CompleteEvent()))
     assert [completion.text for completion in completions] == [" spaces"]
     assert completions[0].display_text.startswith("workspace with spaces")
+
+
+@pytest.mark.asyncio
+async def test_auth_drops_pending_model_when_catalogue_becomes_empty(terminal):
+    async def empty_discovery():
+        terminal.runtime.models = []
+        terminal.runtime.model = None
+        terminal.session.model = None
+
+    terminal.runtime.discover_models = empty_discovery
+    terminal.app.pending_model = "sonnet"
+
+    await terminal.run("/auth openai cli")
+    output = terminal.output()
+    assert terminal.app.pending_model is None
+    assert "Dropped pending model sonnet" in output
+
+
+@pytest.mark.asyncio
+async def test_pending_model_stays_bound_to_provider_across_auth_refresh(terminal):
+    from nocturnomath.backends import ModelSpec
+
+    def shared(provider):
+        return ModelSpec(
+            id="shared",
+            raw_id="shared",
+            provider=provider,
+            label="shared",
+            efforts=["high"],
+            is_default=True,
+        )
+
+    class CollidingBackend:
+        def __init__(self, provider, responses):
+            self.provider = provider
+            self.uses_compact_hook = provider == "anthropic"
+            self.responses = list(responses)
+
+        async def discover_models(self, auth):
+            return (
+                self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+            )
+
+        async def discover_models_staged(self, auth):
+            return await self.discover_models(auth), lambda: None
+
+    terminal.runtime.backends = {
+        "anthropic": CollidingBackend(
+            "anthropic", [[], [shared("anthropic")], [shared("anthropic")]]
+        ),
+        "openai": CollidingBackend(
+            "openai", [[shared("openai")], [shared("openai")], []]
+        ),
+        "google": CollidingBackend("google", [[]]),
+    }
+    await terminal.runtime.discover_models()
+    assert terminal.runtime.models == ["shared"]
+    await terminal.run("/model shared")
+    assert terminal.app.pending_model == "shared"
+    assert terminal.app.pending_model_provider == "openai"
+
+    terminal.app.credential_reader = lambda _prompt: "sk-ant-token"
+    await terminal.run("/auth anthropic subscription")
+    assert terminal.runtime.models == ["shared", "openai/shared"]
+    assert terminal.app.pending_model == "openai/shared"
+    assert terminal.app.pending_model_provider == "openai"
+
+    await terminal.run("/auth openai cli")
+    assert terminal.app.pending_model is None
+    assert "Dropped pending model openai/shared" in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_prompts_while_busy_are_scheduled_with_configured_mode(terminal):
+    terminal.session._is_busy = True
+
+    await terminal.run("steer me")
+    assert "Scheduled (steer, before next probe)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("steer me", "steer")]
+
+    terminal.session.set_prompt_mode("queue")
+    await terminal.run("queue me")
+    assert "Scheduled (queue, after current turn)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("steer me", "steer"), ("queue me", "queue")]
+
+
+@pytest.mark.asyncio
+async def test_prompts_during_compaction_are_labelled_queue(terminal):
+    terminal.session.set_prompt_mode("steer")
+    terminal.session._is_busy = True
+    terminal.session.status = "compacting"
+
+    await terminal.run("wait for compaction")
+    assert "Scheduled (queue, after current turn)." in terminal.output()
+    assert [
+        (item["text"], item["mode"])
+        for item in terminal.session.pending_prompts_snapshot()
+    ] == [("wait for compaction", "queue")]
+
+
+@pytest.mark.asyncio
+async def test_effort_command_lists_and_applies_next_turn_effort(terminal):
+    terminal.runtime.model_efforts[terminal.session.model] = ["low", "medium", "high"]
+    await terminal.run("/effort")
+    assert "effort:" in terminal.output()
+
+    await terminal.run("/effort low")
+    assert terminal.app.pending_effort == "low"
+    assert "Using effort low from the next message." in terminal.output()
+
+    await terminal.run("test with low effort")
+    assert terminal.app.pending_effort is None
+    assert terminal.session.effort == "low"
+
+
+def test_effort_completion_uses_pending_model_and_build_prompt_session_wires_it(
+    terminal,
+):
+    from nocturnomath.cli.terminal import build_prompt_session
+
+    captured = {}
+
+    def fake_prompt_session(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    with patch("nocturnomath.cli.terminal.PromptSession", fake_prompt_session):
+        build_prompt_session(terminal.app)
+
+    completer = captured["completer"]
+    terminal.session.model = "claude-active"
+    terminal.runtime.model_efforts = {
+        "claude-active": ["low"],
+        "gpt-pending": ["medium", "high"],
+    }
+    terminal.app.pending_model = "gpt-pending"
+
+    items = [
+        item.text
+        for item in completer.get_completions(Document("/effort "), CompleteEvent())
+    ]
+    assert items == ["medium", "high"]
+
+    terminal.app.pending_model = None
+    items_active = [
+        item.text
+        for item in completer.get_completions(Document("/effort "), CompleteEvent())
+    ]
+    assert items_active == ["low"]
+
+
+@pytest.mark.asyncio
+async def test_command_compact_handles_interrupt_and_cancelled_error(terminal):
+    entered = asyncio.Event()
+
+    async def slow_compact():
+        entered.set()
+        await asyncio.Event().wait()
+
+    terminal.session.compact = slow_compact
+    compact_run = asyncio.create_task(terminal.run("/compact"))
+    await entered.wait()
+    await terminal.session.interrupt()
+    await compact_run
+    assert "Compaction was cancelled." in terminal.output()
+
+    async def direct_cancel(_agent_id):
+        raise asyncio.CancelledError()
+
+    terminal.runtime.compact_agent = direct_cancel
+    await terminal.run("/compact")
+    assert "Compaction cancelled." in terminal.output()
+
+
+@pytest.mark.asyncio
+async def test_resume_command_reclaims_session_opened_by_background_batch_review(
+    terminal,
+):
+    terminal.session.log_transcript("user", text="batch work")
+    await terminal.run("/new")
+    bg_id = terminal.runtime.create_agent(
+        terminal.session.workspace_path, session_id="S001"
+    )
+    assert len(terminal.runtime.agents) == 2
+    assert terminal.runtime.find_agent_for_session("S001") == bg_id
+
+    terminal.output()
+    await terminal.run("/resume S001")
+    out = terminal.output()
+    assert "S001: Resumed this chat." in out
+    assert len(terminal.runtime.agents) == 1
+    assert terminal.session.workspace.session_id == "S001"

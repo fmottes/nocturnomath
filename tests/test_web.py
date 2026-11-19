@@ -10,58 +10,105 @@ from conftest import FakeEnvironment, FakeKernel
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from nocturnomath.prompt import DEFAULT_EXPLORATION_PROMPT, RUNTIME_PROMPT
+from nocturnomath.backends import ModelSpec
+from nocturnomath.prompt import (
+    DEFAULT_EXPLORATION_PROMPT,
+    RUNTIME_PROMPT,
+    build_system_prompt,
+)
 from nocturnomath.session import ExplorationSession
 from nocturnomath.web import create_app
 
 
+class FakeWebBackend:
+    def __init__(self, provider, models=None, error=None):
+        self.provider = provider
+        self.uses_compact_hook = provider == "anthropic"
+        self.models = list(models or [])
+        self.error = error
+        self.auth_seen = []
+        self.turn_calls = 0
+
+    async def discover_models(self, auth):
+        self.auth_seen.append(auth)
+        if self.error is not None:
+            raise self.error
+        return list(self.models)
+
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
+
+    async def run_turn(self, *args, **kwargs):
+        self.turn_calls += 1
+        if False:
+            yield None
+
+    async def compact(self, *args, **kwargs):
+        return None
+
+
 @pytest.fixture(autouse=True)
-def sdk_model_catalog():
+def backend_model_catalog():
+    backends = {
+        "anthropic": FakeWebBackend(
+            "anthropic",
+            models=[
+                ModelSpec(
+                    id="claude-opus-5",
+                    raw_id="claude-opus-5",
+                    provider="anthropic",
+                    label="claude-opus-5",
+                    efforts=["low", "medium", "high", "xhigh", "max"],
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="claude-sonnet-5",
+                    efforts=["low", "medium", "high", "xhigh"],
+                ),
+            ],
+        ),
+        "openai": FakeWebBackend(
+            "openai",
+            models=[
+                ModelSpec(
+                    id="gpt-6",
+                    raw_id="gpt-6",
+                    provider="openai",
+                    label="gpt-6",
+                    efforts=["low", "medium", "high", "ultra"],
+                    is_default=True,
+                )
+            ],
+        ),
+        "google": FakeWebBackend("google", models=[]),
+    }
     with (
         patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
-        patch("nocturnomath.runtime.ClaudeSDKClient") as sdk,
+        patch("nocturnomath.session.default_backends", return_value=backends),
+        patch("nocturnomath.runtime.default_backends", return_value=backends),
     ):
-        sdk.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-            return_value={
-                "models": [
-                    {
-                        "value": "default",
-                        "displayName": "Default (recommended)",
-                        "resolvedModel": "claude-opus-5",
-                        "supportedEffortLevels": [
-                            "low",
-                            "medium",
-                            "high",
-                            "xhigh",
-                            "max",
-                        ],
-                    },
-                    {
-                        "value": "sonnet",
-                        "displayName": "Sonnet",
-                        "resolvedModel": "claude-sonnet-5",
-                        "supportedEffortLevels": [
-                            "low",
-                            "medium",
-                            "high",
-                            "xhigh",
-                        ],
-                    },
-                ]
-            }
-        )
-        yield sdk
+        yield backends
 
 
-def test_startup_discovers_models_without_querying(sdk_model_catalog):
+def test_startup_discovers_models_without_querying(backend_model_catalog):
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
-        assert snapshot["models"] == ["claude-opus-5", "claude-sonnet-5"]
+        assert snapshot["models"] == ["claude-opus-5", "claude-sonnet-5", "gpt-6"]
         assert snapshot["model_labels"]["claude-sonnet-5"] == "claude-sonnet-5"
+        assert snapshot["model_providers"] == {
+            "claude-opus-5": "anthropic",
+            "claude-sonnet-5": "anthropic",
+            "gpt-6": "openai",
+        }
         assert snapshot["model"] == "claude-opus-5"
         assert snapshot["effort"] == "high"
         assert snapshot["model_efforts"]["claude-opus-5"][-1] == "max"
-        sdk_model_catalog.return_value.__aenter__.return_value.query.assert_not_called()
+        assert all(
+            backend.turn_calls == 0 for backend in backend_model_catalog.values()
+        )
 
 
 def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
@@ -121,15 +168,25 @@ def test_batch_monitor_publishes_the_original_probe_result_and_verdict(
         assert sum(record["kind"] == "user" for record in records) == 1
 
 
-def test_startup_uses_first_model_when_sdk_has_no_resolved_default(sdk_model_catalog):
-    sdk_model_catalog.return_value.__aenter__.return_value.get_server_info = AsyncMock(
-        return_value={
-            "models": [
-                {"value": "sonnet", "resolvedModel": "claude-sonnet-5"},
-                {"value": "opus", "resolvedModel": "claude-opus-5"},
-            ]
-        }
-    )
+def test_startup_uses_first_model_when_backend_has_no_explicit_default(
+    backend_model_catalog,
+):
+    backend_model_catalog["anthropic"].models = [
+        ModelSpec(
+            id="claude-sonnet-5",
+            raw_id="claude-sonnet-5",
+            provider="anthropic",
+            label="claude-sonnet-5",
+        ),
+        ModelSpec(
+            id="claude-opus-5",
+            raw_id="claude-opus-5",
+            provider="anthropic",
+            label="claude-opus-5",
+        ),
+    ]
+    backend_model_catalog["openai"].models = []
+    backend_model_catalog["google"].models = []
 
     with TestClient(create_app()) as client:
         snapshot = client.get("/api/workspace").json()
@@ -148,7 +205,7 @@ def test_startup_opens_the_dashboard_in_a_new_tab():
 
 
 def test_authentication_can_be_changed_before_opening_a_workspace(
-    sdk_model_catalog,
+    backend_model_catalog,
 ):
     with (
         TestClient(create_app()) as client,
@@ -157,43 +214,97 @@ def test_authentication_can_be_changed_before_opening_a_workspace(
         websocket.receive_json()
         response = client.post(
             "/api/auth",
-            json={"method": "subscription", "credential": "oauth-secret"},
+            json={
+                "provider": "anthropic",
+                "method": "subscription",
+                "credential": "oauth-secret",
+            },
         )
         event = websocket.receive_json()
 
         assert response.status_code == 200
-        assert response.json()["auth"]["method"] == "subscription"
-        assert response.json()["models"] == [
+        payload = response.json()
+        assert payload["auth"]["providers"]["anthropic"]["method"] == "subscription"
+        assert payload["models"] == [
             "claude-opus-5",
             "claude-sonnet-5",
+            "gpt-6",
         ]
-        assert response.json()["model"] == "claude-opus-5"
+        assert payload["model"] == "claude-opus-5"
         assert "oauth-secret" not in response.text
         assert event["type"] == "auth_changed"
-        assert event["auth"]["method"] == "subscription"
+        assert event["provider"] == "anthropic"
+        assert event["auth"]["providers"]["anthropic"]["method"] == "subscription"
         assert "oauth-secret" not in repr(event)
 
-        options = sdk_model_catalog.call_args.args[0]
-        assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
-        assert options.env["ANTHROPIC_API_KEY"] == ""
+        seen_env = backend_model_catalog["anthropic"].auth_seen[-1].sdk_env()
+        assert seen_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
+        assert seen_env["ANTHROPIC_API_KEY"] == ""
+
+        openai_response = client.post(
+            "/api/auth",
+            json={
+                "provider": "openai",
+                "method": "api_key",
+                "credential": "openai-secret",
+            },
+        )
+        openai_event = websocket.receive_json()
+        assert openai_response.status_code == 200
+        assert (
+            openai_response.json()["auth"]["providers"]["openai"]["method"] == "api_key"
+        )
+        assert "openai-secret" not in openai_response.text
+        assert openai_event["provider"] == "openai"
+        assert "openai-secret" not in repr(openai_event)
+        assert (
+            backend_model_catalog["openai"].auth_seen[-1].sdk_env()["OPENAI_API_KEY"]
+            == "openai-secret"
+        )
 
 
 def test_authentication_rejects_missing_secrets_and_foreign_origins():
     with TestClient(create_app()) as client:
-        missing = client.post("/api/auth", json={"method": "api_key"})
+        missing = client.post(
+            "/api/auth", json={"provider": "openai", "method": "api_key"}
+        )
         assert missing.status_code == 400
         assert "API key" in missing.json()["detail"]
 
+        disallowed = client.post(
+            "/api/auth",
+            json={
+                "provider": "google",
+                "method": "subscription",
+                "credential": "secret",
+            },
+        )
+        assert disallowed.status_code == 400
+        assert "secret" not in disallowed.text
+
         foreign = client.post(
             "/api/auth",
-            json={"method": "api_key", "credential": "secret"},
+            json={
+                "provider": "anthropic",
+                "method": "api_key",
+                "credential": "secret",
+            },
             headers={"Origin": "https://elsewhere.example"},
         )
         assert foreign.status_code == 403
 
         for body in (
-            {"method": "secret-invalid-method", "credential": "secret"},
-            {"method": "api_key", "credential": {"key": "secret"}},
+            {
+                "provider": "anthropic",
+                "method": "secret-invalid-method",
+                "credential": "secret",
+            },
+            {"provider": "invalid", "method": "cli", "credential": "secret"},
+            {
+                "provider": "openai",
+                "method": "api_key",
+                "credential": {"key": "secret"},
+            },
         ):
             invalid = client.post("/api/auth", json=body)
             assert invalid.status_code == 422
@@ -206,6 +317,9 @@ def test_authentication_ui_is_served_without_embedding_credentials():
         page = client.get("/").text
         assert 'id="btn-auth-landing"' in page
         assert 'id="auth-modal"' in page
+        assert 'id="auth-provider"' in page
+        assert 'value="openai"' in page
+        assert 'value="google"' in page
         assert 'type="password"' in page
         external_scripts = re.findall(
             r'<script\b[^>]*src="https://[^>]+></script>', page
@@ -215,14 +329,14 @@ def test_authentication_ui_is_served_without_embedding_credentials():
         assert all('crossorigin="anonymous"' in tag for tag in external_scripts)
 
 
-def test_model_discovery_failure_has_no_fallback(sdk_model_catalog):
-    sdk_model_catalog.return_value.__aenter__.side_effect = RuntimeError(
-        "SDK unavailable"
-    )
+def test_model_discovery_failure_has_no_fallback(backend_model_catalog):
+    for backend in backend_model_catalog.values():
+        backend.error = RuntimeError("CLI unavailable")
     with TestClient(create_app(model="custom-model")) as client:
         snapshot = client.get("/api/workspace").json()
         assert snapshot["models"] == []
         assert snapshot["model"] is None
+        assert snapshot["model_providers"] == {}
 
 
 NoopKernel = FakeKernel
@@ -506,15 +620,26 @@ def test_history_replaces_the_selected_idle_explorer(session):
         with patch("nocturnomath.session.Kernel", FakeKernel):
             return ExplorationSession(**kwargs)
 
-    with TestClient(create_app(session, session_factory=factory)) as client:
+    with (
+        TestClient(create_app(session, session_factory=factory)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
         agent_id = client.get("/api/workspace").json()["agents"][0]["agent_id"]
         response = client.post(
             f"/api/agents/{agent_id}/resume",
             json={"id": "S001", "restore_kernel": False},
         )
+        resumed_evt = websocket.receive_json()
     assert response.status_code == 200
-    assert response.json()["agent_id"] == agent_id
-    assert response.json()["session_id"] == "S001"
+    body = response.json()
+    assert body["agent_id"] == agent_id
+    assert body["session_id"] == "S001"
+    assert body["is_busy"] is False
+    assert body["status"] == "idle"
+    assert resumed_evt["type"] == "session_resumed"
+    assert resumed_evt["is_busy"] is False
+    assert resumed_evt["status"] == "idle"
 
 
 def test_resume_session_can_restore_kernel(session):
@@ -596,7 +721,7 @@ def test_scientific_prompt_is_saved_per_project_and_runtime_rules_stay_fixed(
             "exploration_prompt": "Check the signal.",
             "exploration_prompt_is_custom": True,
         }
-        assert session._client_options().system_prompt == (
+        assert build_system_prompt(session.exploration_prompt) == (
             "Check the signal.\n\n" + RUNTIME_PROMPT.strip() + "\n"
         )
         assert (
@@ -691,7 +816,11 @@ def test_busy_http_mutations_return_conflict(session):
         assert (
             client.post(
                 "/api/auth",
-                json={"method": "api_key", "credential": "secret"},
+                json={
+                    "provider": "anthropic",
+                    "method": "api_key",
+                    "credential": "secret",
+                },
             ).status_code
             == 409
         )
@@ -846,3 +975,608 @@ def test_documents_api_handles_nested_paths_and_empty_folders(session):
         outside = "/api/documents/..%2Fkb%2Fevidence.md"
         assert client.get(outside).status_code in (400, 404)
         assert client.put(outside, json={"text": "unsafe"}).status_code in (400, 404)
+
+
+def test_prompt_mode_setting_and_websocket_queue_steer_controls(session):
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    seen_queries = []
+
+    async def fake_query(text):
+        seen_queries.append(text)
+        if len(seen_queries) == 1:
+            entered_first.set()
+            await asyncio.to_thread(release_first.wait, 5)
+        await session.emit("assistant_text", text=f"reply:{text}")
+        await session.emit("turn_complete", full_text=f"reply:{text}")
+
+    session.query = fake_query
+
+    def recv_until(ws, predicate):
+        seen_events = []
+        while True:
+            event = ws.receive_json()
+            seen_events.append(event)
+            if predicate(event):
+                return event, seen_events
+
+    with (
+        TestClient(create_app(session)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        init = websocket.receive_json()
+        assert init["workspace"]["prompt_mode"] == "steer"
+        assert client.get("/api/workspace").json()["prompt_mode"] == "steer"
+        assert (
+            client.put(
+                "/api/settings/prompt-mode", json={"mode": "invalid"}
+            ).status_code
+            == 400
+        )
+
+        agent_id = init["workspace"]["agents"][0]["agent_id"]
+        websocket.send_json({"action": "query", "agent_id": agent_id, "text": "first"})
+        first_user = websocket.receive_json()
+        assert (first_user["type"], first_user["text"]) == ("user_message", "first")
+        assert entered_first.wait(timeout=5)
+
+        websocket.send_json(
+            {"action": "query", "agent_id": agent_id, "text": "steer-then-cancel"}
+        )
+        pending_evt, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert pending_evt["pending_prompts"] == [
+            {
+                "id": pending_evt["pending_prompts"][0]["id"],
+                "text": "steer-then-cancel",
+                "mode": "steer",
+            }
+        ]
+        first_id = pending_evt["pending_prompts"][0]["id"]
+
+        updated = client.put("/api/settings/prompt-mode", json={"mode": "queue"})
+        assert updated.status_code == 200
+        assert updated.json() == {"prompt_mode": "queue"}
+        assert session.workspace.read_config()["prompt_mode"] == "queue"
+
+        observed = []
+        while not (
+            any(e["type"] == "prompt_mode_changed" for e in observed)
+            and any(e["type"] == "pending_prompts_changed" for e in observed)
+        ):
+            observed.append(websocket.receive_json())
+        mode_evt = next(e for e in observed if e["type"] == "prompt_mode_changed")
+        assert mode_evt["prompt_mode"] == "queue"
+        updated_pending = next(
+            e for e in observed if e["type"] == "pending_prompts_changed"
+        )
+        assert updated_pending["pending_prompts"][0]["mode"] == "queue"
+
+        websocket.send_json(
+            {"action": "query", "agent_id": agent_id, "text": "keep-queued"}
+        )
+        two_pending, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert [item["text"] for item in two_pending["pending_prompts"]] == [
+            "steer-then-cancel",
+            "keep-queued",
+        ]
+
+        websocket.send_json(
+            {
+                "action": "cancel_pending_prompt",
+                "agent_id": agent_id,
+                "prompt_id": first_id,
+            }
+        )
+        after_cancel, _ = recv_until(
+            websocket, lambda e: e["type"] == "pending_prompts_changed"
+        )
+        assert [item["text"] for item in after_cancel["pending_prompts"]] == [
+            "keep-queued"
+        ]
+
+        release_first.set()
+        _, tail = recv_until(
+            websocket,
+            lambda e: (
+                e["type"] == "turn_complete"
+                and e.get("full_text") == "reply:keep-queued"
+            ),
+        )
+        user_messages = [e["text"] for e in tail if e["type"] == "user_message"]
+        assert user_messages == ["keep-queued"]
+        assert seen_queries == ["first", "keep-queued"]
+
+
+def test_websocket_query_and_defaults_keep_provider_when_catalogue_collides(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    shared_openai = ModelSpec(
+        id="shared",
+        raw_id="shared",
+        provider="openai",
+        label="shared",
+        efforts=["low", "high"],
+        is_default=True,
+    )
+    shared_anthropic = ModelSpec(
+        id="shared",
+        raw_id="shared",
+        provider="anthropic",
+        label="shared",
+        efforts=["low", "high"],
+    )
+
+    class RecordingBackend(FakeWebBackend):
+        def __init__(self, provider, models=None):
+            super().__init__(provider, models=models)
+            self.calls = []
+
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            self.turn_calls += 1
+            self.calls.append((prompt, model, effort))
+            yield SessionStarted(f"{self.provider}-1")
+            yield TextBlockDone(f"{self.provider}:{model}")
+            yield TurnResult()
+
+    anthropic = RecordingBackend("anthropic", models=[])
+    openai = RecordingBackend("openai", models=[shared_openai])
+    backend_model_catalog["anthropic"] = anthropic
+    backend_model_catalog["openai"] = openai
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        init = websocket.receive_json()
+        assert init["workspace"]["is_open"] is False
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        ws_updated = websocket.receive_json()
+        assert ws_updated["type"] == "workspace_updated"
+        assert ws_updated["workspace"]["models"] == ["shared"]
+        assert ws_updated["workspace"]["model_providers"] == {"shared": "openai"}
+        agent_id = ws_updated["workspace"]["agents"][0]["agent_id"]
+
+        # Publish a colliding "shared" from Anthropic so OpenAI's moves to "openai/shared".
+        anthropic.models = [shared_anthropic]
+        assert (
+            client.post(
+                "/api/auth", json={"provider": "anthropic", "method": "cli"}
+            ).status_code
+            == 200
+        )
+        auth_evt = websocket.receive_json()
+        assert auth_evt["type"] == "auth_changed"
+        assert auth_evt["models"] == ["shared", "openai/shared"]
+        assert auth_evt["model_providers"] == {
+            "shared": "anthropic",
+            "openai/shared": "openai",
+        }
+
+        # Submit a stale-catalogue payload targeting OpenAI's "shared": must go to OpenAI.
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "hello openai",
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            }
+        )
+        while True:
+            event = websocket.receive_json()
+            assert event["type"] != "error", event
+            if event["type"] == "turn_complete":
+                break
+        assert anthropic.turn_calls == 0
+        assert len(openai.calls) == 1
+        assert openai.calls[0][1:] == ("shared", "high")
+        assert client.app.state.runtime.get_agent(agent_id).model == "openai/shared"
+
+        # Session defaults with the same stale OpenAI payload also resolve to "openai/shared".
+        defaults_res = client.post(
+            "/api/session/defaults",
+            json={
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            },
+        )
+        assert defaults_res.status_code == 200
+        assert defaults_res.json()["session_defaults"] == {
+            "model": "openai/shared",
+            "effort": "high",
+        }
+        assert workspace.joinpath(".nocturnomath/config.json").exists()
+        assert client.app.state.runtime.get_agent(agent_id).default_provider == "openai"
+
+        # Drain idle status before testing removed provider rejection.
+        while client.app.state.runtime.get_agent(agent_id).has_active_query():
+            pass
+
+        # If OpenAI drops "shared", the stale OpenAI payload must error instead of hitting Anthropic.
+        openai.models = []
+        assert (
+            client.post(
+                "/api/auth", json={"provider": "openai", "method": "cli"}
+            ).status_code
+            == 200
+        )
+        while websocket.receive_json()["type"] != "auth_changed":
+            pass
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "should be rejected",
+                "model": "shared",
+                "provider": "openai",
+                "raw_model": "shared",
+                "effort": "high",
+            }
+        )
+        err = websocket.receive_json()
+        while err["type"] != "error":
+            err = websocket.receive_json()
+        assert "Choose a model from the model selector." in err["message"]
+        assert anthropic.turn_calls == 0
+
+
+def test_prefixed_raw_model_ids_and_session_reset_resume_payloads(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_raw"
+    workspace.mkdir()
+    oss_spec = ModelSpec(
+        id="openai/gpt-oss-120b",
+        raw_id="openai/gpt-oss-120b",
+        provider="openai",
+        label="GPT-OSS 120B",
+        efforts=["low", "high"],
+        is_default=True,
+    )
+
+    class PrefixedOpenAI(FakeWebBackend):
+        async def run_turn(self, prompt, *, model, effort, **kwargs):
+            self.turn_calls += 1
+            assert model == "openai/gpt-oss-120b"
+            yield SessionStarted("oai-oss-1")
+            yield TextBlockDone("oss-ok")
+            yield TurnResult()
+
+    backend_model_catalog["anthropic"] = FakeWebBackend("anthropic", models=[])
+    backend_model_catalog["openai"] = PrefixedOpenAI("openai", models=[oss_spec])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        ws_res = client.post("/api/workspace", json={"path": str(workspace)})
+        assert ws_res.status_code == 200
+        snap = ws_res.json()["workspace"]
+        assert snap["session_id"] is None
+        assert snap["model_raw_ids"] == {"openai/gpt-oss-120b": "openai/gpt-oss-120b"}
+        assert client.get("/api/auth").json()["model_raw_ids"] == {
+            "openai/gpt-oss-120b": "openai/gpt-oss-120b"
+        }
+        ws_evt = websocket.receive_json()
+        agent_id = ws_evt["workspace"]["agents"][0]["agent_id"]
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "create S001",
+                "model": "openai/gpt-oss-120b",
+                "provider": "openai",
+                "raw_model": "openai/gpt-oss-120b",
+                "effort": "high",
+            }
+        )
+        while websocket.receive_json()["type"] != "turn_complete":
+            pass
+        while client.app.state.runtime.get_agent(agent_id).has_active_query():
+            pass
+
+        reset_res = client.post("/api/session/new")
+        assert reset_res.status_code == 200
+        reset_evt = websocket.receive_json()
+        while reset_evt["type"] != "session_reset":
+            reset_evt = websocket.receive_json()
+        assert reset_evt["agent_id"] == agent_id
+        assert reset_evt["session_id"] is None
+
+        resume_res = client.post("/api/session/resume", json={"id": "S001"})
+        assert resume_res.status_code == 200
+        body = resume_res.json()
+        assert body["session_id"] == "S001"
+        assert body["can_compact"] is True
+        assert body["agent_id"] == agent_id
+        assert body["status"] == "idle"
+        assert body["is_busy"] is False
+        assert body["model"] == "openai/gpt-oss-120b"
+        assert body["effort"] == "high"
+
+
+def test_kernel_restart_conflicts_while_primary_agent_changing_and_user_message_carries_model(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_state"
+    workspace.mkdir()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        efforts=["low", "medium"],
+        is_default=True,
+    )
+
+    class SimpleBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    backend_model_catalog["anthropic"] = SimpleBackend("anthropic", models=[spec])
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        rt = client.app.state.runtime
+
+        rt._changing_agents.add(rt.primary_agent_id)
+        try:
+            res = client.post("/api/kernel/restart")
+            assert res.status_code == 409
+        finally:
+            rt._changing_agents.discard(rt.primary_agent_id)
+
+        with patch.object(
+            rt,
+            "transition_agent",
+            AsyncMock(side_effect=RuntimeError("already changing")),
+        ):
+            res2 = client.post("/api/kernel/restart")
+            assert res2.status_code == 409
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": rt.primary_agent_id,
+                "text": "hello",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+                "effort": "medium",
+            }
+        )
+        seen = None
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "user_message":
+                seen = evt
+                break
+        assert seen is not None
+        assert seen["model"] == "claude-test"
+        assert seen["effort"] == "medium"
+        while websocket.receive_json()["type"] != "turn_complete":
+            pass
+        while rt.get_agent(rt.primary_agent_id).has_active_query():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_web_runtime_broadcast_handles_set_mutation(session):
+    from nocturnomath.runtime import Runtime
+    from nocturnomath.web.runtime import WebRuntime
+
+    core = Runtime(session)
+    web_rt = WebRuntime(core)
+    delivered = []
+
+    class MutatingSocket:
+        def __init__(self, name, remove_other=None):
+            self.name = name
+            self.remove_other = remove_other
+
+        async def send_json(self, message):
+            delivered.append((self.name, message["type"]))
+            if self.remove_other is not None:
+                web_rt.websockets.discard(self.remove_other)
+
+    other = MutatingSocket("other")
+    first = MutatingSocket("first", remove_other=other)
+    web_rt.websockets.update({first, other})
+
+    await web_rt.broadcast("ping", {"value": 1})
+    assert ("first", "ping") in delivered
+
+
+def test_websocket_interrupt_is_nonblocking_and_second_stop_breaks_shield(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TurnResult
+
+    workspace = tmp_path / "ws_ws_int"
+    workspace.mkdir()
+    entered = threading.Event()
+    unwinding = threading.Event()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        is_default=True,
+    )
+
+    class ShieldedCancelBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            entered.set()
+            blocker = asyncio.create_task(asyncio.sleep(30))
+            try:
+                yield SessionStarted("ant-shield")
+                await asyncio.Event().wait()
+                yield TurnResult()
+            except asyncio.CancelledError:
+                unwinding.set()
+                await asyncio.shield(blocker)
+                raise
+            finally:
+                if not blocker.done():
+                    blocker.cancel()
+                    try:
+                        await blocker
+                    except asyncio.CancelledError:
+                        pass
+
+    backend_model_catalog["anthropic"] = ShieldedCancelBackend(
+        "anthropic", models=[spec]
+    )
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        rt = client.app.state.runtime
+        agent_id = rt.primary_agent_id
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "hang in shielded unwind",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+            }
+        )
+        assert entered.wait(timeout=5)
+
+        # First Stop enters unwinding inside asyncio.shield(blocker); WS loop must stay responsive.
+        websocket.send_json({"action": "interrupt", "agent_id": agent_id})
+        assert unwinding.wait(timeout=5)
+
+        websocket.send_json({"action": "query", "agent_id": agent_id, "text": "/notes"})
+        notes_evt = None
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "system_message":
+                notes_evt = evt
+                break
+        assert notes_evt is not None
+
+        # Second Stop breaks out of the shielded unwind cleanly.
+        websocket.send_json({"action": "interrupt", "agent_id": agent_id})
+        cancelled_seen = False
+        idle_seen = False
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "status_change" and evt["status"] == "cancelled":
+                cancelled_seen = True
+            if evt["type"] == "status_change" and evt["status"] == "idle":
+                idle_seen = True
+                break
+        assert cancelled_seen and idle_seen
+        assert not rt.get_agent(agent_id).has_active_query()
+
+
+def test_agent_snapshot_is_idle_immediately_upon_idle_status_change(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_turn_idle"
+    workspace.mkdir()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        is_default=True,
+    )
+
+    class SimpleTurnBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-turn")
+            yield TextBlockDone("Done.")
+            yield TurnResult(
+                context_usage={"used_tokens": 120, "window_tokens": 200000}
+            )
+
+    backend_model_catalog["anthropic"] = SimpleTurnBackend("anthropic", models=[spec])
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        agent_id = client.app.state.runtime.primary_agent_id
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "check snapshot on idle status_change",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+            }
+        )
+        while True:
+            evt = websocket.receive_json()
+            if evt["type"] == "status_change" and evt.get("status") == "idle":
+                break
+        snap = client.get(f"/api/agents/{agent_id}").json()
+        assert snap["is_busy"] is False
+        assert snap["status"] == "idle"
+        assert snap["can_compact"] is True

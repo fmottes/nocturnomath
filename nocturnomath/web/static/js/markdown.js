@@ -6,8 +6,16 @@ const ALLOWED_TAGS = new Set([
 
 function safeUrl(value, image = false) {
   const source = value.trim();
-  if (!source || source.startsWith("#") || source.startsWith("/") || source.startsWith("./") || source.startsWith("../")) {
-    return source;
+  if (!source) return source;
+  if (source.startsWith("//") || source.startsWith("\\\\")) return null;
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(source.replace(/[\u0000-\u0020]+/g, ""));
+  if (!hasScheme) {
+    try {
+      const resolved = new URL(source, "https://workspace.invalid/");
+      return resolved.origin === "https://workspace.invalid" ? source : null;
+    } catch (error) {
+      return null;
+    }
   }
   try {
     const protocol = new URL(source).protocol;
@@ -66,10 +74,11 @@ function escapeHtml(text) {
 function protectMath(markdown) {
   const formulas = [];
   const protectedText = markdown.replace(
-    /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\n])+?(?<!\s)\$/g,
-    (formula) => {
+    /(?:^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*(?:\n|$)|(`+)(?!`)(?:(?!\2)[\s\S])*?\2(?!`))|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\\\n])+?(?<!\s)\$/gm,
+    (match, fence, ticks) => {
+      if (fence !== undefined || ticks !== undefined) return match;
       const token = `NocturnomathMathToken${formulas.length}End`;
-      formulas.push(formula);
+      formulas.push(match);
       return token;
     },
   );

@@ -1,4 +1,4 @@
-import { state } from "./state.js?v=20261016-3";
+import { state } from "./state.js?v=20261117-2";
 
 export function initWebSocket(onMessage, onOpen, onClose) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -26,7 +26,8 @@ export function initWebSocket(onMessage, onOpen, onClose) {
 export function sendWs(action, payload = {}) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({ action, ...payload }));
-  } else {
-    console.warn("WebSocket is not connected");
+    return true;
   }
+  console.warn("WebSocket is not connected");
+  return false;
 }

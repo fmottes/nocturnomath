@@ -7,16 +7,21 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from conftest import FakeEnvironment, FakeKernel
 
 from nocturnomath import slurm
+from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
 from nocturnomath.runtime import Runtime
 from nocturnomath.session import ExplorationSession
 
 
 def tools(session):
     return {tool.name: tool for tool in session.tools}
+
+
+class _StagedDiscoveryMixin:
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
 
 
 @pytest.fixture(autouse=True)
@@ -552,28 +557,24 @@ async def test_declared_plot_must_arrive_before_review(
 
 @pytest.mark.asyncio
 async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_probe(
-    session, runtime, cluster, monkeypatch
+    session, runtime, cluster
 ):
     probe_id, job_id = await submit(session, ["plot-1.png"])
-    session._sdk_session_id = "original-conversation"
+    session._track_session_id("original-conversation", "anthropic")
     probe = complete(session, cluster, probe_id, job_id)
     (probe / "plot-1.png").write_bytes(b"saved plot")
-    options_used = []
+    resumes = []
 
-    class ReviewClient:
-        def __init__(self, options):
-            options_used.append(options)
+    class ReviewBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
+        async def run_turn(self, prompt, *, resume_session_id=None, **kwargs):
+            resumes.append(resume_session_id)
             assert probe_id in prompt
-
-        async def receive_response(self):
             result = await tools(session)["check_slurm_job"].handler(
                 {"probe_id": probe_id}
             )
@@ -582,12 +583,16 @@ async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_pr
             await tools(session)["verdict"].handler(
                 {"text": "It printed 42 as predicted."}
             )
-            yield AssistantMessage(content=[TextBlock("Reviewed.")], model="test")
+            yield TextBlockDone("Reviewed.")
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", ReviewClient)
+        async def compact(self, **kwargs):
+            return None
+
+    session.backends["anthropic"] = ReviewBackend()
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
-    assert options_used[0].resume == "original-conversation"
+    assert resumes == ["original-conversation"]
     records = session.workspace.current_records()
     assert sum(record["kind"] == "user" for record in records) == 1
     assert any(record["kind"] == "slurm_review" for record in records)
@@ -602,53 +607,40 @@ async def test_review_resumes_the_sdk_and_records_the_verdict_on_the_original_pr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement_state", ["COMPLETED", "FAILED"])
 async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
-    session, runtime, cluster, monkeypatch, replacement_state
+    session, runtime, cluster, replacement_state
 ):
     original_id, job_id = await submit(session)
-    session._track_session_id("original-conversation")
+    session._track_session_id("original-conversation", "anthropic")
     original = complete(session, cluster, original_id, job_id, "OUT_OF_MEMORY")
     error = "slurmstepd: error: Detected an out-of-memory event.\n"
     (original / "stderr.txt").write_text(error)
     queries = []
-    options_used = []
+    resumes = []
 
-    class CorrectionClient:
-        def __init__(self, options):
-            options_used.append(options)
+    class CorrectionBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
+        async def run_turn(self, prompt, *, resume_session_id=None, **kwargs):
+            resumes.append(resume_session_id)
             # The automatic continuation must allow an evidence-based resubmission.
             assert "submit_slurm" in prompt
             assert "Stop after reviewing it; do not launch further probes" not in prompt
-            self.probe_id = re.search(
-                r"Runtime event: Slurm probe (S\d+/P\d+)", prompt
-            )[1]
-            queries.append(self.probe_id)
-
-        async def receive_response(self):
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            queries.append(target)
             handlers = tools(session)
-            result = await handlers["check_slurm_job"].handler(
-                {"probe_id": self.probe_id}
-            )
+            result = await handlers["check_slurm_job"].handler({"probe_id": target})
             assert not result.get("is_error")
-            if self.probe_id == original_id:
+            if target == original_id:
                 assert "OUT_OF_MEMORY" in result["content"][0]["text"]
                 await handlers["verdict"].handler(
                     {"text": "The job exhausted its 1 GB allocation before completing."}
                 )
-                yield AssistantMessage(
-                    content=[
-                        TextBlock(
-                            "I will rerun the same script with 2 GB of memory to address the recorded OOM failure."
-                        )
-                    ],
-                    model="test",
+                yield TextBlockDone(
+                    "I will rerun the same script with 2 GB of memory to address the recorded OOM failure."
                 )
                 submitted = await handlers["submit_slurm"].handler(
                     {
@@ -667,9 +659,13 @@ async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
                 else:
                     verdict = "The replacement failed too; no further correction is supported by its output. User input is needed."
                 await handlers["verdict"].handler({"text": verdict})
-                yield AssistantMessage(content=[TextBlock(verdict)], model="test")
+                yield TextBlockDone(verdict)
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", CorrectionClient)
+        async def compact(self, **kwargs):
+            return None
+
+    session.backends["anthropic"] = CorrectionBackend()
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
     jobs = slurm.list_jobs(session.workspace)
@@ -707,7 +703,7 @@ async def test_failed_job_correction_is_submitted_monitored_and_reviewed(
     assert queries == [original_id, replacement_id]
     assert len(slurm.list_jobs(session.workspace)) == 2
     assert slurm.pending_jobs(session.workspace) == []
-    assert all(options.resume == "original-conversation" for options in options_used)
+    assert all(resume == "original-conversation" for resume in resumes)
     records = session.workspace.current_records()
     assert [
         record["probe_id"] for record in records if record["kind"] == "verdict"
@@ -757,7 +753,7 @@ async def test_review_without_a_verdict_reports_it_and_does_not_loop(
     ],
 )
 async def test_interrupted_correction_resumes_without_repeating_verdict_or_submission(
-    session, runtime, cluster, monkeypatch, point, failure
+    session, runtime, cluster, point, failure
 ):
     original_id, job_id = await submit(session)
     original = complete(session, cluster, original_id, job_id, "OUT_OF_MEMORY")
@@ -765,30 +761,21 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
     queries = []
     interrupted = False
 
-    class CorrectionClient:
-        def __init__(self, options):
-            pass
+    class CorrectionBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
 
-        async def __aenter__(self):
-            return self
+        async def discover_models(self, auth):
+            return []
 
-        async def __aexit__(self, *args):
-            pass
-
-        async def query(self, prompt):
-            self.target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[
-                1
-            ]
-            queries.append(self.target)
-
-        async def receive_response(self):
+        async def run_turn(self, prompt, **kwargs):
             nonlocal interrupted
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            queries.append(target)
             handlers = tools(runtime.get_agent(runtime.find_agent_for_session("S001")))
-            result = await handlers["check_slurm_job"].handler(
-                {"probe_id": self.target}
-            )
+            result = await handlers["check_slurm_job"].handler({"probe_id": target})
             assert not result.get("is_error")
-            if self.target == original_id:
+            if target == original_id:
                 already_reviewed = slurm.has_verdict(session.workspace, original_id)
                 if already_reviewed:
                     assert "Existing verdict" in result["content"][0]["text"]
@@ -811,17 +798,11 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
                     assert not result.get("is_error")
                 if not interrupted:
                     interrupted = True
+                    yield SessionStarted("sdk-chat")
                     if failure == "sdk_error":
-                        yield ResultMessage(
-                            subtype="error_during_execution",
-                            duration_ms=1,
-                            duration_api_ms=1,
-                            is_error=True,
-                            num_turns=1,
-                            session_id="sdk-chat",
-                            result="SDK failed before completing the correction",
+                        raise RuntimeError(
+                            "SDK failed before completing the correction"
                         )
-                        return
                     if failure == "cancelled":
                         raise asyncio.CancelledError()
                     raise RuntimeError("Connection lost during correction")
@@ -829,11 +810,15 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
                 await handlers["verdict"].handler(
                     {"text": "The replacement printed 42 as predicted."}
                 )
-            yield AssistantMessage(
-                content=[TextBlock("Correction handled.")], model="test"
-            )
+            yield TextBlockDone("Correction handled.")
+            yield TurnResult()
 
-    monkeypatch.setattr("nocturnomath.session.ClaudeSDKClient", CorrectionClient)
+        async def compact(self, **kwargs):
+            return None
+
+    backend = CorrectionBackend()
+    session.backends["anthropic"] = backend
+    runtime.backends["anthropic"] = backend
     await runtime._poll_slurm_jobs()
     await finish_reviews(runtime)
     assert slurm.has_verdict(session.workspace, original_id)
@@ -873,3 +858,627 @@ async def test_interrupted_correction_resumes_without_repeating_verdict_or_submi
         record["probe_id"] for record in records if record["kind"] == "verdict"
     ] == [original_id, jobs[1]["probe_id"]]
     assert (original / "stderr.txt").read_text() == "Out of memory\n"
+
+
+@pytest.mark.asyncio
+async def test_automatic_review_stays_on_owning_provider_and_waits_when_unavailable(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    anthropic_calls = []
+    openai_calls = []
+    waiting_notices = []
+    openai_available = True
+
+    def record_notice(event_type, payload):
+        if event_type == "system_message" and "waiting for" in payload.get("text", ""):
+            waiting_notices.append(payload["text"])
+
+    runtime.subscribe(record_notice)
+
+    class AnthropicStub(_StagedDiscoveryMixin):
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="Claude Sonnet 5",
+                    efforts=["medium"],
+                    is_default=True,
+                )
+            ]
+
+        async def run_turn(self, prompt, **kwargs):
+            anthropic_calls.append({"prompt": prompt, **kwargs})
+            yield TextBlockDone("Should not be called.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub(_StagedDiscoveryMixin):
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            if not openai_available:
+                return []
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["high"],
+                )
+            ]
+
+        async def run_turn(self, prompt, *, model, resume_session_id=None, **kwargs):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+            handlers = tools(owner)
+            if len(openai_calls) == 1:
+                submitted = await handlers["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                yield SessionStarted("oai-thread-1")
+                yield TextBlockDone("Submitted from OpenAI.")
+            else:
+                result = await handlers["check_slurm_job"].handler(
+                    {"probe_id": "S001/P001"}
+                )
+                assert not result.get("is_error")
+                await handlers["verdict"].handler(
+                    {"text": "Printed 42 as predicted on OpenAI."}
+                )
+                yield TextBlockDone("Reviewed on OpenAI.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": AnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+    runtime.set_session_defaults("claude-sonnet-5", "medium", provider="anthropic")
+
+    assert (
+        runtime.start_query(
+            "Investigate on OpenAI.", "gpt-5.4", "high", provider="openai"
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    # Reopen the workspace while OpenAI is unavailable and Claude is the default.
+    openai_available = False
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    assert runtime.models == ["claude-sonnet-5"]
+
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert anthropic_calls == []
+    assert len(openai_calls) == 1
+    assert len(runtime.agents) == 1
+    assert slurm.needs_review(runtime.session.workspace, probe_id)
+    assert len(waiting_notices) == 1
+    assert "waiting for OpenAI models to become available" in waiting_notices[0]
+
+    # Restore OpenAI availability; automatic review resumes on OpenAI, not Claude.
+    openai_available = True
+    await runtime.discover_models()
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert anthropic_calls == []
+    assert len(openai_calls) == 2
+    assert openai_calls[1]["model"] == "gpt-5.4"
+    assert openai_calls[1]["resume_session_id"] == "oai-thread-1"
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert owner.model == "gpt-5.4"
+    assert slurm.has_verdict(owner.workspace, probe_id)
+    assert not slurm.needs_review(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_reopened_review_after_partial_provider_switch_stays_on_new_owner(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    anthropic_calls = []
+    openai_calls = []
+
+    class AnthropicStub(_StagedDiscoveryMixin):
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="claude-sonnet-5",
+                    raw_id="claude-sonnet-5",
+                    provider="anthropic",
+                    label="Claude Sonnet 5",
+                    efforts=["medium"],
+                    is_default=True,
+                )
+            ]
+
+        async def run_turn(self, prompt, **kwargs):
+            anthropic_calls.append({"prompt": prompt, **kwargs})
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("Initial Claude turn.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub(_StagedDiscoveryMixin):
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["high"],
+                )
+            ]
+
+        async def run_turn(
+            self, prompt, *, model, tools=(), resume_session_id=None, **kwargs
+        ):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            by_name = {spec.name: spec for spec in tools}
+            if len(openai_calls) == 1:
+                submitted = await by_name["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                raise RuntimeError("OpenAI CLI disconnected before reporting thread ID")
+
+            result = await by_name["check_slurm_job"].handler({"probe_id": "S001/P001"})
+            assert not result.get("is_error")
+            await by_name["verdict"].handler(
+                {"text": "Reviewed on OpenAI after disconnect."}
+            )
+            yield SessionStarted("oai-recovered")
+            yield TextBlockDone("Reviewed on OpenAI.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": AnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+
+    assert runtime.start_query("Start on Claude.") == "started"
+    await runtime.wait_for_query()
+
+    assert (
+        runtime.start_query(
+            "Switch to OpenAI and submit.",
+            "gpt-5.4",
+            "high",
+            provider="openai",
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert len(anthropic_calls) == 1
+    assert len(openai_calls) == 2
+    assert openai_calls[1]["resume_session_id"] is None
+    assert openai_calls[1]["model"] == "gpt-5.4"
+    assert "Initial Claude turn." in openai_calls[1]["prompt"]
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert slurm.has_verdict(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_reopened_review_uses_latest_model_and_effort_on_same_native_thread(
+    session, runtime, cluster
+):
+    from nocturnomath.backends import ModelSpec
+
+    openai_calls = []
+
+    class EmptyAnthropicStub(_StagedDiscoveryMixin):
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    class OpenAIStub(_StagedDiscoveryMixin):
+        provider = "openai"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return [
+                ModelSpec(
+                    id="gpt-5.4",
+                    raw_id="gpt-5.4",
+                    provider="openai",
+                    label="GPT-5.4",
+                    efforts=["low", "high"],
+                    is_default=True,
+                ),
+                ModelSpec(
+                    id="gpt-5.4-mini",
+                    raw_id="gpt-5.4-mini",
+                    provider="openai",
+                    label="GPT-5.4 Mini",
+                    efforts=["low", "high"],
+                ),
+            ]
+
+        async def run_turn(
+            self, prompt, *, model, effort=None, resume_session_id=None, **kwargs
+        ):
+            openai_calls.append(
+                {
+                    "prompt": prompt,
+                    "model": model,
+                    "effort": effort,
+                    "resume_session_id": resume_session_id,
+                    **kwargs,
+                }
+            )
+            owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+            handlers = tools(owner)
+            if len(openai_calls) == 1:
+                yield SessionStarted("oai-shared-thread")
+                yield TextBlockDone("First OpenAI turn.")
+            elif len(openai_calls) == 2:
+                submitted = await handlers["submit_slurm"].handler(
+                    {
+                        "code": "print(42)",
+                        "expected": "prints 42",
+                        "time_minutes": 10,
+                        "cpus": 1,
+                        "memory_gb": 1,
+                    }
+                )
+                assert not submitted.get("is_error")
+                yield TextBlockDone("Submitted from mini.")
+            else:
+                result = await handlers["check_slurm_job"].handler(
+                    {"probe_id": "S001/P001"}
+                )
+                assert not result.get("is_error")
+                await handlers["verdict"].handler(
+                    {"text": "Reviewed on gpt-5.4-mini at low effort."}
+                )
+                yield TextBlockDone("Reviewed on mini.")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            return None
+
+    class EmptyGoogleStub(_StagedDiscoveryMixin):
+        provider = "google"
+        uses_compact_hook = False
+
+        async def discover_models(self, auth):
+            return []
+
+        async def run_turn(self, prompt, **kwargs):
+            if False:
+                yield TextBlockDone("")
+
+        async def compact(self, **kwargs):
+            return None
+
+    runtime.backends = {
+        "anthropic": EmptyAnthropicStub(),
+        "openai": OpenAIStub(),
+        "google": EmptyGoogleStub(),
+    }
+    session.backends = runtime.backends
+    await runtime.discover_models()
+
+    assert (
+        runtime.start_query(
+            "Turn 1 on GPT-5.4 high.", "gpt-5.4", "high", provider="openai"
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    assert (
+        runtime.start_query(
+            "Turn 2 on GPT-5.4 Mini low.",
+            "gpt-5.4-mini",
+            "low",
+            provider="openai",
+        )
+        == "started"
+    )
+    await runtime.wait_for_query()
+
+    job = slurm.list_jobs(session.workspace)[0]
+    probe_id, job_id = job["probe_id"], job["job_id"]
+
+    runtime.open_workspace(session.workspace_path)
+    await runtime.discover_models()
+    complete(runtime.session, cluster, probe_id, job_id)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+
+    assert len(openai_calls) == 3
+    assert openai_calls[2]["model"] == "gpt-5.4-mini"
+    assert openai_calls[2]["effort"] == "low"
+    assert openai_calls[2]["resume_session_id"] == "oai-shared-thread"
+    owner = runtime.get_agent(runtime.find_agent_for_session("S001"))
+    assert (owner.model, owner.effort) == ("gpt-5.4-mini", "low")
+    assert slurm.has_verdict(owner.workspace, probe_id)
+
+
+@pytest.mark.asyncio
+async def test_slurm_review_defers_steer_prompts_and_preserves_null_correction_of(
+    session, runtime, cluster
+):
+    probe_id, job_id = await submit(session)
+    complete(session, cluster, probe_id, job_id, state="FAILED")
+
+    async def review_with_user_steer():
+        session._slurm_review_probe_id = probe_id
+        try:
+            await tools(session)["check_slurm_job"].handler({"probe_id": probe_id})
+            await tools(session)["verdict"].handler(
+                {"text": "Job failed on missing flag; submitting fixed script."}
+            )
+            # User submits a steer message mid-review: must queue rather than hijack submit_slurm.
+            session.enqueue_prompt("Switch topic after review", mode="steer")
+            assert session._steerable_prefix_count() == 0
+            assert session.pending_prompts_snapshot()[0]["mode"] == "queue"
+            res = await tools(session)["submit_slurm"].handler(
+                {
+                    "code": "print('fixed')",
+                    "expected": "prints 42",
+                    "time_minutes": 10,
+                    "cpus": 1,
+                    "memory_gb": 1,
+                    "correction_of": None,
+                }
+            )
+            assert not res.get("is_error")
+        finally:
+            session._slurm_review_probe_id = None
+
+    await review_with_user_steer()
+    jobs = slurm.list_jobs(session.workspace)
+    assert len(jobs) == 2
+    replacement_meta = json.loads(
+        (
+            session.workspace.sessions_path / "S001" / "probes" / "P002" / "probe.json"
+        ).read_text()
+    )
+    assert replacement_meta["correction_of"] == probe_id
+    assert not slurm.needs_review(session.workspace, probe_id)
+    assert len(session._pending_prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_slurm_probe_with_verdict_does_not_need_review(
+    session, cluster
+):
+    probe_id, job_id = await submit(session)
+    complete(session, cluster, probe_id, job_id, state="COMPLETED")
+    # Simulate check_slurm_job finalizing probe.json as "completed" and recording verdict
+    # even if the review turn were interrupted before clearing anything else.
+    session._slurm_review_probe_id = probe_id
+    try:
+        await tools(session)["check_slurm_job"].handler({"probe_id": probe_id})
+        await tools(session)["verdict"].handler({"text": "Job finished cleanly."})
+    finally:
+        session._slurm_review_probe_id = None
+
+    assert slurm.has_verdict(session.workspace, probe_id)
+    assert not slurm.needs_review(session.workspace, probe_id)
+
+    # Also verify a failed probe with review_pending=True and a verdict clears review_pending
+    # once a manual follow-up turn completes.
+    failed_id, failed_job_id = await submit(session)
+    complete(session, cluster, failed_id, failed_job_id, state="FAILED")
+    session._slurm_review_probe_id = failed_id
+    try:
+        await tools(session)["check_slurm_job"].handler({"probe_id": failed_id})
+        await tools(session)["verdict"].handler(
+            {"text": "Recorded verdict; user will handle follow-up manually."}
+        )
+    finally:
+        session._slurm_review_probe_id = None
+    slurm.set_review_pending(session.workspace, failed_id, True)
+    assert slurm.needs_review(session.workspace, failed_id)
+
+    class ManualBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-manual")
+            yield TextBlockDone("Continuing manually.")
+            yield TurnResult()
+
+    session.backends["anthropic"] = ManualBackend()
+    assert await session.query("continue manually") is True
+    assert not slurm.needs_review(session.workspace, failed_id)
+
+
+@pytest.mark.asyncio
+async def test_cross_session_slurm_check_does_not_block_resumed_checking_session(
+    session, runtime, reviewer, cluster
+):
+    probe_s1, job_s1 = await submit(session)
+    complete(session, cluster, probe_s1, job_s1)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+    assert slurm.has_verdict(session.workspace, probe_s1)
+
+    # Start S002 and manually inspect S001/P001, logging run(S001/P001) in S002.
+    runtime.reset_session()
+    session.log_transcript("user", text="Inspect S001/P001 from S002")
+    inspected = await tools(session)["check_slurm_job"].handler({"probe_id": probe_s1})
+    assert not inspected.get("is_error")
+    assert "Existing verdict" in inspected["content"][0]["text"]
+    assert session._pending_verdict is None
+
+    # Submit S002/P001, switch away, and let S002 reopen/resume; S001/P001 must not
+    # poison S002._pending_verdict_probe_id or block S002/P001's automatic review.
+    probe_s2, job_s2 = await submit(session)
+    runtime.reset_session()
+    complete(session, cluster, probe_s2, job_s2)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+    assert slurm.has_verdict(session.workspace, probe_s2)
+
+    runtime.reset_session()
+    session.resume_session("S002")
+    assert session._pending_verdict is None
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_finished_slurm_jobs_in_same_session_both_get_reviewed(
+    session, runtime, cluster, monkeypatch
+):
+    probe_1, job_1 = await submit(session)
+    probe_2, job_2 = await submit(session)
+    complete(session, cluster, probe_1, job_1)
+    complete(session, cluster, probe_2, job_2)
+    both_verdicts = asyncio.Event()
+    reviewed_ids = []
+
+    class RealReviewBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            target = re.search(r"Runtime event: Slurm probe (S\d+/P\d+)", prompt)[1]
+            tool_map = {spec.name: spec for spec in tools}
+            checked = await tool_map["check_slurm_job"].handler({"probe_id": target})
+            assert not checked.get("is_error")
+            recorded = await tool_map["verdict"].handler(
+                {"text": f"Reviewed {target} cleanly."}
+            )
+            assert not recorded.get("is_error")
+            reviewed_ids.append(target)
+            if len(reviewed_ids) == 2:
+                both_verdicts.set()
+            yield SessionStarted("ant-slurm")
+            yield TextBlockDone("Done.")
+            yield TurnResult()
+
+    session.backends["anthropic"] = RealReviewBackend()
+    runtime.backends["anthropic"] = RealReviewBackend()
+    monkeypatch.setattr("nocturnomath.runtime.SLURM_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(
+        runtime, "_wake_slurm_monitor", Runtime._wake_slurm_monitor.__get__(runtime)
+    )
+    runtime.start()
+    await asyncio.wait_for(both_verdicts.wait(), timeout=5)
+    for _ in range(10):
+        await finish_reviews(runtime)
+        if not slurm.pending_jobs(session.workspace):
+            break
+        await asyncio.sleep(0.02)
+    assert set(reviewed_ids) == {probe_1, probe_2}
+    assert slurm.has_verdict(session.workspace, probe_1)
+    assert slurm.has_verdict(session.workspace, probe_2)
+    assert slurm.pending_jobs(session.workspace) == []

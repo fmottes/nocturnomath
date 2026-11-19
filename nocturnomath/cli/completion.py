@@ -1,7 +1,7 @@
 """Complete slash commands and their arguments in the terminal client."""
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 from prompt_toolkit.completion import (
     CompleteEvent,
@@ -11,6 +11,7 @@ from prompt_toolkit.completion import (
 )
 from prompt_toolkit.document import Document
 
+from ..auth import PROVIDER_METHODS, PROVIDER_TITLES
 from ..runtime import Runtime
 
 logger = logging.getLogger("nocturnomath.cli")
@@ -19,9 +20,16 @@ logger = logging.getLogger("nocturnomath.cli")
 class CommandCompleter(Completer):
     """Suggest the slash commands, then the arguments each of them accepts."""
 
-    def __init__(self, runtime: Runtime, commands: Iterable[tuple[str, str, str]]):
+    def __init__(
+        self,
+        runtime: Runtime,
+        commands: Iterable[tuple[str, str, str]],
+        *,
+        pending_model: Callable[[], str | None] | None = None,
+    ):
         self.runtime = runtime
         self.commands = list(commands)
+        self._pending_model = pending_model
         self.files = PathCompleter(expanduser=True)
         self.directories = PathCompleter(only_directories=True, expanduser=True)
 
@@ -37,7 +45,7 @@ class CommandCompleter(Completer):
             return
         single_path_commands = {"/docs", "/env", "/workspace"}
         word = argument if name in single_path_commands else argument.rsplit(" ", 1)[-1]
-        for value, meta in self.arguments(name):
+        for value, meta in self.arguments(name, argument):
             if value.startswith(word):
                 yield Completion(
                     value, start_position=-len(word), display_meta=meta or ""
@@ -55,25 +63,55 @@ class CommandCompleter(Completer):
                     name, start_position=-len(prefix), display_meta=description
                 )
 
-    def arguments(self, name: str) -> list[tuple[str, str]]:
+    def arguments(self, name: str, argument: str = "") -> list[tuple[str, str]]:
         try:
-            return self._arguments(name)
+            return self._arguments(name, argument)
         except Exception as exc:
             logger.debug(f"No completions for {name}: {exc}")
             return []
 
-    def _arguments(self, name: str) -> list[tuple[str, str]]:
+    def _arguments(self, name: str, argument: str = "") -> list[tuple[str, str]]:
         if name == "/model":
+            if " " in argument.lstrip():
+                return []
+            items = []
+            for model in self.runtime.models:
+                provider = self.runtime.model_providers.get(model)
+                label = self.runtime.model_labels.get(model, "")
+                if provider:
+                    title = PROVIDER_TITLES.get(provider, provider)
+                    meta = f"{title} · {label}" if label and label != model else title
+                else:
+                    meta = label
+                items.append((model, meta))
+            return items
+        if name == "/effort":
+            if " " in argument.lstrip():
+                return []
+            current = (self._pending_model() if self._pending_model else None) or (
+                self.runtime.session.model
+                if self.runtime.session
+                else self.runtime.model
+            )
             return [
-                (model, self.runtime.model_labels.get(model, ""))
-                for model in self.runtime.models
+                (level, f"reasoning effort for {current}")
+                for level in self.runtime.model_efforts.get(current or "", [])
             ]
         if name == "/auth":
+            head, space, rest = argument.lstrip().partition(" ")
+            if not space:
+                return [
+                    ("status", "show current authentication across providers"),
+                    ("anthropic", "configure Anthropic / Claude credentials"),
+                    ("openai", "configure OpenAI / Codex credentials"),
+                    ("google", "configure Google / Antigravity credentials"),
+                ]
+            provider = head.lower()
+            if provider not in PROVIDER_METHODS or " " in rest:
+                return []
             return [
-                ("status", "show the current authentication method"),
-                ("subscription", "enter a Claude subscription token securely"),
-                ("api-key", "enter a Claude API key securely"),
-                ("claude-code", "use the existing Claude Code login"),
+                ("api-key" if key == "api_key" else key, label)
+                for key, label in PROVIDER_METHODS[provider].items()
             ]
         if name == "/env":
             return [("managed", "the environment prepared in the workspace")]

@@ -24,6 +24,7 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
+from ..auth import PROVIDER_METHODS, PROVIDER_TITLES, PROVIDERS
 from ..runtime import Runtime
 from .common import add_session_arguments
 from .completion import CommandCompleter
@@ -32,6 +33,15 @@ logger = logging.getLogger("nocturnomath.cli")
 
 ASSET_PREFIX = "/api/asset?path="
 OUTPUT_LINE_CAP = 60
+
+_CREDENTIAL_PROMPTS = {
+    ("anthropic", "subscription"): (
+        "Claude subscription token (from `claude setup-token`): "
+    ),
+    ("anthropic", "api_key"): "Anthropic API key: ",
+    ("openai", "api_key"): "OpenAI API key: ",
+    ("google", "api_key"): "Google Gemini API key: ",
+}
 
 COMMANDS = [
     ("/help", "", "list these commands"),
@@ -42,10 +52,11 @@ COMMANDS = [
     ("/resume", "<S001> [--kernel]", "reopen a chat, optionally replaying its probes"),
     ("/export", "[path]", "save the current chat as a Jupyter notebook"),
     ("/model", "[name]", "show the catalogue, or use a model from the next message"),
+    ("/effort", "[level]", "show or set reasoning effort from the next message"),
     (
         "/auth",
-        "[status|subscription|api-key|claude-code]",
-        "show or change Claude login",
+        "[status|<provider> <method>]",
+        "show or change model provider logins",
     ),
     ("/compact", "", "compact the current chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
@@ -113,6 +124,8 @@ class TerminalApp:
         self.initial_python = python
         self.credential_reader = credential_reader
         self.pending_model: str | None = None
+        self.pending_model_provider: str | None = None
+        self.pending_effort: str | None = None
         self.status = "idle"
         self.stopped = False
         self._interrupt_task: asyncio.Task | None = None
@@ -211,11 +224,13 @@ class TerminalApp:
             )
             self.write(f"workspace: {session.workspace_path}", style="dim")
             self.write(f"model: {session.model or 'No model available'}", style="dim")
-            self.write(f"effort: {session.effort}", style="dim")
-            auth = self.runtime.auth.public()
-            self.write(f"Claude auth: {auth['label']}", style="dim")
-            if auth["note"]:
-                self.write(auth["note"], style="dim")
+            if session.effort:
+                self.write(f"effort: {session.effort}", style="dim")
+            auth = self.runtime.auth.public(self.runtime._provider_models)
+            self.write(f"auth: {auth['label']}", style="dim")
+            for info in auth["providers"].values():
+                if info["note"]:
+                    self.write(info["note"], style="dim")
             self.write(
                 f"next transcript: {session.transcript_path} "
                 "(created with first message)",
@@ -238,11 +253,23 @@ class TerminalApp:
         model = session.model or "No model available"
         if self.pending_model:
             model += f" → {self.pending_model}"
+        effort = session.effort
+        if self.pending_effort:
+            effort = (
+                f"{effort} → {self.pending_effort}" if effort else self.pending_effort
+            )
+        effort_part = f" · effort {effort}" if effort else ""
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
+        custom_auth = [
+            f"{provider}:{self.runtime.auth.get(provider).method}"
+            for provider in PROVIDERS
+            if self.runtime.auth.get(provider).method != "cli"
+        ]
+        auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
         return (
-            f"kernel {kernel} · model {model} · effort {session.effort} · "
-            f"auth {self.runtime.auth.method} · chat {chat} · {self.status}"
+            f"kernel {kernel} · model {model}{effort_part} · "
+            f"auth {auth_summary} · chat {chat} · {self.status}"
         )
 
     def show_help(self):
@@ -266,6 +293,7 @@ class TerminalApp:
                 "status_change",
                 "turn_complete",
                 "context_usage_changed",
+                "pending_prompts_changed",
             ):
                 return
             if event_type == "assistant_text":
@@ -382,6 +410,8 @@ class TerminalApp:
         self.status = payload.get("status", "idle")
         if self.status == "thinking":
             self.show_spinner("thinking…")
+        elif self.status == "probing":
+            self.show_spinner("running probe…")
         elif self.status == "compacting":
             self.show_spinner("compacting…")
         else:
@@ -435,8 +465,13 @@ class TerminalApp:
             )
 
     def _render_context_compacted(self, payload):
+        if payload.get("record_reloaded") is False:
+            self.write(
+                "Chat context compacted. The current scientific record will be attached on the next message."
+            )
+            return
         self.write(
-            "Claude compacted this chat. The current scientific record was reloaded."
+            "Chat context compacted. The current scientific record was reloaded."
         )
 
     def _render_context_usage_changed(self, payload):
@@ -445,6 +480,16 @@ class TerminalApp:
         window = usage.get("window_tokens")
         if isinstance(used, int) and isinstance(window, int) and window > 0:
             self.write(f"Context: {round(100 * used / window)}%", style="dim")
+
+    def _render_pending_prompts_changed(self, payload):
+        pass
+
+    def _render_document_saved(self, payload):
+        verb = "Updated" if payload.get("action") == "revised" else "Created"
+        self.write(
+            f"{verb} .nocturnomath/documents/{payload.get('name', '')}.",
+            style="green",
+        )
 
     # ----------------------------------------------------------------- helpers
 
@@ -484,7 +529,11 @@ class TerminalApp:
     def check_model(self, requested: str | None):
         if not self.runtime.models:
             self.write("No model available.", style="dim")
-        elif requested and requested not in self.runtime.models:
+        elif (
+            requested
+            and requested not in self.runtime.models
+            and self.runtime.resolve_model(requested) is None
+        ):
             self.write(
                 f"Model {requested} is unavailable; using {self.runtime.model}.",
                 style="dim",
@@ -547,12 +596,42 @@ class TerminalApp:
             return True
 
     async def run_query(self, text: str):
+        raw_model = (
+            self.runtime.model_raw_ids.get(self.pending_model)
+            if self.pending_model
+            else None
+        )
         try:
-            self.runtime.start_query(text, self.pending_model)
+            query_state = self.runtime.start_query(
+                text,
+                self.pending_model,
+                self.pending_effort,
+                provider=self.pending_model_provider,
+                raw_model=raw_model,
+            )
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return
         self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
+        if query_state == "pending":
+            session = self.runtime.session
+            snapshot = session.pending_prompts_snapshot() if session else []
+            mode = (
+                snapshot[-1]["mode"]
+                if snapshot
+                else (session.prompt_mode if session else "steer")
+            )
+            when = "before next probe" if mode == "steer" else "after current turn"
+            self.write(f"Scheduled ({mode}, {when}).", style="dim")
+            if self.runtime.current_task is None:
+                return
+            while self.runtime.current_task and not self.runtime.current_task.done():
+                await self.runtime.wait_for_query()
+            self.close_stream()
+            self.clear_spinner()
+            return
         await self.runtime.wait_for_query()
         self.close_stream()
         self.clear_spinner()
@@ -563,6 +642,9 @@ class TerminalApp:
 
     async def _command_new(self, argument: str) -> bool:
         self.require_idle("start a new session")
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -570,6 +652,8 @@ class TerminalApp:
     async def _command_compact(self, argument: str) -> bool:
         try:
             await self.runtime.compact_agent(self.runtime.primary_agent_id)
+        except asyncio.CancelledError:
+            self.write("Compaction cancelled.", style="dim")
         except Exception as exc:
             self.error(f"Compaction failed: {exc}")
         return True
@@ -625,10 +709,17 @@ class TerminalApp:
             self.error("Name a chat to resume, such as /resume S001.")
             return True
         self.require_idle("resume")
-        session = self.runtime.session
+        existing_id = self.runtime.find_agent_for_session(ids[0])
+        if existing_id is not None and existing_id != self.runtime.primary_agent_id:
+            await self.runtime.transition_agent(
+                existing_id, self.runtime.close_agent, existing_id
+            )
         data = await self.runtime.transition(
-            session.resume_session, ids[0], restore_kernel
+            self.runtime.resume_session, ids[0], restore_kernel
         )
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.emit("session_resumed", data)
         return True
 
@@ -653,7 +744,11 @@ class TerminalApp:
                     f"{self.pending_model} applies from the next message.", style="dim"
                 )
             for name in runtime.models:
-                self.write(f"  {name} ({runtime.model_labels.get(name, name)})")
+                provider = runtime.model_providers.get(name)
+                tag = (
+                    f"[{PROVIDER_TITLES.get(provider, provider)}] " if provider else ""
+                )
+                self.write(f"  {tag}{name} ({runtime.model_labels.get(name, name)})")
             if not runtime.models:
                 self.write("The model catalogue is unavailable.", style="dim")
             return True
@@ -668,53 +763,130 @@ class TerminalApp:
             )
             return True
         self.pending_model = argument
+        self.pending_model_provider = runtime.model_providers.get(argument)
+        supported = runtime.model_efforts.get(argument, [])
+        if self.pending_effort and self.pending_effort not in supported:
+            self.pending_effort = None
         self.write(f"Using {argument} from the next message.")
         return True
 
+    async def _command_effort(self, argument: str) -> bool:
+        runtime = self.runtime
+        session = runtime.session
+        target = self.pending_model or (session.model if session else runtime.model)
+        levels = runtime.model_efforts.get(target or "", [])
+        current = session.effort if session else runtime.effort
+        if not argument:
+            self.write(f"effort: {current or 'none'}")
+            if self.pending_effort:
+                self.write(
+                    f"{self.pending_effort} applies from the next message.",
+                    style="dim",
+                )
+            if levels:
+                self.write(f"  supported for {target}: {', '.join(levels)}")
+            else:
+                self.write(
+                    f"  {target or 'Current model'} has no effort setting.",
+                    style="dim",
+                )
+            return True
+        if not levels:
+            self.error(f"{target or 'Current model'} does not support effort levels.")
+            return True
+        if argument not in levels:
+            self.error(f"Choose a supported effort for {target}: {', '.join(levels)}.")
+            return True
+        self.pending_effort = argument
+        self.write(f"Using effort {argument} from the next message.")
+        return True
+
     async def _command_auth(self, argument: str) -> bool:
-        choice = argument or "status"
-        if choice == "status":
-            auth = self.runtime.auth.public()
-            self.write(f"Claude authentication: {auth['label']}")
-            if auth["note"]:
-                self.write(auth["note"], style="dim")
+        parts = argument.split()
+        if not parts or parts == ["status"]:
+            auth = self.runtime.auth.public(self.runtime._provider_models)
+            self.write(f"Authentication: {auth['label']}")
+            for provider in PROVIDERS:
+                info = auth["providers"][provider]
+                count = info["models_count"]
+                count_text = (
+                    f" ({count} {'model' if count == 1 else 'models'})"
+                    if count is not None
+                    else ""
+                )
+                self.write(f"  {info['title']}: {info['label']}{count_text}")
+                if info["note"]:
+                    self.write(f"    {info['note']}", style="dim")
             self.write(
-                "Use /auth subscription, /auth api-key, or /auth claude-code to change it.",
+                "Use /auth <anthropic|openai|google> <cli|subscription|api-key> to change a provider.",
                 style="dim",
             )
             return True
-        methods = {
-            "subscription": "subscription",
-            "api-key": "api_key",
-            "claude-code": "claude_code",
-        }
-        if choice not in methods:
-            self.error("Use /auth subscription, /auth api-key, or /auth claude-code.")
-            return True
-        self.require_idle("change Claude authentication")
-        method = methods[choice]
-        credential = None
-        if method != "claude_code":
-            prompt = (
-                "Claude subscription token (from `claude setup-token`): "
-                if method == "subscription"
-                else "Claude API key: "
+        if len(parts) != 2:
+            self.error(
+                "Use /auth status or /auth <anthropic|openai|google> <cli|subscription|api-key>."
             )
+            return True
+        provider = parts[0].lower()
+        if provider not in PROVIDER_METHODS:
+            self.error("Choose a provider: anthropic, openai, or google.")
+            return True
+        method = "api_key" if parts[1] == "api-key" else parts[1]
+        if method not in PROVIDER_METHODS[provider]:
+            choices = "|".join(
+                "api-key" if key == "api_key" else key
+                for key in PROVIDER_METHODS[provider]
+            )
+            self.error(f"Use /auth {provider} <{choices}>.")
+            return True
+        self.require_idle("change authentication")
+        credential = None
+        if method != "cli":
+            prompt = _CREDENTIAL_PROMPTS[(provider, method)]
             try:
                 credential = await asyncio.to_thread(self.credential_reader, prompt)
             except EOFError:
                 self.write("Authentication unchanged.", style="dim")
                 return True
-        auth = await self.runtime.authenticate(method, credential)
-        self.write(f"Selected {auth['label']}.")
+        try:
+            auth = await self.runtime.authenticate(provider, method, credential)
+        except ValueError as exc:
+            self.error(str(exc))
+            return True
+        selected = auth["providers"][provider]
+        self.write(f"Selected {selected['title']}: {selected['label']}.")
         self.write("Credentials will be checked on your next message.", style="dim")
-        models = self.runtime.models
-        if self.pending_model and models and self.pending_model not in models:
-            self.write(
-                f"Dropped pending model {self.pending_model}: not in the new catalogue.",
-                style="dim",
+        if self.pending_model:
+            resolved = self.runtime.resolve_model(
+                self.pending_model, self.pending_model_provider
             )
-            self.pending_model = None
+            if resolved is None:
+                self.write(
+                    f"Dropped pending model {self.pending_model}: not in the new catalogue.",
+                    style="dim",
+                )
+                self.pending_model = None
+                self.pending_model_provider = None
+                self.pending_effort = None
+            else:
+                self.pending_model = resolved
+                self.pending_model_provider = self.runtime.model_providers.get(resolved)
+                if (
+                    self.pending_effort
+                    and self.pending_effort
+                    not in self.runtime.model_efforts.get(resolved, [])
+                ):
+                    self.pending_effort = None
+        elif self.pending_effort:
+            active_model = (
+                self.runtime.session.model
+                if self.runtime.session
+                else self.runtime.model
+            )
+            if self.pending_effort not in self.runtime.model_efforts.get(
+                active_model or "", []
+            ):
+                self.pending_effort = None
         self.check_model(self.runtime.model)
         return True
 
@@ -727,6 +899,9 @@ class TerminalApp:
             self.runtime.open_workspace, session.workspace_path, argument
         )
         self.initial_python = None
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         self.write("New research environment; this starts a new chat.")
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
@@ -741,6 +916,9 @@ class TerminalApp:
             self.runtime.open_workspace, argument, self.initial_python
         )
         self.initial_python = None
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
         )
@@ -800,7 +978,9 @@ def build_prompt_session(app: TerminalApp) -> PromptSession:
         history=FileHistory(str(history_path)),
         multiline=True,
         key_bindings=bindings,
-        completer=CommandCompleter(app.runtime, COMMANDS),
+        completer=CommandCompleter(
+            app.runtime, COMMANDS, pending_model=lambda: app.pending_model
+        ),
         complete_while_typing=True,
         bottom_toolbar=app.bottom_toolbar,
     )
@@ -834,7 +1014,6 @@ async def run_terminal(args: argparse.Namespace):
         console=console,
         python=args.python,
     )
-    app.runtime.start()
     app.runtime.subscribe(app.render_event)
     try:
         app.runtime.open_workspace(args.path, args.python)
@@ -843,6 +1022,7 @@ async def run_terminal(args: argparse.Namespace):
         return
     app.initial_python = None
     await app.runtime.discover_models()
+    app.runtime.start()
     app.check_model(args.default_model)
     app.banner()
 

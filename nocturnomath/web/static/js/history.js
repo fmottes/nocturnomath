@@ -1,5 +1,5 @@
-import { elements, state } from "./state.js?v=20261016-3";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261030-1";
+import { elements, state } from "./state.js?v=20261117-2";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261118-1";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -111,12 +111,16 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
   });
   try {
     if (!state.activeAgentId && !openAgentId) throw new Error("No explorer is selected");
-    if (openAgentId) {
+    if (openAgentId && !restoreKernel) {
       window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
       elements.historyModal.classList.add("hidden");
       return;
     }
-    const res = await fetch(`/api/agents/${encodeURIComponent(state.activeAgentId)}/resume`, {
+    const targetAgentId = openAgentId || state.activeAgentId;
+    if (openAgentId && openAgentId !== state.activeAgentId) {
+      window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
+    }
+    const res = await fetch(`/api/agents/${encodeURIComponent(targetAgentId)}/resume`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: sessionId, restore_kernel: restoreKernel }),
@@ -250,7 +254,11 @@ function renderRecords(records, isBusy = false) {
         break;
 
       case "compaction":
-        appendSystemMessage("Claude compacted this Explorer's conversation. The latest scientific record was reloaded before it continued.");
+        appendSystemMessage(
+          rec.record_reloaded === false
+            ? "This Explorer's conversation was compacted. The latest scientific record will be attached on the next message."
+            : "This Explorer's conversation was compacted. The latest scientific record was reloaded before continuing."
+        );
         break;
 
       case "packages_installed":

@@ -3,7 +3,7 @@
 import argparse
 from importlib.metadata import version
 
-from ..session import EFFORT_LEVELS
+from ..backends.base import EFFORT_LEVELS
 
 
 def add_session_arguments(parser: argparse.ArgumentParser):
@@ -26,7 +26,7 @@ def add_session_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--default-model",
         default=None,
-        help="exact Claude model identifier for new sessions (default: SDK choice)",
+        help="exact model identifier for new sessions (default: backend choice)",
     )
     parser.add_argument(
         "--default-effort",
@@ -38,5 +38,5 @@ def add_session_arguments(parser: argparse.ArgumentParser):
         "--timeout", type=int, default=600, help="seconds allowed per kernel run"
     )
     parser.add_argument(
-        "--images", type=int, default=2, help="plots returned to Claude per run"
+        "--images", type=int, default=2, help="plots returned to the model per run"
     )

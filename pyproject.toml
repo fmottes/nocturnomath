@@ -15,7 +15,6 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "claude-agent-sdk>=0.2.152",
     "fastapi>=0.115.0",
     "jupyter-client>=8.10.0",
     "prompt-toolkit>=3.0.53",

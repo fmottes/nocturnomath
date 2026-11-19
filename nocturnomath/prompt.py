@@ -110,6 +110,9 @@ about runtime behavior or saved records, follow this contract.
   original probe ID (for example `S001/P001`). The corrected execution is saved as
   another attempt under that probe; prior code and output remain available. A failed
   attempt needs no verdict.
+- A call to `run` or `submit_slurm` may return without starting a probe if I sent a new
+  message while you were working. Do not call `verdict` for that unstarted probe; read
+  and address my message before running the next probe, or reply directly if no probe is needed.
 
 ## Scientific record
 

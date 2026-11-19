@@ -1,6 +1,7 @@
-import { elements, state } from "./state.js?v=20261016-3";
+import { elements, state } from "./state.js?v=20261117-2";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
+import { rewriteDocumentLinks } from "./workspace.js?v=20261118-2";
 
 // ============================================================================
 // Chat UI Rendering
@@ -285,11 +286,19 @@ export function appendNoteNotification(kind, text) {
   badge.className = "note-badge";
   badge.textContent = ({ evidence: "Evidence", thought: "Thought", evidence_struck: "Struck" })[kind] || kind;
 
-  const content = document.createElement("span");
-  content.textContent = text;
+  const content = document.createElement("div");
+  content.className = "note-body";
+  content.innerHTML = renderMarkdown(text);
+  rewriteDocumentLinks(
+    content,
+    kind === "thought"
+      ? (state.workspace?.thoughts_path || ".nocturnomath/kb/thoughts.md")
+      : (state.workspace?.evidence_path || ".nocturnomath/kb/evidence.md"),
+  );
+  highlightBlocks(content);
+  renderMath(content);
 
-  notif.appendChild(badge);
-  notif.appendChild(content);
+  notif.append(badge, content);
 
   elements.chatMessages.appendChild(notif);
   scrollChatToBottom();

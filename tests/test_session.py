@@ -1,166 +1,190 @@
 import asyncio
 import json
-import os
-import shlex
-import subprocess
-from typing import Any, ClassVar
-from unittest.mock import patch
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
-from claude_agent_sdk import (
-    AssistantMessage,
-    ResultMessage,
-    StreamEvent,
-    SystemMessage,
-    TextBlock,
-)
 from conftest import FakeEnvironment, FakeKernel
 
-from nocturnomath.auth import ClaudeAuth
+from nocturnomath.auth import AuthStore
+from nocturnomath.backends import (
+    CompactionNotice,
+    CompactResult,
+    MessageUsage,
+    ModelSpec,
+    SessionResumeError,
+    SessionStarted,
+    TextBlockDone,
+    TextDelta,
+    TurnResult,
+    TurnStarted,
+)
 from nocturnomath.session import ExplorationSession
 
 
-def stream_event(delta, parent_tool_use_id=None):
-    return StreamEvent(
-        uuid="stream-event",
+@dataclass
+class TurnCall:
+    prompt: str
+    system_prompt: str
+    model: str
+    effort: str | None
+    auth: Any
+    resume_session_id: str | None
+    workspace_path: Any
+
+
+class FakeBackend:
+    def __init__(
+        self,
+        provider="anthropic",
+        *,
+        uses_compact_hook=True,
         session_id="sdk-session",
-        event={"type": "content_block_delta", "index": 0, "delta": delta},
-        parent_tool_use_id=parent_tool_use_id,
-    )
+        events=None,
+        compact_result=None,
+        fail_turn=None,
+        fail_compact=None,
+    ):
+        self.provider = provider
+        self.uses_compact_hook = uses_compact_hook
+        self.session_id = session_id
+        self.custom_events = events
+        self.compact_result = compact_result
+        self.fail_turn = fail_turn
+        self.fail_compact = fail_compact
+        self.calls: list[TurnCall] = []
+        self.compact_calls: list[dict[str, Any]] = []
 
+    async def discover_models(self, auth):
+        return [
+            ModelSpec(id="test", raw_id="test", provider=self.provider, label="test")
+        ]
 
-class FakeClient:
-    prompts: ClassVar[list[str]] = []
-    options_used: ClassVar[list[Any]] = []
+    async def discover_models_staged(self, auth):
+        return await self.discover_models(auth), lambda: None
 
-    def __init__(self, options):
-        self.options = options
-        FakeClient.options_used.append(options)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return None
-
-    async def query(self, prompt):
-        self.prompts.append(prompt)
-
-    async def receive_response(self):
-        yield stream_event({"type": "text_delta", "text": "ans"})
-        yield stream_event({"type": "text_delta", "text": "wer"})
-        yield stream_event({"type": "thinking_delta", "thinking": "musing"})
-        yield stream_event({"type": "text_delta", "text": "sub"}, "tool-use-1")
-        yield AssistantMessage(
-            content=[TextBlock("answer")], model="test", session_id="sdk-session"
+    async def run_turn(
+        self,
+        prompt,
+        *,
+        system_prompt,
+        tools,
+        workspace_path,
+        model,
+        effort,
+        auth,
+        resume_session_id=None,
+        tool_timeout_s=660,
+    ):
+        self.tool_timeout_s = tool_timeout_s
+        self.calls.append(
+            TurnCall(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model,
+                effort=effort,
+                auth=auth,
+                resume_session_id=resume_session_id,
+                workspace_path=workspace_path,
+            )
         )
+        if self.fail_turn is not None:
+            raise self.fail_turn
+        if self.custom_events is not None:
+            for item in self.custom_events:
+                yield item
+            return
+        yield SessionStarted(self.session_id)
+        yield TextDelta("ans")
+        yield TextDelta("wer")
+        yield TextBlockDone("answer")
+        yield TurnResult()
 
-
-class FailingClient(FakeClient):
-    async def query(self, prompt):
-        raise RuntimeError("send failed")
-
-
-class UsageClient(FakeClient):
-    async def receive_response(self):
-        yield AssistantMessage(
-            content=[TextBlock("answer")],
-            model="test",
-            session_id="sdk-session",
-            usage={
-                "input_tokens": 1000,
-                "cache_read_input_tokens": 12000,
-                "cache_creation_input_tokens": 500,
-                "output_tokens": 300,
+    async def compact(
+        self,
+        *,
+        system_prompt,
+        tools,
+        workspace_path,
+        model,
+        effort,
+        auth,
+        resume_session_id,
+    ):
+        self.compact_calls.append(
+            {
+                "system_prompt": system_prompt,
+                "model": model,
+                "effort": effort,
+                "auth": auth,
+                "resume_session_id": resume_session_id,
+            }
+        )
+        if self.fail_compact is not None:
+            raise self.fail_compact
+        return self.compact_result or CompactResult(
+            session_id=resume_session_id,
+            context_usage={
+                "used_tokens": 4200,
+                "window_tokens": 200000,
+                "model": "test",
             },
         )
-        yield ResultMessage(
-            subtype="success",
-            duration_ms=1,
-            duration_api_ms=1,
-            is_error=False,
-            num_turns=1,
-            session_id="sdk-session",
-            model_usage={"test": {"contextWindow": 200000}},
-        )
 
 
-class CostClient(FakeClient):
-    async def receive_response(self):
-        yield AssistantMessage(
-            content=[TextBlock("hi")],
-            model="m",
-            session_id="sdk-session",
-            usage={"input_tokens": 10, "output_tokens": 5},
-            message_id="msg_1",
-        )
-        yield ResultMessage(
-            subtype="success",
-            duration_ms=1,
-            duration_api_ms=1,
-            is_error=False,
-            num_turns=1,
-            session_id="sdk-session",
-            total_cost_usd=0.01,
-            usage={"input_tokens": 10, "output_tokens": 5},
-        )
-
-
-class CompactingClient(FakeClient):
-    async def receive_response(self):
-        yield SystemMessage(subtype="compact_boundary", data={"trigger": "auto"})
-        yield AssistantMessage(
-            content=[TextBlock("continued")], model="test", session_id="sdk-session"
-        )
-
-    async def get_context_usage(self):
-        return {"totalTokens": 4200, "rawMaxTokens": 200000, "model": "test"}
-
-
-class NoBoundaryClient(FakeClient):
-    async def receive_response(self):
-        yield AssistantMessage(content=[], model="test", session_id="sdk-session")
-
-
-class SlowUsageClient(CompactingClient):
-    async def get_context_usage(self):
-        await asyncio.sleep(1)
+def attach_backend(session, backend: FakeBackend, provider="anthropic"):
+    session.backends[provider] = backend
+    return backend
 
 
 @pytest.mark.asyncio
-async def test_compaction_is_recorded_and_reloads_current_scientific_record(session):
+async def test_compaction_is_recorded_and_reloads_scientific_record_when_needed(
+    session,
+):
     events = []
     session.subscribe(lambda event_type, payload: events.append(event_type))
-    with patch("nocturnomath.session.ClaudeSDKClient", CompactingClient):
-        await session.query("question")
+    anthropic = attach_backend(
+        session,
+        FakeBackend(
+            uses_compact_hook=True,
+            events=[
+                SessionStarted("sdk-session"),
+                CompactionNotice(),
+                TextBlockDone("continued"),
+                TurnResult(),
+            ],
+        ),
+        "anthropic",
+    )
+    await session.query("question")
 
     assert "context_compacted" in events
     assert any(
         record["kind"] == "compaction" for record in session.workspace.current_records()
     )
-    options = FakeClient.options_used[-1]
-    hook = json.loads(options.settings)["hooks"]["SessionStart"][0]
-    assert hook["matcher"] == "compact"
-    assert "nocturnomath.compaction" in hook["hooks"][0]["command"]
-    assert options.env["NOCTURNOMATH_WORKSPACE_PATH"] == str(session.workspace_path)
+    assert not session._record_dirty
+    assert anthropic.calls[-1].workspace_path == session.workspace_path
 
-    session.workspace.notes.evidence_path.write_text(
-        "# Evidence\n\n## E001\n\nNew result\n"
+    # Non-hook providers (OpenAI / Google) mark the record dirty so the next turn
+    # reloads evidence.md and thoughts.md explicitly.
+    session.model = "gpt-5.6-sol"
+    attach_backend(
+        session,
+        FakeBackend(
+            provider="openai",
+            uses_compact_hook=False,
+            session_id="thr-1",
+            events=[
+                SessionStarted("thr-1"),
+                CompactionNotice(),
+                TextBlockDone("ok"),
+                TurnResult(),
+            ],
+        ),
+        "openai",
     )
-    result = await asyncio.to_thread(
-        subprocess.run,
-        shlex.split(hook["hooks"][0]["command"]),
-        input='{"source":"compact"}',
-        text=True,
-        capture_output=True,
-        cwd=session.workspace_path,
-        env={**os.environ, **options.env},
-        check=True,
-    )
-    context = json.loads(result.stdout)["hookSpecificOutput"]
-    assert context["hookEventName"] == "SessionStart"
-    assert "New result" in context["additionalContext"]
-    assert "# Thoughts" in context["additionalContext"]
+    await session.query("next")
+    assert session._record_dirty is True
 
 
 @pytest.mark.asyncio
@@ -169,13 +193,12 @@ async def test_manual_compaction_keeps_transcript_and_kernel_and_refreshes_usage
 ):
     events = []
     session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("original question")
+    backend = attach_backend(session, FakeBackend())
+    await session.query("original question")
     kernel = session.kernel
-    with patch("nocturnomath.session.ClaudeSDKClient", CompactingClient):
-        await session.compact()
+    await session.compact()
 
-    assert FakeClient.prompts[-1] == "/compact"
+    assert backend.compact_calls[-1]["resume_session_id"] == "sdk-session"
     assert session.kernel is kernel
     assert session._sdk_session_id == "sdk-session"
     assert session.context_usage == {
@@ -196,12 +219,12 @@ async def test_manual_compaction_keeps_transcript_and_kernel_and_refreshes_usage
 async def test_manual_compaction_requires_context_and_confirmation(session):
     with pytest.raises(RuntimeError, match="no conversation context"):
         await session.compact()
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("original question")
-    with (
-        patch("nocturnomath.session.ClaudeSDKClient", NoBoundaryClient),
-        pytest.raises(RuntimeError, match="did not confirm"),
-    ):
+    attach_backend(
+        session,
+        FakeBackend(fail_compact=RuntimeError("Claude did not confirm")),
+    )
+    await session.query("original question")
+    with pytest.raises(RuntimeError, match="did not confirm"):
         await session.compact()
     assert not session.has_active_query()
     assert not any(
@@ -210,34 +233,49 @@ async def test_manual_compaction_requires_context_and_confirmation(session):
 
 
 @pytest.mark.asyncio
-async def test_manual_compaction_does_not_wait_for_slow_usage_refresh(session):
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("original question")
-    with (
-        patch("nocturnomath.session.ClaudeSDKClient", SlowUsageClient),
-        patch("nocturnomath.session.CONTEXT_USAGE_TIMEOUT_S", 0.01),
-    ):
-        await session.compact()
+async def test_manual_compaction_on_non_hook_backend_marks_record_dirty(session):
+    session.model = "gpt-5.6-sol"
+    openai = attach_backend(
+        session,
+        FakeBackend(
+            provider="openai",
+            uses_compact_hook=False,
+            session_id="thr-1",
+            compact_result=CompactResult(session_id="thr-1", context_usage=None),
+        ),
+        "openai",
+    )
+    await session.query("original question")
+    await session.compact()
 
     assert session.context_usage is None
+    assert session._record_dirty is True
     assert not session.has_active_query()
     assert any(
         record["kind"] == "compaction" for record in session.workspace.current_records()
     )
+    session.workspace.notes.add_evidence("Temp = 4 K.", ["source"])
+    await session.query("follow up")
+    assert "Temp = 4 K." in openai.calls[-1].prompt
 
 
 @pytest.mark.asyncio
 async def test_context_usage_is_reported_and_restored_from_history(session):
     events = []
     session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
-    with patch("nocturnomath.session.ClaudeSDKClient", UsageClient):
-        await session.query("question")
+    expected = {"used_tokens": 13500, "window_tokens": 200000, "model": "test"}
+    attach_backend(
+        session,
+        FakeBackend(
+            events=[
+                SessionStarted("sdk-session"),
+                TextBlockDone("answer"),
+                TurnResult(context_usage=expected),
+            ]
+        ),
+    )
+    await session.query("question")
 
-    expected = {
-        "used_tokens": 13500,
-        "window_tokens": 200000,
-        "model": "test",
-    }
     assert session.context_usage == expected
     assert (
         next(
@@ -261,18 +299,13 @@ async def test_context_usage_is_reported_and_restored_from_history(session):
 async def test_query_streams_text_tracks_context_and_logs(session):
     events = []
     session.subscribe(lambda event_type, payload: events.append((event_type, payload)))
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("question")
+    backend = attach_backend(session, FakeBackend())
+    await session.query("question")
 
     assert session._sdk_session_id == "sdk-session"
-    options = FakeClient.options_used[-1]
-    assert options.include_partial_messages is True
-    assert options.effort == "high"
-    assert options.tools == []
-    assert options.strict_mcp_config is True
-    assert options.setting_sources == ["user"]
-    assert options.skills == []
-    assert options.cwd == session.workspace_path
+    call = backend.calls[-1]
+    assert call.effort == "high"
+    assert call.workspace_path == session.workspace_path
     assert [event_type for event_type, _ in events] == [
         "status_change",
         "assistant_delta",
@@ -308,9 +341,9 @@ async def test_pending_probe_verdict_survives_next_message_and_resume(session):
     await tools["run"].handler({"code": "print(42)", "expected": "prints 42"})
     assert session._pending_verdict_probe_id == "S001/P001"
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("Continue")
-    assert "S001/P001 still needs a verdict" in FakeClient.prompts[-1]
+    backend = attach_backend(session, FakeBackend())
+    await session.query("Continue")
+    assert "S001/P001 still needs a verdict" in backend.calls[-1].prompt
     assert session._pending_verdict_probe_id == "S001/P001"
     blocked = await tools["run"].handler({"code": "print(43)", "expected": "prints 43"})
     assert blocked["is_error"]
@@ -329,19 +362,19 @@ async def test_batch_review_is_an_internal_turn_and_preserves_next_message_docum
     session,
 ):
     session.log_transcript("user", text="Original question")
-    session._sdk_session_id = "original-sdk-session"
+    session._track_session_id("original-sdk-session", "anthropic")
     session.workspace.save_document("input.md", "Selected for the next message", False)
     session.refresh_document_settings()
     session.set_document_included("input.md", True)
     events = []
     session.subscribe(lambda kind, payload: events.append((kind, payload)))
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.review_slurm("S001/P001")
+    backend = attach_backend(session, FakeBackend())
+    await session.review_slurm("S001/P001")
 
-    assert FakeClient.options_used[-1].resume == "original-sdk-session"
-    assert "S001/P001" in FakeClient.prompts[-1]
-    assert "Selected for the next message" not in FakeClient.prompts[-1]
+    assert backend.calls[-1].resume_session_id == "original-sdk-session"
+    assert "S001/P001" in backend.calls[-1].prompt
+    assert "Selected for the next message" not in backend.calls[-1].prompt
     assert session._sent_documents == {}
     records = session.workspace.current_records()
     assert [record["text"] for record in records if record["kind"] == "user"] == [
@@ -353,33 +386,101 @@ async def test_batch_review_is_an_internal_turn_and_preserves_next_message_docum
     )
     assert any(kind == "slurm_review" for kind, _ in events)
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("Next user message")
-    assert "Selected for the next message" in FakeClient.prompts[-1]
+    await session.query("Next user message")
+    assert "Selected for the next message" in backend.calls[-1].prompt
 
 
 @pytest.mark.asyncio
-async def test_query_passes_selected_effort_to_the_sdk(session):
+async def test_query_passes_selected_effort_to_backend(session):
     session.effort = "xhigh"
+    backend = attach_backend(session, FakeBackend())
+    await session.query("question")
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("question")
-
-    assert FakeClient.options_used[-1].effort == "xhigh"
+    assert backend.calls[-1].effort == "xhigh"
 
 
 @pytest.mark.asyncio
-async def test_query_passes_selected_authentication_only_to_the_sdk(session):
-    session.auth = ClaudeAuth.interactive("api_key", "top-secret-key")
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("question")
+async def test_query_passes_selected_authentication_only_to_backend(session):
+    session.auth = AuthStore()
+    session.auth.set("anthropic", "api_key", "top-secret-key")
+    backend = attach_backend(session, FakeBackend())
+    await session.query("question")
 
-    options = FakeClient.options_used[-1]
-    assert options.env["ANTHROPIC_API_KEY"] == "top-secret-key"
-    assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
-    assert options.env["ANTHROPIC_AUTH_TOKEN"] == ""
+    env = backend.calls[-1].auth.sdk_env()
+    assert env["ANTHROPIC_API_KEY"] == "top-secret-key"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert env["ANTHROPIC_AUTH_TOKEN"] == ""
     transcript = session.transcript_path.read_text()
     assert "top-secret-key" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_switching_providers_mid_chat_keeps_kernel_and_recaps_history(session):
+    anthropic = attach_backend(
+        session, FakeBackend(provider="anthropic", session_id="ant-1"), "anthropic"
+    )
+    openai = attach_backend(
+        session,
+        FakeBackend(provider="openai", uses_compact_hook=False, session_id="oai-1"),
+        "openai",
+    )
+    (session.workspace.documents_path / "notes.md").write_text("# Notes\nalpha = 1\n")
+
+    restarts_before = session.kernel.restarts
+    await session.query("first question")
+    assert anthropic.calls[-1].resume_session_id is None
+    assert "### notes.md" in anthropic.calls[-1].prompt
+
+    # Same provider switches model while preserving the native session ID.
+    session.model = "claude-sonnet-5-5"
+    await session.query("same provider follow up")
+    assert anthropic.calls[-1].model == "claude-sonnet-5-5"
+    assert anthropic.calls[-1].resume_session_id == "ant-1"
+    assert "first question" not in anthropic.calls[-1].prompt
+
+    # Switching to OpenAI mid-session keeps the live kernel, resets native session,
+    # prepends a recap of earlier turns without duplicating the new message, and
+    # re-sends active documents to the new provider.
+    session.model = "gpt-5.6-sol"
+    await session.query("cross provider question")
+    assert session.kernel.restarts == restarts_before
+    oai_call = openai.calls[-1]
+    assert oai_call.resume_session_id is None
+    assert (
+        "live Jupyter kernel and its in-memory variables are still intact"
+        in oai_call.prompt
+    )
+    assert "Me: first question" in oai_call.prompt
+    assert "Me: same provider follow up" in oai_call.prompt
+    assert oai_call.prompt.count("cross provider question") == 1
+    assert "### notes.md" in oai_call.prompt
+
+    # Subsequent turn on OpenAI resumes the OpenAI thread natively.
+    await session.query("openai follow up")
+    assert openai.calls[-1].resume_session_id == "oai-1"
+
+    # Resuming S001 while an Anthropic model is selected still retains the saved
+    # native OpenAI thread until the next message actually picks a backend.
+    session.start_new_transcript()
+    session.model = "claude-opus-5-5"
+    resumed = session.resume_session("S001")
+    assert resumed["context_restored"] is True
+    assert session._sdk_session_id == "oai-1"
+    assert session._resume_prefix is None
+
+    # Switching back to OpenAI before sending uses that preserved native thread.
+    session.model = "gpt-5.6-sol"
+    await session.query("still native on openai")
+    assert openai.calls[-1].resume_session_id == "oai-1"
+
+    # Switching to Anthropic after resuming converts the preserved thread into a recap.
+    session.start_new_transcript()
+    session.model = "claude-opus-5-5"
+    resumed_then_switch = session.resume_session("S001")
+    assert resumed_then_switch["context_restored"] is True
+    await session.query("switch after resume")
+    assert anthropic.calls[-1].resume_session_id is None
+    assert "Me: still native on openai" in anthropic.calls[-1].prompt
 
 
 @pytest.mark.asyncio
@@ -401,7 +502,7 @@ async def test_active_query_guards_state_and_interrupts(session):
 @pytest.mark.asyncio
 async def test_resume_reads_current_records_and_reuses_session_probe_folder(session):
     session.log_transcript("user", text="original investigation")
-    session.log_transcript("meta", sdk_session_id="sdk-session")
+    session.log_transcript("meta", provider="anthropic", sdk_session_id="sdk-session")
     session.workspace.start_probe("print(3)", "3", "test")
     session.workspace.notes.add_evidence("Value = 3.", ["source"])
     session.reset_client_session()
@@ -409,10 +510,10 @@ async def test_resume_reads_current_records_and_reuses_session_probe_folder(sess
     resumed = session.resume_session("S001")
     assert resumed["id"] == "S001"
     assert session.workspace.start_probe("print(4)", "4", "test").name == "P002"
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("continue")
-    assert "<del>" in FakeClient.prompts[-1]
-    assert "Value = 3." in FakeClient.prompts[-1]
+    backend = attach_backend(session, FakeBackend())
+    await session.query("continue")
+    assert "<del>" in backend.calls[-1].prompt
+    assert "Value = 3." in backend.calls[-1].prompt
 
 
 def test_resume_with_kernel_replays_recorded_probe_code_in_order(session):
@@ -439,40 +540,40 @@ async def test_included_documents_are_sent_when_new_or_changed(session):
     (documents / "draft.md").write_text("# Draft\n")
     session.set_document_included("draft.md", False)
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("first")
-        first = FakeClient.prompts[-1]
-        assert "### inputs.md\n\n# Inputs\n\nN = 10\n" in first
-        assert "draft.md" not in first
-        assert (
-            first.index("# Evidence")
-            < first.index("### inputs.md")
-            < first.index("first")
-        )
+    backend = attach_backend(session, FakeBackend())
+    await session.query("first")
+    first = backend.calls[-1].prompt
+    assert "### inputs.md\n\n# Inputs\n\nN = 10\n" in first
+    assert "draft.md" not in first
+    assert (
+        first.index("# Evidence") < first.index("### inputs.md") < first.index("first")
+    )
 
-        await session.query("second")
-        assert "inputs.md" not in FakeClient.prompts[-1]
-        (documents / "inputs.md").write_text("# Inputs\n\nN = 20\n")
-        await session.query("third")
-        third = FakeClient.prompts[-1]
-        assert "N = 20" in third and "N = 10" not in third
+    await session.query("second")
+    assert "inputs.md" not in backend.calls[-1].prompt
+    (documents / "inputs.md").write_text("# Inputs\n\nN = 20\n")
+    await session.query("third")
+    third = backend.calls[-1].prompt
+    assert "N = 20" in third and "N = 10" not in third
 
-        session.set_documents_default(False)
-        await session.query("fourth")
-        assert "inputs.md" not in FakeClient.prompts[-1]
-        assert session.list_documents() == [
-            {**item, "included": False} for item in session.workspace.list_documents()
-        ]
+    session.set_documents_default(False)
+    await session.query("fourth")
+    assert "inputs.md" not in backend.calls[-1].prompt
+    assert session.list_documents() == [
+        {**item, "included": False} for item in session.workspace.list_documents()
+    ]
 
-        session.set_document_included("inputs.md", True)
-        (documents / "inputs.md").write_text("# Inputs\n\nN = 30\n")
-        await session.query("fifth")
-        assert "N = 30" in FakeClient.prompts[-1]
-        await session.query("sixth")
-        assert "inputs.md" not in FakeClient.prompts[-1]
+    session.set_document_included("inputs.md", True)
+    (documents / "inputs.md").write_text("# Inputs\n\nN = 30\n")
+    await session.query("fifth")
+    assert "N = 30" in backend.calls[-1].prompt
+    await session.query("sixth")
+    assert "inputs.md" not in backend.calls[-1].prompt
 
 
 def test_document_selections_persist_per_workspace(session, tmp_path):
+    from unittest.mock import patch
+
     session.workspace.save_document("inputs.md", "# Inputs")
     session.workspace.save_document("draft.md", "# Draft")
     session.set_document_included("draft.md", False)
@@ -512,37 +613,35 @@ async def test_nested_document_saved_by_tool_enters_next_message_context(session
     await save.handler(
         {"path": "reports/summary.md", "text": "# Summary", "replace_existing": False}
     )
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("Read the report")
-        assert "### reports/summary.md\n\n# Summary\n" in FakeClient.prompts[-1]
-        await session.query("Continue")
-        assert "### reports/summary.md" not in FakeClient.prompts[-1]
+    backend = attach_backend(session, FakeBackend())
+    await session.query("Read the report")
+    assert "### reports/summary.md\n\n# Summary\n" in backend.calls[-1].prompt
+    await session.query("Continue")
+    assert "### reports/summary.md" not in backend.calls[-1].prompt
 
-        await save.handler(
-            {
-                "path": "reports/summary.md",
-                "text": "# Updated",
-                "replace_existing": True,
-            }
-        )
-        await session.query("Continue again")
-        assert "### reports/summary.md\n\n# Updated\n" in FakeClient.prompts[-1]
+    await save.handler(
+        {
+            "path": "reports/summary.md",
+            "text": "# Updated",
+            "replace_existing": True,
+        }
+    )
+    await session.query("Continue again")
+    assert "### reports/summary.md\n\n# Updated\n" in backend.calls[-1].prompt
 
 
 @pytest.mark.asyncio
 async def test_project_prompt_applies_to_next_query_without_resetting_context(session):
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("first")
-        session_id = session._sdk_session_id
-        session.set_exploration_prompt("Explore this project's data carefully.")
-        await session.query("second")
+    backend = attach_backend(session, FakeBackend())
+    await session.query("first")
+    session_id = session._sdk_session_id
+    session.set_exploration_prompt("Explore this project's data carefully.")
+    await session.query("second")
 
-    options = FakeClient.options_used[-1]
-    assert options.resume == session_id
-    assert options.system_prompt.startswith(
-        "Explore this project's data carefully.\n\n"
-    )
-    assert "# Nocturnomath runtime contract" in options.system_prompt
+    call = backend.calls[-1]
+    assert call.resume_session_id == session_id
+    assert call.system_prompt.startswith("Explore this project's data carefully.\n\n")
+    assert "# Nocturnomath runtime contract" in call.system_prompt
     assert session.workspace.read_config()["exploration_prompt"] == (
         "Explore this project's data carefully."
     )
@@ -552,20 +651,38 @@ async def test_project_prompt_applies_to_next_query_without_resetting_context(se
 async def test_document_context_is_retried_when_submission_fails(session):
     (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FailingClient):
-        await session.query("first")
+    attach_backend(session, FakeBackend(fail_turn=RuntimeError("send failed")))
+    await session.query("first")
     assert session._sent_documents == {}
 
-    with patch("nocturnomath.session.ClaudeSDKClient", FakeClient):
-        await session.query("second")
-    assert "### inputs.md\n\n# Inputs\n" in FakeClient.prompts[-1]
-    assert "# Evidence" in FakeClient.prompts[-1]
+    backend = attach_backend(session, FakeBackend())
+    await session.query("second")
+    assert "### inputs.md\n\n# Inputs\n" in backend.calls[-1].prompt
+    assert "# Evidence" in backend.calls[-1].prompt
 
 
 @pytest.mark.asyncio
 async def test_query_logs_usage_records(session):
-    with patch("nocturnomath.session.ClaudeSDKClient", CostClient):
-        await session.query("hello")
+    attach_backend(
+        session,
+        FakeBackend(
+            events=[
+                SessionStarted("sdk-session"),
+                MessageUsage(
+                    message_id="msg_1",
+                    model="m",
+                    usage={"input_tokens": 10, "output_tokens": 5},
+                ),
+                TextBlockDone("hi"),
+                TurnResult(
+                    total_cost_usd=0.01,
+                    usage={"input_tokens": 10, "output_tokens": 5},
+                    num_turns=1,
+                ),
+            ]
+        ),
+    )
+    await session.query("hello")
     records = [
         json.loads(line) for line in session.transcript_path.read_text().splitlines()
     ]
@@ -575,3 +692,725 @@ async def test_query_logs_usage_records(session):
     assert msg[0]["usage"]["output_tokens"] == 5
     assert len(total) == 1 and total[0]["total_cost_usd"] == 0.01
     assert total[0]["num_turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_after_session_started_does_not_commit_prompt_state(session):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+
+    class EmitStartThenFailBackend(FakeBackend):
+        async def run_turn(self, *args, **kwargs):
+            yield SessionStarted("ephemeral-thread")
+            raise RuntimeError("invalid model")
+
+    attach_backend(session, EmitStartThenFailBackend())
+    assert await session.query("first") is False
+    assert session._sdk_session_id is None
+    assert session._active_provider is None
+    assert session._session_initialized is False
+    assert session._sent_documents == {}
+    assert session._kernel_notice != ""
+
+    backend = attach_backend(session, FakeBackend(session_id="real-thread"))
+    assert await session.query("second") is True
+    assert session._sdk_session_id == "real-thread"
+    assert "# Evidence" in backend.calls[-1].prompt
+    assert "### inputs.md\n\n# Inputs\n" in backend.calls[-1].prompt
+
+
+@pytest.mark.asyncio
+async def test_stale_native_session_falls_back_to_recap_and_recovers(session):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+    session.model = "gpt-5.6-sol"
+
+    class RecoveringBackend(FakeBackend):
+        def __init__(self):
+            super().__init__(provider="openai", uses_compact_hook=False)
+            self.turn_num = 0
+
+        async def run_turn(self, prompt, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            self.turn_num += 1
+            if self.turn_num == 1:
+                yield SessionStarted("stale-thread")
+                yield TextBlockDone("first answer")
+                yield TurnResult()
+                return
+            if kwargs.get("resume_session_id") == "stale-thread":
+                raise SessionResumeError("Thread not found")
+            yield SessionStarted("fresh-thread")
+            yield TextBlockDone("recovered answer")
+            yield TurnResult()
+
+    backend = attach_backend(session, RecoveringBackend(), "openai")
+    events: list[tuple[str, dict[str, Any]]] = []
+    session.subscribe(lambda et, payload: events.append((et, payload)))
+    assert await session.query("first question") is True
+    assert session._sdk_session_id == "stale-thread"
+
+    assert await session.query("follow up") is True
+    assert len(backend.calls) == 3
+    assert backend.calls[1].resume_session_id == "stale-thread"
+    assert backend.calls[2].resume_session_id is None
+    assert (
+        "live Jupyter kernel and its in-memory variables are still intact"
+        in backend.calls[2].prompt
+    )
+    assert "Me: first question" in backend.calls[2].prompt
+    assert backend.calls[2].prompt.count("follow up") == 1
+    assert "### inputs.md\n\n# Inputs\n" in backend.calls[2].prompt
+    assert session._sdk_session_id == "fresh-thread"
+    assert any(
+        et == "system_message"
+        and "rebuilt context from the saved transcript" in payload["text"]
+        for et, payload in events
+    )
+    records = [
+        json.loads(line) for line in session.transcript_path.read_text().splitlines()
+    ]
+    assert any(
+        r.get("kind") == "meta"
+        and r.get("context_rebuilt") is True
+        and r.get("stale_sdk_session_id") == "stale-thread"
+        for r in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_omits_model_when_selected_model_belongs_to_another_provider(
+    session,
+):
+    anthropic = attach_backend(
+        session, FakeBackend(provider="anthropic", session_id="ant-1"), "anthropic"
+    )
+    await session.query("first")
+    session.model = "gpt-5.6-sol"
+
+    await session.compact()
+    assert anthropic.compact_calls[-1]["model"] is None
+    assert anthropic.compact_calls[-1]["effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_tool_run_or_turn_started_before_failure_commits_thread_and_docs(
+    session,
+):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+
+    class ToolThenFailBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            yield SessionStarted("thread-via-tool")
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["list_documents"].handler({})
+            raise RuntimeError("interrupted mid-probe")
+
+    backend = attach_backend(session, ToolThenFailBackend(provider="openai"), "openai")
+    session.model = "gpt-5.6-sol"
+    assert await session.query("run a tool first") is False
+    assert session._sdk_session_id == "thread-via-tool"
+    assert session._active_provider == "openai"
+    assert "inputs.md" in session._sent_documents
+
+    # Next turn resumes the committed thread without resending unchanged inputs.md.
+    class TurnStartedThenFailBackend(FakeBackend):
+        async def run_turn(self, prompt, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            yield TurnStarted()
+            raise RuntimeError("aborted during reasoning")
+
+    turn_started_backend = attach_backend(
+        session, TurnStartedThenFailBackend(provider="openai"), "openai"
+    )
+    session._session_initialized = False
+    assert await session.query("follow up") is False
+    assert session._session_initialized is True
+    assert turn_started_backend.calls[-1].resume_session_id == "thread-via-tool"
+    assert "### inputs.md" not in turn_started_backend.calls[-1].prompt
+    assert backend.calls[-1].resume_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_record_dirty_and_non_hook_compaction_reload_labels(session):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class PausedBackend(FakeBackend):
+        async def run_turn(self, prompt, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            started.set()
+            await release.wait()
+            yield SessionStarted("oai-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    attach_backend(
+        session, PausedBackend(provider="openai", uses_compact_hook=False), "openai"
+    )
+    session.model = "gpt-5.6-sol"
+    task = asyncio.create_task(session.query("first turn"))
+    await started.wait()
+    # Another explorer modifies the shared record after first turn's prompt was built
+    # but before the turn makes progress.
+    session.workspace.notes.add_evidence("Observed later.", ["source"])
+    session.mark_record_dirty()
+    release.set()
+    assert await task is True
+    assert session._record_dirty is True
+
+    backend2 = attach_backend(
+        session, FakeBackend(provider="openai", uses_compact_hook=False), "openai"
+    )
+    session.timeout_s = 900
+    await session.query("second turn")
+    assert backend2.tool_timeout_s == 960
+    assert (
+        "The shared scientific record changed in another exploration."
+        in backend2.calls[-1].prompt
+    )
+    assert "Observed later." in backend2.calls[-1].prompt
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    session.subscribe(lambda et, payload: events.append((et, payload)))
+    compacting_backend = attach_backend(
+        session,
+        FakeBackend(
+            provider="openai",
+            uses_compact_hook=False,
+            events=[
+                SessionStarted("oai-1"),
+                CompactionNotice(),
+                TextBlockDone("after compaction"),
+                TurnResult(),
+            ],
+        ),
+        "openai",
+    )
+    await session.query("trigger auto compact")
+    compacted = [payload for et, payload in events if et == "context_compacted"]
+    assert compacted and compacted[-1]["record_reloaded"] is False
+    assert session._record_dirty is True
+
+    await session.query("post compaction turn")
+    assert "Conversation history was compacted." in compacting_backend.calls[-1].prompt
+    assert (
+        "The shared scientific record changed in another exploration."
+        not in compacting_backend.calls[-1].prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_steer_during_active_turn_delivers_before_second_probe_without_resending_initial_docs(
+    session,
+):
+    (session.workspace.documents_path / "initial.md").write_text("# Initial\n")
+    steered_texts = []
+
+    class SteeredTurnBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            self.calls.append(
+                TurnCall(
+                    prompt=prompt,
+                    system_prompt=kwargs["system_prompt"],
+                    model=kwargs["model"],
+                    effort=kwargs["effort"],
+                    auth=kwargs["auth"],
+                    resume_session_id=kwargs.get("resume_session_id"),
+                    workspace_path=kwargs["workspace_path"],
+                )
+            )
+            yield SessionStarted("sdk-session")
+            by_name = {spec.name: spec for spec in tools}
+            first_run = await by_name["run"].handler(
+                {"code": "x = 1", "expected": "sets x"}
+            )
+            assert not first_run.get("is_error")
+            verdict = await by_name["verdict"].handler({"text": "x was set"})
+            assert not verdict.get("is_error")
+
+            session.enqueue_prompt("Now multiply x by 2", mode="steer")
+            session.workspace.create_document("Added", "Factor is 2")
+
+            steered = await by_name["run"].handler(
+                {"code": "print(x)", "expected": "1"}
+            )
+            assert not steered.get("is_error")
+            steered_texts.append(steered["content"][0]["text"])
+
+            third_run = await by_name["run"].handler(
+                {"code": "print(x * 2)", "expected": "2"}
+            )
+            assert not third_run.get("is_error")
+            assert "Probe S001/P002" in third_run["content"][0]["text"]
+            await by_name["verdict"].handler({"text": "x * 2 was computed"})
+
+            yield TextBlockDone("Done.")
+            yield TurnResult()
+
+    attach_backend(session, SteeredTurnBackend())
+    assert await session.query("Start") is True
+    assert len(steered_texts) == 1
+    assert "Now multiply x by 2" in steered_texts[0]
+    assert "Factor is 2" in steered_texts[0]
+    assert "# Initial" not in steered_texts[0]
+    assert session.kernel.executed_codes == ["x = 1", "print(x * 2)"]
+
+
+@pytest.mark.asyncio
+async def test_session_status_tracks_kernel_probing(session):
+    session._is_busy = True
+    await session.emit("status_change", status="thinking")
+    assert session.status == "thinking"
+
+    await session.emit("probe_start", probe_id="S001/P001", kernel_alive=True)
+    assert session.status == "probing"
+
+    await session.emit("probe_finish", probe_id="S001/P001", status="completed")
+    assert session.status == "thinking"
+
+    await session.emit("probe_start", probe_id="S001/P002", backend="slurm")
+    assert session.status == "thinking"
+
+    session._is_busy = False
+    await session.emit("status_change", status="idle")
+    assert session.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_query_snapshots_turn_model_effort_and_auth_across_concurrent_refresh(
+    session,
+):
+    openai = attach_backend(session, FakeBackend(provider="openai"), "openai")
+    anthropic = attach_backend(session, FakeBackend(provider="anthropic"), "anthropic")
+    session.model_providers = {"gpt-5.6-sol": "openai", "claude-sonnet-5": "anthropic"}
+    session.model_raw_ids = {
+        "gpt-5.6-sol": "gpt-5.6-sol",
+        "claude-sonnet-5": "claude-sonnet-5",
+    }
+    session.model = "gpt-5.6-sol"
+    session.effort = "high"
+
+    async def mutate_on_thinking(event_type, payload):
+        if event_type == "status_change" and payload.get("status") == "thinking":
+            session.auth.set("openai", "api_key", "sk-later")
+            session.model = "claude-sonnet-5"
+            session.effort = "low"
+            session.model_providers = {"claude-sonnet-5": "anthropic"}
+            session.model_raw_ids = {"claude-sonnet-5": "claude-sonnet-5"}
+
+    session.subscribe(mutate_on_thinking)
+    assert await session.query("run with snapshotted turn config") is True
+    assert anthropic.calls == []
+    assert len(openai.calls) == 1
+    call = openai.calls[0]
+    assert call.model == "gpt-5.6-sol"
+    assert call.effort == "high"
+    assert call.auth.method == "cli"
+
+
+@pytest.mark.asyncio
+async def test_recap_kernel_preserved_reflects_kernel_notice_and_provider_switch(
+    session,
+):
+    anthropic = attach_backend(
+        session,
+        FakeBackend(provider="anthropic", session_id="ant-1"),
+        "anthropic",
+    )
+    openai = attach_backend(
+        session,
+        FakeBackend(provider="openai", session_id="oai-1"),
+        "openai",
+    )
+    session.model_providers = {"claude-sonnet-5": "anthropic", "gpt-5.6-sol": "openai"}
+    session.model_raw_ids = {
+        "claude-sonnet-5": "claude-sonnet-5",
+        "gpt-5.6-sol": "gpt-5.6-sol",
+    }
+    session.model = "claude-sonnet-5"
+    assert await session.query("first question") is True
+    assert session._kernel_notice == ""
+
+    # Switching providers while the kernel stayed live marks the kernel preserved.
+    session.model = "gpt-5.6-sol"
+    assert await session.query("switch while kernel live") is True
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        in openai.calls[-1].prompt
+    )
+
+    # After restarting the kernel, switching providers must NOT claim the kernel is intact.
+    session.kernel.restart("manual restart")
+    assert session._kernel_notice
+    session.model = "claude-sonnet-5"
+    assert await session.query("switch after restart") is True
+    rebuild_prompt = anthropic.calls[-1].prompt
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        not in rebuild_prompt
+    )
+    assert "The kernel may no longer hold the state it had then" in rebuild_prompt
+
+
+@pytest.mark.asyncio
+async def test_failed_cross_provider_switch_preserves_thread_and_threadless_turn_rebuilds_context(
+    session,
+):
+    (session.workspace.documents_path / "inputs.md").write_text("# Inputs\n")
+    attach_backend(
+        session,
+        FakeBackend(provider="anthropic", session_id="ant-1"),
+        "anthropic",
+    )
+    assert await session.query("first") is True
+    assert session._sdk_session_id == "ant-1"
+    assert session._active_provider == "anthropic"
+    assert "inputs.md" in session._sent_documents
+
+    # A switch that fails before the new provider accepts the turn leaves the
+    # existing native thread, active provider, and sent documents intact.
+    session.model = "gpt-5.6-sol"
+    attach_backend(
+        session,
+        FakeBackend(provider="openai", fail_turn=RuntimeError("Codex unavailable")),
+        "openai",
+    )
+    assert await session.query("unaccepted switch") is False
+    assert session._sdk_session_id == "ant-1"
+    assert session._active_provider == "anthropic"
+    assert "inputs.md" in session._sent_documents
+
+    # A switch that executes a tool before crashing without SessionStarted has no
+    # native thread ID; the next turn rebuilds full context and documents.
+    class ToolThenDisconnectBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["list_documents"].handler({})
+            raise RuntimeError("disconnected before SessionStarted")
+            yield TurnStarted()
+
+    attach_backend(session, ToolThenDisconnectBackend(provider="openai"), "openai")
+    assert await session.query("partial switch") is False
+    assert session._sdk_session_id is None
+    assert session._active_provider == "openai"
+
+    working_openai = attach_backend(
+        session,
+        FakeBackend(provider="openai", session_id="oai-2"),
+        "openai",
+    )
+    assert await session.query("follow up in memory") is True
+    assert session._sdk_session_id == "oai-2"
+    rebuilt_prompt = working_openai.calls[-1].prompt
+    assert "# Evidence" in rebuilt_prompt
+    assert "Me: first" in rebuilt_prompt
+    assert "### inputs.md" in rebuilt_prompt
+
+
+@pytest.mark.asyncio
+async def test_mid_emit_cancellation_closes_backend_turn_generator(session):
+    closed = False
+    inside_emit = asyncio.Event()
+
+    class GeneratorBackend(FakeBackend):
+        async def run_turn(self, prompt, **kwargs):
+            nonlocal closed
+            try:
+                yield SessionStarted("ant-gen")
+                yield TextDelta("streaming")
+                await asyncio.Event().wait()
+            finally:
+                closed = True
+
+    attach_backend(session, GeneratorBackend(provider="anthropic"), "anthropic")
+
+    async def block_on_delta(event_type, _payload):
+        if event_type == "assistant_delta":
+            inside_emit.set()
+            await asyncio.Event().wait()
+
+    session.subscribe(block_on_delta)
+    task = asyncio.create_task(session.query("cancel inside emit"))
+    session._current_task = task
+    await asyncio.wait_for(inside_emit.wait(), timeout=2)
+    await session.interrupt()
+    assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_resume_session_onto_pending_explorer_initializes_environment_record(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from conftest import FakeEnvironment, FakeKernel
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        first = ExplorationSession(tmp_path, model="claude-sonnet-5")
+        second = ExplorationSession(tmp_path, model="claude-sonnet-5")
+        try:
+            attach_backend(
+                first, FakeBackend(provider="anthropic", session_id="s1"), "anthropic"
+            )
+            assert await first.query("create S001") is True
+            assert first.workspace.session_id == "S001"
+
+            # `second` still has tentative S001 (`session_pending=True`) and no environment_record.
+            assert second.workspace.session_pending is True
+            second.resume_session("S001", restore_kernel=False)
+            assert hasattr(second, "environment_record")
+            by_name = {spec.name: spec for spec in second.tools}
+            res = await by_name["run"].handler(
+                {"code": "print(1 + 1)", "expected": "prints 2"}
+            )
+            assert not res.get("is_error")
+        finally:
+            first.shutdown()
+            second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_user_interrupt_during_kernel_probe_records_interrupted_status(session):
+    import threading
+
+    entered = threading.Event()
+    interrupted = threading.Event()
+
+    def slow_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        interrupted.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = True
+        return "KeyboardInterrupt", [], None
+
+    def mark_interrupt():
+        interrupted.set()
+
+    session.kernel.execute = slow_execute
+    session.kernel.interrupt = mark_interrupt
+
+    class SlowRunBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-int")
+            by_name = {spec.name: spec for spec in tools}
+            # Simulate a backend subprocess whose MCP call completes on kernel SIGINT
+            # slightly before task cancellation reaches the tool handler.
+            await by_name["run"].handler(
+                {"code": "import time; time.sleep(10)", "expected": "finishes"}
+            )
+            await asyncio.Event().wait()
+
+    attach_backend(session, SlowRunBackend(provider="anthropic"), "anthropic")
+    task = asyncio.create_task(session.query("run slow probe"))
+    session._current_task = task
+    await asyncio.to_thread(entered.wait, 5)
+    await session.interrupt()
+
+    probe_meta = (
+        session.workspace.sessions_path / "S001" / "probes" / "P001" / "probe.json"
+    )
+    assert '"status": "interrupted"' in probe_meta.read_text()
+
+
+def test_install_packages_rejects_bare_string_argument(session):
+    with pytest.raises(ValueError, match="package requirements"):
+        session.install_packages("scipy")
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_restart_kernel_tool_preserves_provider_switch_status(session):
+    class RestartingBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-restart")
+            by_name = {spec.name: spec for spec in tools}
+            res = await by_name["restart_kernel"].handler({"reason": "fresh state"})
+            assert not res.get("is_error")
+            yield TextBlockDone("Kernel restarted cleanly.")
+            yield TurnResult()
+
+    attach_backend(session, RestartingBackend(provider="anthropic"), "anthropic")
+    openai = attach_backend(
+        session, FakeBackend(provider="openai", session_id="oai-2"), "openai"
+    )
+    session.model_providers = {"claude-test": "anthropic", "gpt-5.4": "openai"}
+    session.model_raw_ids = {"claude-test": "claude-test", "gpt-5.4": "gpt-5.4"}
+
+    session.model = "claude-test"
+    await session.query("Restart the kernel and verify")
+    assert session._kernel_notice == ""
+
+    session.model = "gpt-5.4"
+    await session.query("Continue on OpenAI")
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        in openai.calls[-1].prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_probe_not_resurrected_and_unsolicited_tool_cancel_spares_kernel(
+    session,
+):
+    import threading
+
+    from nocturnomath.backends import SessionResumeError
+
+    entered = threading.Event()
+    finish_exec = threading.Event()
+    interrupts_called = 0
+
+    def mark_interrupt():
+        nonlocal interrupts_called
+        interrupts_called += 1
+        finish_exec.set()
+
+    # 1. Interrupted probe with kernel.errored=False neither sets _pending_verdict
+    # nor resurrects after a later probe's verdict or session resume.
+    def race_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        finish_exec.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = False
+        return "partial output", [], None
+
+    session.kernel.execute = race_execute
+    session.kernel.interrupt = mark_interrupt
+
+    class InterruptRaceBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-1")
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["run"].handler({"code": "x = 1", "expected": "x is 1"})
+            await asyncio.Event().wait()
+
+    attach_backend(session, InterruptRaceBackend(provider="anthropic"), "anthropic")
+    task = asyncio.create_task(session.query("run interrupted"))
+    session._current_task = task
+    await asyncio.to_thread(entered.wait, 5)
+    await session.interrupt()
+    session._current_task = None
+    assert session._pending_verdict is None
+
+    # Complete a second probe and record its verdict; P001 must not come back.
+    session.kernel.execute = lambda _c, _t: ("2\n", [], None)
+    by_name = {spec.name: spec for spec in session.tools}
+    await by_name["run"].handler({"code": "print(2)", "expected": "2"})
+    assert session._pending_verdict_probe_id == "S001/P002"
+    verdict_res = await by_name["verdict"].handler({"text": "Matched 2."})
+    assert not verdict_res.get("is_error")
+    assert session._pending_verdict is None
+    resumed = session.resume_session("S001")
+    assert resumed["context_restored"] is True
+    assert session._pending_verdict is None
+
+    # 2. Unsolicited MCP tool cancellation mid-turn (e.g. client 180s RPC timeout)
+    # must NOT interrupt the kernel, and must save completed artifacts + pending verdict.
+    entered.clear()
+    finish_exec.clear()
+    interrupts_called = 0
+
+    def long_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        finish_exec.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = False
+        return "49\n", [], None
+
+    session.kernel.execute = long_execute
+
+    class ClientTimeoutBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-1")
+            tool_map = {spec.name: spec for spec in tools}
+            tool_task = asyncio.create_task(
+                tool_map["run"].handler({"code": "7**2", "expected": "49"})
+            )
+            await asyncio.to_thread(entered.wait, 5)
+            tool_task.cancel()
+            await asyncio.sleep(0.02)
+            assert interrupts_called == 0
+            finish_exec.set()
+            with pytest.raises(asyncio.CancelledError):
+                await tool_task
+            yield TextBlockDone("Tool call timed out in client wrapper.")
+            yield TurnResult()
+
+    attach_backend(session, ClientTimeoutBackend(provider="anthropic"), "anthropic")
+    busy_states = {}
+    session.subscribe(
+        lambda kind, payload: (
+            busy_states.__setitem__("turn_complete", session.has_active_query())
+            if kind == "turn_complete"
+            else busy_states.__setitem__("idle", session.has_active_query())
+            if kind == "status_change" and payload.get("status") == "idle"
+            else None
+        )
+    )
+    assert await session.query("run 4m probe") is True
+    assert interrupts_called == 0
+    assert busy_states == {"turn_complete": True, "idle": False}
+    assert session._pending_verdict_probe_id == "S001/P003"
+    p3_meta = json.loads(
+        (
+            session.workspace.sessions_path / "S001" / "probes" / "P003" / "probe.json"
+        ).read_text()
+    )
+    assert p3_meta["status"] == "completed"
+
+    # 3. Stale session during compact() persists context_rebuilt=True on disk.
+    class StaleCompactBackend(FakeBackend):
+        async def compact(self, **kwargs):
+            raise SessionResumeError("missing session")
+
+    attach_backend(session, StaleCompactBackend(provider="anthropic"), "anthropic")
+    with pytest.raises(RuntimeError, match="no longer available"):
+        await session.compact()
+    resumed_after_stale = session.resume_session("S001")
+    assert resumed_after_stale["context_restored"] is False
+    assert session.can_compact is False

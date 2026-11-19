@@ -5,9 +5,10 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .auth import PROVIDERS
 from .notes import ResearchNotes, write_text
 
 logger = logging.getLogger("nocturnomath")
@@ -491,11 +492,81 @@ class Workspace:
         return records
 
     @staticmethod
-    def sdk_id(records: list[dict[str, Any]]) -> str | None:
+    def _accepted_session_meta(
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        owner_provider: str | None = None
+        sdk_id: str | None = None
+        sdk_id_allowed = True
+        model: str | None = None
+        effort: str | None = None
         for record in reversed(records):
-            if record.get("kind") == "meta" and record.get("sdk_session_id"):
-                return record["sdk_session_id"]
-        return None
+            if record.get("kind") != "meta":
+                continue
+            provider = record.get("provider")
+            has_provider = provider in PROVIDERS
+            raw_sdk_id = record.get("sdk_session_id")
+            has_sdk_id = isinstance(raw_sdk_id, str) and bool(raw_sdk_id)
+            has_rebuilt = bool(record.get("context_rebuilt"))
+            if not (has_provider or has_sdk_id or has_rebuilt):
+                continue
+            rec_provider = (
+                provider if has_provider else ("anthropic" if has_sdk_id else None)
+            )
+            if owner_provider is None:
+                if rec_provider is None:
+                    sdk_id_allowed = False
+                    continue
+                owner_provider = rec_provider
+                if has_rebuilt or not has_sdk_id:
+                    sdk_id_allowed = False
+                elif sdk_id_allowed:
+                    sdk_id = raw_sdk_id
+                    sdk_id_allowed = False
+            else:
+                if rec_provider is not None and rec_provider != owner_provider:
+                    break
+                if sdk_id is None and sdk_id_allowed:
+                    if has_rebuilt or not has_sdk_id:
+                        sdk_id_allowed = False
+                    else:
+                        sdk_id = raw_sdk_id
+                        sdk_id_allowed = False
+            if model is None:
+                candidate_model = record.get("raw_model") or record.get("model")
+                if isinstance(candidate_model, str) and candidate_model:
+                    model = candidate_model
+                    rec_effort = record.get("effort")
+                    effort = (
+                        rec_effort
+                        if isinstance(rec_effort, str) and rec_effort
+                        else None
+                    )
+            if (sdk_id is not None or not sdk_id_allowed) and model is not None:
+                break
+        return owner_provider, sdk_id, model, effort
+
+    @classmethod
+    def sdk_session_info(
+        cls,
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        owner_provider, sdk_id, _, _ = cls._accepted_session_meta(records)
+        if sdk_id is not None and owner_provider is not None:
+            return owner_provider, sdk_id
+        return None, None
+
+    @classmethod
+    def sdk_id(cls, records: list[dict[str, Any]]) -> str | None:
+        return cls.sdk_session_info(records)[1]
+
+    @classmethod
+    def session_provider_and_model(
+        cls,
+        records: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None, str | None]:
+        owner_provider, _, model, effort = cls._accepted_session_meta(records)
+        return owner_provider, model, effort
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []
@@ -780,7 +851,19 @@ class Workspace:
         return outputs
 
     @staticmethod
-    def recap(records: list[dict[str, Any]], max_chars: int = 8000) -> str:
+    def recap(
+        records: list[dict[str, Any]],
+        max_chars: int = 8000,
+        *,
+        kernel_preserved: bool = False,
+    ) -> str:
+        expected_by_probe = {
+            record["probe_id"]: record["expected"]
+            for record in records
+            if record.get("kind") == "probe_started"
+            and record.get("probe_id")
+            and record.get("expected")
+        }
         lines = []
         for record in records:
             kind = record.get("kind")
@@ -789,13 +872,47 @@ class Workspace:
             elif kind == "agent":
                 lines.append("You: " + _clip(record.get("text", ""), 800))
             elif kind == "run":
+                probe_id = record.get("probe_id")
+                status = record.get("status", "completed")
+                header = (
+                    f"You ran probe {probe_id} ({status}), expecting: "
+                    if probe_id
+                    else "You ran a probe expecting: "
+                ) + record.get("expected", "")
+                if probe_id:
+                    plot_sources = [
+                        f"{probe_id}/{PurePosixPath(img).name}"
+                        for img in (record.get("images") or [])
+                        if isinstance(img, str) and img
+                    ]
+                    sources = [f"{probe_id}/output.txt", *plot_sources]
+                    header += "\nSources: " + ", ".join(sources)
                 lines.append(
-                    "You ran a probe expecting: "
-                    + record.get("expected", "")
-                    + "\nIt printed: "
-                    + _clip(record.get("output", ""), 400)
+                    header + "\nIt printed: " + _clip(record.get("output", ""), 400)
                 )
-            elif kind in ("evidence", "thought", "evidence_struck", "verdict"):
+            elif kind == "probe_failed":
+                lines.append(
+                    f"Probe {record.get('probe_id', '')} failed: "
+                    + _clip(record.get("text", ""), 300)
+                )
+            elif kind == "slurm_submitted":
+                probe_id = record.get("probe_id", "")
+                line = (
+                    f"Submitted Slurm probe {probe_id} (job {record.get('job_id', '')})"
+                )
+                expected = record.get("expected") or expected_by_probe.get(probe_id, "")
+                if expected:
+                    line += f", expecting: {expected}"
+                lines.append(line)
+            elif kind == "verdict":
+                probe_id = record.get("probe_id")
+                prefix = (
+                    f"Recorded verdict for {probe_id}: "
+                    if probe_id
+                    else "Recorded verdict: "
+                )
+                lines.append(prefix + record.get("text", ""))
+            elif kind in ("evidence", "thought", "evidence_struck"):
                 lines.append(
                     f"Recorded {kind} {record.get('entry_id', '')}: "
                     + record.get("text", "")
@@ -803,8 +920,17 @@ class Workspace:
         body = "\n\n".join(lines)
         if len(body) > max_chars:
             body = "[earlier turns omitted]\n\n" + body[-max_chars:]
-        return (
-            "This continues an earlier exploration session. Its full context could not be "
-            "restored, so here is the transcript so far. The kernel may no longer hold the "
-            "state it had then; re-run whatever you need.\n\n" + body + "\n\n---\n\n"
-        )
+        if kernel_preserved:
+            intro = (
+                "This continues the current exploration session on a new model provider, "
+                "or after rebuilding provider context. Here is the transcript so far. "
+                "The live Jupyter kernel and its in-memory variables are still intact; "
+                "do not re-run earlier probes unless needed."
+            )
+        else:
+            intro = (
+                "This continues an earlier exploration session. Its full context could not be "
+                "restored, so here is the transcript so far. The kernel may no longer hold the "
+                "state it had then; re-run whatever you need."
+            )
+        return intro + "\n\n" + body + "\n\n---\n\n"

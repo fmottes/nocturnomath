@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, SecretStr
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from ..auth import ProviderId
+from ..backends import AgentBackend
 from ..session import ExplorationSession
 from .runtime import WebRuntime
 
@@ -83,14 +85,21 @@ class DocumentsDefaultRequest(BaseModel):
 class SessionDefaultsRequest(BaseModel):
     model: str
     effort: str | None = None
+    provider: Literal["anthropic", "openai", "google"] | None = None
+    raw_model: str | None = None
 
 
 class ExplorationPromptRequest(BaseModel):
     prompt: str | None
 
 
+class PromptModeRequest(BaseModel):
+    mode: str
+
+
 class AuthRequest(BaseModel):
-    method: Literal["claude_code", "subscription", "api_key"]
+    provider: Literal["anthropic", "openai", "google"]
+    method: Literal["cli", "subscription", "api_key"]
     credential: SecretStr | None = None
 
 
@@ -105,6 +114,7 @@ def create_app(
     navigator_root: Path | str = ".",
     python: str | None = None,
     session_factory: Callable[..., ExplorationSession] = ExplorationSession,
+    backends: Mapping[ProviderId, AgentBackend] | None = None,
 ) -> FastAPI:
     """Build the dashboard without opening a workspace until the user chooses one."""
     runtime = WebRuntime(
@@ -115,14 +125,16 @@ def create_app(
         image_cap=image_cap,
         navigator_root=navigator_root,
         session_factory=session_factory,
+        backends=backends,
     )
 
     initial_python = python
+    interrupt_tasks: dict[str, asyncio.Task] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        runtime.start()
         await runtime.discover_models()
+        runtime.start()
         browser_task = None
         if browser_url:
 
@@ -137,6 +149,11 @@ def create_app(
             if browser_task and not browser_task.done():
                 browser_task.cancel()
             await runtime.drain()
+            for task in list(interrupt_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            if interrupt_tasks:
+                await asyncio.gather(*interrupt_tasks.values(), return_exceptions=True)
             runtime.shutdown()
 
     app = FastAPI(title="Nocturnomath Web App", lifespan=lifespan)
@@ -208,9 +225,10 @@ def create_app(
 
     def require_idle(action: str, agent_id: str | None = None):
         session = active_session(agent_id)
+        resolved_agent_id = agent_id or runtime.primary_agent_id
         if (
             runtime.changing
-            or agent_id in runtime._changing_agents
+            or resolved_agent_id in runtime._changing_agents
             or session.has_active_query()
         ):
             raise HTTPException(
@@ -250,8 +268,10 @@ def create_app(
                 detail="Open a workspace folder before using the agent.",
             )
         try:
-            agent_id = await asyncio.to_thread(runtime.create_agent)
+            agent_id = await runtime.create_agent_async()
             snapshot = runtime.agent_snapshot(agent_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Failed to create explorer")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -310,12 +330,18 @@ def create_app(
 
     def auth_payload():
         return {
-            "auth": runtime.auth.public(),
+            "auth": runtime.auth.public(runtime._provider_models),
             "model": runtime.session.model if runtime.session else runtime.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,
+            "model_providers": runtime.model_providers,
+            "model_raw_ids": runtime.model_raw_ids,
             "model_efforts": runtime.model_efforts,
             "effort": runtime.session.effort if runtime.session else runtime.effort,
+            "agent_models": {
+                agent_id: {"model": agent.model, "effort": agent.effort}
+                for agent_id, agent in list(runtime.agents.items())
+            },
             "session_defaults": (
                 {
                     "model": runtime.session.default_model,
@@ -338,13 +364,17 @@ def create_app(
             else None
         )
         try:
-            await runtime.authenticate(auth_request.method, credential)
+            await runtime.authenticate(
+                auth_request.provider, auth_request.method, credential
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         data = auth_payload()
-        await runtime.broadcast("auth_changed", data)
+        await runtime.broadcast(
+            "auth_changed", {"provider": auth_request.provider, **data}
+        )
         return data
 
     @app.post("/api/exit")
@@ -464,7 +494,7 @@ def create_app(
     ):
         session = active_session(agent_id)
         session.set_documents_default(request.enabled)
-        for other in runtime.agents.values():
+        for other in list(runtime.agents.values()):
             if other is not session and other.workspace_path == session.workspace_path:
                 other.documents_default = session.documents_default
                 other.document_choices = {}
@@ -498,7 +528,7 @@ def create_app(
         session = active_session(agent_id)
         try:
             session.delete_document(name)
-            for other in runtime.agents.values():
+            for other in list(runtime.agents.values()):
                 if (
                     other is not session
                     and other.workspace_path == session.workspace_path
@@ -571,12 +601,17 @@ def create_app(
     async def restart_kernel(agent_id: str | None = None):
         require_idle("restart the kernel", agent_id)
         session = active_session(agent_id)
-        await runtime.transition_agent(
-            agent_id or runtime.primary_agent_id, session.kernel.restart
-        )
+        resolved_agent_id = agent_id or runtime.primary_agent_id
+        try:
+            await runtime.transition_agent(resolved_agent_id, session.kernel.restart)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await runtime.broadcast(
             "kernel_restarted",
-            {"agent_id": agent_id, "kernel_alive": session.kernel.is_alive()},
+            {
+                "agent_id": resolved_agent_id,
+                "kernel_alive": session.kernel.is_alive(),
+            },
         )
         return {"status": "ok", "kernel_alive": session.kernel.is_alive()}
 
@@ -589,7 +624,12 @@ def create_app(
     @app.post("/api/session/defaults")
     async def set_session_defaults(defaults: SessionDefaultsRequest):
         try:
-            runtime.set_session_defaults(defaults.model, defaults.effort)
+            runtime.set_session_defaults(
+                defaults.model,
+                defaults.effort,
+                provider=defaults.provider,
+                raw_model=defaults.raw_model,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as exc:
@@ -619,6 +659,17 @@ def create_app(
         await runtime.broadcast("exploration_prompt_changed", data)
         return data
 
+    @app.put("/api/settings/prompt-mode")
+    async def set_prompt_mode(request: PromptModeRequest):
+        active_session()
+        try:
+            mode = await runtime.set_prompt_mode(request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        data = {"prompt_mode": mode}
+        await runtime.broadcast("prompt_mode_changed", data)
+        return data
+
     @app.post("/api/session/new")
     async def new_session():
         try:
@@ -629,7 +680,10 @@ def create_app(
         await runtime.broadcast(
             "session_reset",
             {
-                "session_id": session.workspace.session_id,
+                "agent_id": runtime.primary_agent_id,
+                "session_id": None
+                if session.workspace.session_pending
+                else session.workspace.session_id,
                 "model": session.model,
                 "effort": session.effort,
             },
@@ -641,7 +695,7 @@ def create_app(
         session = active_session()
         open_agents = {
             candidate.workspace.session_id: agent_id
-            for agent_id, candidate in runtime.agents.items()
+            for agent_id, candidate in list(runtime.agents.items())
             if not candidate.workspace.session_pending
         }
         sessions = session.list_sessions()
@@ -662,9 +716,9 @@ def create_app(
     @app.post("/api/session/resume")
     async def resume_session(request: SessionResumeRequest):
         try:
-            session = active_session()
+            active_session()
             data = await runtime.transition(
-                session.resume_session, request.id, request.restore_kernel
+                runtime.resume_session, request.id, request.restore_kernel
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -672,11 +726,13 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        await runtime.broadcast("session_resumed", data)
-        return {"status": "ok", **data}
+        payload = {"agent_id": runtime.primary_agent_id, **data}
+        await runtime.broadcast("session_resumed", payload)
+        return {"status": "ok", **payload}
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        nonlocal initial_python
         origin = websocket.headers.get("origin")
         if origin and not _same_origin(
             origin, websocket.url.scheme, websocket.headers.get("host", "")
@@ -719,7 +775,7 @@ def create_app(
 
                 if action == "new_agent":
                     try:
-                        agent_id = await asyncio.to_thread(runtime.create_agent)
+                        agent_id = await runtime.create_agent_async()
                         await runtime.broadcast(
                             "agent_added", runtime.agent_snapshot(agent_id)
                         )
@@ -733,8 +789,11 @@ def create_app(
                         try:
                             target_path = navigation_path(target_path)
                             await runtime.transition(
-                                runtime.open_workspace, target_path, data.get("python")
+                                runtime.open_workspace,
+                                target_path,
+                                data.get("python") or initial_python,
                             )
+                            initial_python = None
                             info = await workspace_snapshot()
                             await runtime.broadcast(
                                 "workspace_updated", {"workspace": info}
@@ -758,7 +817,7 @@ def create_app(
                         continue
                     if text == "/new":
                         try:
-                            new_id = await asyncio.to_thread(runtime.create_agent)
+                            new_id = await runtime.create_agent_async()
                             await runtime.broadcast(
                                 "agent_added",
                                 {
@@ -777,10 +836,10 @@ def create_app(
                                 agent_id, session.kernel.restart
                             )
                             await runtime.broadcast(
-                                "system_message",
+                                "kernel_restarted",
                                 {
                                     "agent_id": agent_id,
-                                    "text": "Kernel restarted. In-memory state is cleared.",
+                                    "kernel_alive": session.kernel.is_alive(),
                                 },
                             )
                         except RuntimeError as exc:
@@ -799,7 +858,12 @@ def create_app(
                         )
                         continue
                     model = data.get("model")
-                    if model is not None and model not in runtime.models:
+                    provider = data.get("provider")
+                    raw_model = data.get("raw_model")
+                    if any(
+                        value is not None and not isinstance(value, str)
+                        for value in (model, provider, raw_model)
+                    ):
                         await runtime.broadcast(
                             "error",
                             {
@@ -809,10 +873,7 @@ def create_app(
                         )
                         continue
                     effort = data.get("effort")
-                    target_model = model or session.model
-                    if effort is not None and effort not in runtime.model_efforts.get(
-                        target_model or "", []
-                    ):
+                    if effort is not None and not isinstance(effort, str):
                         await runtime.broadcast(
                             "error",
                             {
@@ -822,23 +883,67 @@ def create_app(
                         )
                         continue
                     try:
-                        runtime.start_query(text, model, effort, agent_id)
+                        query_state = runtime.start_query(
+                            text,
+                            model,
+                            effort,
+                            agent_id,
+                            provider=provider,
+                            raw_model=raw_model,
+                        )
                     except (RuntimeError, ValueError) as exc:
                         await runtime.broadcast(
                             "error", {"agent_id": agent_id, "message": str(exc)}
                         )
                         continue
-                    await runtime.broadcast(
-                        "user_message",
-                        {
-                            "agent_id": agent_id,
-                            "session_id": session.workspace.session_id,
-                            "text": text,
-                        },
-                    )
+                    if query_state == "started":
+                        await runtime.broadcast(
+                            "user_message",
+                            {
+                                "agent_id": agent_id,
+                                "session_id": session.workspace.session_id,
+                                "text": text,
+                                "model": session.model,
+                                "effort": session.effort,
+                            },
+                        )
+                    elif session._last_pending_task is not None:
+                        await session._last_pending_task
+
+                elif action == "cancel_pending_prompt":
+                    prompt_id = data.get("prompt_id")
+                    if isinstance(prompt_id, str) and prompt_id:
+                        await session.remove_pending_prompt(prompt_id)
 
                 elif action == "interrupt":
-                    await session.interrupt()
+                    existing = interrupt_tasks.get(agent_id)
+                    if existing is not None and not existing.done():
+                        task = session._current_task
+                        if task is not None and not task.done():
+                            task.cancel()
+                    else:
+
+                        async def run_interrupt(
+                            target_id=agent_id, target_session=session
+                        ):
+                            try:
+                                await target_session.interrupt()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.exception(
+                                    "Interrupt failed for explorer %s", target_id
+                                )
+                            finally:
+                                if (
+                                    interrupt_tasks.get(target_id)
+                                    is asyncio.current_task()
+                                ):
+                                    interrupt_tasks.pop(target_id, None)
+
+                        bg = asyncio.create_task(run_interrupt())
+                        if not bg.done():
+                            interrupt_tasks[agent_id] = bg
                 elif action == "restart_kernel":
                     try:
                         await runtime.transition_agent(agent_id, session.kernel.restart)
@@ -854,11 +959,19 @@ def create_app(
                             "error", {"agent_id": agent_id, "message": str(exc)}
                         )
                 elif action == "new_session":
-                    new_id = await asyncio.to_thread(runtime.create_agent)
-                    await runtime.broadcast(
-                        "agent_added",
-                        {"requested_by": agent_id, **runtime.agent_snapshot(new_id)},
-                    )
+                    try:
+                        new_id = await runtime.create_agent_async()
+                        await runtime.broadcast(
+                            "agent_added",
+                            {
+                                "requested_by": agent_id,
+                                **runtime.agent_snapshot(new_id),
+                            },
+                        )
+                    except Exception as exc:
+                        await runtime.broadcast(
+                            "error", {"agent_id": agent_id, "message": str(exc)}
+                        )
         except WebSocketDisconnect:
             runtime.websockets.discard(websocket)
         except Exception as exc:

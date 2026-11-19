@@ -1,8 +1,8 @@
-import { elements, state } from "./state.js?v=20261016-3";
-import { highlightBlocks, renderMarkdown } from "./markdown.js?v=20260922-1";
+import { elements, state } from "./state.js?v=20261117-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
-import { updateAgentStatus, updateKernelStatus } from "./status.js?v=20261016-3";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261016-3";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261118-2";
 
 // ============================================================================
 // Workspace & Files Management
@@ -24,6 +24,7 @@ export function applyWorkspace(ws) {
     elements.effortSelect.value = "";
     elements.sessionDefaultsStatus.textContent = "";
     elements.explorationPromptStatus.textContent = "";
+    if (elements.promptModeStatus) elements.promptModeStatus.textContent = "";
     showDocumentsView("list");
   }
   state.workspace = ws;
@@ -45,12 +46,16 @@ export function applyWorkspace(ws) {
     selected?.model || ws.model,
     ws.model_efforts || {},
     selected?.effort || ws.effort,
+    ws.model_providers || {},
+    null,
+    ws.model_raw_ids || {},
   );
   setSessionDefaults(ws.session_defaults);
   setExplorationPrompt(ws.exploration_prompt, ws.exploration_prompt_is_custom);
+  setPromptMode(ws.prompt_mode);
 
   updateKernelStatus(selected?.kernel_alive, selected?.kernel_busy);
-  updateAgentStatus(selected?.is_busy ? "thinking" : "idle");
+  updateAgentStatus(selected?.is_busy ? (selected?.status && selected.status !== "idle" ? selected.status : "thinking") : "idle");
   setContextUsage(selected?.context_usage);
 
   if (![ws.evidence_path, ws.thoughts_path].includes(state.activeDoc)) {
@@ -100,23 +105,152 @@ export function showLanding(ws) {
   renderRecentWorkspaces();
 }
 
+const PROVIDER_ORDER = ["anthropic", "openai", "google"];
+const PROVIDER_TITLES = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+};
+
 export function setAuthStatus(auth) {
   if (!auth) return;
   state.auth = auth;
-  const label = auth.label || "Claude authentication";
-  elements.btnAuth.textContent = label;
-  elements.btnAuthLanding.textContent = label;
-  elements.authSummary.textContent = `Current: ${label}.${auth.note ? ` ${auth.note}` : ""}`;
-  elements.authCurrent.textContent = `Current: ${label}`;
-  elements.authNote.textContent = auth.note || "";
-  elements.authNote.classList.toggle("hidden", !auth.note);
+  const label = auth.label || "Model provider authentication";
+  elements.btnAuth.textContent = "Auth";
+  elements.btnAuth.title = label;
+  elements.btnAuthLanding.textContent = "Auth";
+  elements.btnAuthLanding.title = label;
+
+  const providers = auth.providers || {};
+  const lines = PROVIDER_ORDER
+    .map((id) => providers[id])
+    .filter(Boolean)
+    .map((info) => {
+      const title = info.title || PROVIDER_TITLES[info.provider] || info.provider;
+      const count = Number.isInteger(info.models_count)
+        ? ` (${info.models_count} ${info.models_count === 1 ? "model" : "models"})`
+        : "";
+      const note = info.note ? ` — ${info.note}` : "";
+      return `${title}: ${info.label}${count}${note}`;
+    });
+  elements.authSummary.textContent = lines.length
+    ? lines.join(" · ")
+    : `Current: ${label}`;
+
+  const activeProvider = elements.authProvider?.value || "anthropic";
+  const active = providers[activeProvider];
+  elements.authCurrent.textContent = active
+    ? `Current (${active.title || PROVIDER_TITLES[activeProvider] || activeProvider}): ${active.label}`
+    : `Current: ${label}`;
+  const noteText = active?.note || "";
+  elements.authNote.textContent = noteText;
+  elements.authNote.classList.toggle("hidden", !noteText);
 }
 
-function fillModelSelect(select, models, labels, preferred) {
-  select.replaceChildren(...models.map((model) => new Option(labels[model] || model, model)));
-  if (!models.length) select.add(new Option("No model available", ""));
-  select.disabled = !models.length;
+function fillModelSelect(select, models, labels, preferred, providers = {}) {
+  if (!models.length) {
+    select.replaceChildren(new Option("No model available", ""));
+    select.disabled = true;
+    select.value = "";
+    return;
+  }
+
+  const grouped = new Map();
+  const ungrouped = [];
+  for (const model of models) {
+    const provider = providers[model];
+    if (provider) {
+      if (!grouped.has(provider)) grouped.set(provider, []);
+      grouped.get(provider).push(model);
+    } else {
+      ungrouped.push(model);
+    }
+  }
+
+  const orderedProviders = [
+    ...PROVIDER_ORDER.filter((provider) => grouped.has(provider)),
+    ...[...grouped.keys()].filter((provider) => !PROVIDER_ORDER.includes(provider)),
+  ];
+
+  const nodes = [];
+  for (const provider of orderedProviders) {
+    const group = document.createElement("optgroup");
+    group.label = PROVIDER_TITLES[provider] || provider;
+    for (const model of grouped.get(provider)) {
+      group.appendChild(new Option(labels[model] || model, model));
+    }
+    nodes.push(group);
+  }
+  for (const model of ungrouped) {
+    nodes.push(new Option(labels[model] || model, model));
+  }
+
+  select.replaceChildren(...nodes);
+  select.disabled = false;
   select.value = models.includes(preferred) ? preferred : models[0] || "";
+}
+
+export function rawModelId(model, provider = null, modelRawIds = state.modelRawIds) {
+  if (!model) return null;
+  if (modelRawIds && Object.prototype.hasOwnProperty.call(modelRawIds, model)) {
+    return modelRawIds[model];
+  }
+  if (provider && model.startsWith(`${provider}/`)) {
+    return model.slice(provider.length + 1);
+  }
+  const slash = model.indexOf("/");
+  if (slash > 0 && PROVIDER_ORDER.includes(model.slice(0, slash))) {
+    return model.slice(slash + 1);
+  }
+  return model;
+}
+
+export function resolveCatalogueModel(
+  rawOrCatalogueId,
+  provider = null,
+  models = state.models,
+  modelProviders = state.modelProviders,
+  modelRawIds = state.modelRawIds,
+) {
+  if (!rawOrCatalogueId || !models.length) return null;
+  let targetProvider = provider;
+  if (!targetProvider) {
+    const slash = rawOrCatalogueId.indexOf("/");
+    if (slash > 0 && PROVIDER_ORDER.includes(rawOrCatalogueId.slice(0, slash))) {
+      targetProvider = rawOrCatalogueId.slice(0, slash);
+    }
+  }
+  if (!targetProvider) {
+    return models.includes(rawOrCatalogueId) ? rawOrCatalogueId : null;
+  }
+  if (
+    models.includes(rawOrCatalogueId)
+    && modelProviders[rawOrCatalogueId] === targetProvider
+  ) {
+    return rawOrCatalogueId;
+  }
+  for (const candidate of models) {
+    if (
+      modelProviders[candidate] === targetProvider
+      && modelRawIds?.[candidate] === rawOrCatalogueId
+    ) {
+      return candidate;
+    }
+  }
+  const raw = rawModelId(rawOrCatalogueId, targetProvider, modelRawIds);
+  for (const candidate of [`${targetProvider}/${raw}`, raw]) {
+    if (models.includes(candidate) && modelProviders[candidate] === targetProvider) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function chooseEffort(efforts, preferred = null) {
+  if (!efforts.length) return null;
+  if (efforts.includes(preferred)) return preferred;
+  if (efforts.includes("high")) return "high";
+  return efforts[0] || null;
 }
 
 export function setEffortForModel(select, model, preferred = null) {
@@ -124,22 +258,27 @@ export function setEffortForModel(select, model, preferred = null) {
   select.replaceChildren(...efforts.map((effort) => new Option(effort, effort)));
   if (!efforts.length) select.add(new Option("No effort setting", ""));
   select.disabled = !efforts.length;
-  select.value = efforts.includes(preferred)
-    ? preferred
-    : efforts.includes("high")
-      ? "high"
-      : efforts[0] || "";
+  select.value = chooseEffort(efforts, preferred) || "";
 }
 
 export function setActiveModelAndEffort(model, effort) {
   if (state.models.includes(model)) elements.modelSelect.value = model;
+  else if (state.models.length && !state.models.includes(elements.modelSelect.value)) {
+    elements.modelSelect.value = state.models[0];
+  }
   setEffortForModel(elements.effortSelect, elements.modelSelect.value, effort);
 }
 
 export function setSessionDefaults(defaults) {
   state.sessionDefaults = defaults || null;
   const preferredModel = defaults?.model || state.models[0] || "";
-  fillModelSelect(elements.defaultModelSelect, state.models, state.modelLabels, preferredModel);
+  fillModelSelect(
+    elements.defaultModelSelect,
+    state.models,
+    state.modelLabels,
+    preferredModel,
+    state.modelProviders,
+  );
   setEffortForModel(elements.defaultEffortSelect, elements.defaultModelSelect.value, defaults?.effort);
   elements.sessionDefaultsSave.disabled = !state.models.length;
 }
@@ -150,20 +289,81 @@ export function setModelCatalogue(
   serverModel = null,
   modelEfforts = {},
   serverEffort = null,
+  modelProviders = {},
+  agentModels = null,
+  modelRawIds = {},
 ) {
   // The dropdown decides the model of the next message, so an unsent choice
-  // survives a catalogue refresh; otherwise follow the server's model.
+  // survives a catalogue refresh; otherwise follow the active explorer's server model.
+  const previousProviders = state.modelProviders || {};
+  const previousRawIds = state.modelRawIds || {};
   const currentModel = elements.modelSelect.value;
   const currentEffort = elements.effortSelect.value;
+  const currentProvider = previousProviders[currentModel] || null;
+  const currentRaw = rawModelId(currentModel, currentProvider, previousRawIds);
   state.models = models;
   state.modelLabels = labels;
   state.modelEfforts = modelEfforts;
-  const preferred = [currentModel, serverModel].find((model) => models.includes(model));
-  fillModelSelect(elements.modelSelect, models, labels, preferred);
+  state.modelProviders = modelProviders;
+  state.modelRawIds = modelRawIds;
+  const resolvedCurrent = resolveCatalogueModel(
+    currentRaw || currentModel,
+    currentProvider,
+    models,
+    modelProviders,
+    modelRawIds,
+  );
+  for (const agent of state.agents.values()) {
+    if (agent.draftModel || agent.draftRawModel) {
+      const draftProv = agent.draftProvider || previousProviders[agent.draftModel] || null;
+      const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv, previousRawIds);
+      const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders, modelRawIds);
+      if (resolvedDraft) {
+        agent.draftModel = resolvedDraft;
+        agent.draftProvider = modelProviders[resolvedDraft] || draftProv;
+        agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider, modelRawIds);
+        agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
+      } else {
+        agent.draftModel = null;
+        agent.draftProvider = null;
+        agent.draftRawModel = null;
+        agent.draftEffort = null;
+      }
+    }
+    if (agentModels && Object.prototype.hasOwnProperty.call(agentModels, agent.agent_id)) {
+      const serverAgent = agentModels[agent.agent_id];
+      agent.model = serverAgent.model;
+      agent.effort = serverAgent.effort;
+      agent.modelProvider = agent.model ? (modelProviders[agent.model] || null) : null;
+    } else if (agent.model) {
+      const modelProv = agent.modelProvider || previousProviders[agent.model] || null;
+      const resolvedAgentModel = resolveCatalogueModel(
+        rawModelId(agent.model, modelProv, previousRawIds),
+        modelProv,
+        models,
+        modelProviders,
+        modelRawIds,
+      );
+      agent.model = resolvedAgentModel || (models.includes(serverModel) ? serverModel : models[0] || null);
+      agent.modelProvider = agent.model ? (modelProviders[agent.model] || null) : null;
+    }
+  }
+  const activeAgent = state.activeAgentId ? state.agents.get(state.activeAgentId) : null;
+  const activeServerModel = activeAgent ? activeAgent.model : serverModel;
+  const activeServerEffort = activeAgent ? activeAgent.effort : serverEffort;
+  const preferred = activeAgent
+    ? (activeAgent.draftModel || (models.includes(activeServerModel) ? activeServerModel : resolvedCurrent))
+    : (resolvedCurrent || (models.includes(activeServerModel) ? activeServerModel : null));
+  fillModelSelect(elements.modelSelect, models, labels, preferred, modelProviders);
+  const preferredEffort = activeAgent?.draftModel && activeAgent.draftModel === elements.modelSelect.value
+    ? activeAgent.draftEffort
+    : (!activeAgent && resolvedCurrent && resolvedCurrent === elements.modelSelect.value
+      ? currentEffort
+      : activeServerEffort);
   setEffortForModel(
     elements.effortSelect,
     elements.modelSelect.value,
-    currentModel === elements.modelSelect.value ? currentEffort : serverEffort,
+    preferredEffort,
   );
   if (state.sessionDefaults) setSessionDefaults(state.sessionDefaults);
 }
@@ -226,6 +426,7 @@ export async function openWorkspace(path, python = null) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "Unable to prepare research environment");
   applyWorkspace(data.workspace);
+  window.dispatchEvent(new CustomEvent("nocturnomath:workspace-opened", { detail: data.workspace }));
   return data.workspace;
 }
 
@@ -255,6 +456,12 @@ export function setExplorationPrompt(prompt, isCustom) {
   state.explorationPromptIsCustom = Boolean(isCustom);
   elements.explorationPromptInput.value = state.explorationPrompt;
   elements.explorationPromptReset.disabled = !state.explorationPromptIsCustom;
+}
+
+export function setPromptMode(mode) {
+  state.promptMode = mode === "queue" ? "queue" : "steer";
+  if (elements.promptModeSelect) elements.promptModeSelect.value = state.promptMode;
+  refreshSendButton();
 }
 
 export function selectViewerTab(tab) {
@@ -305,6 +512,12 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
   state.activeDoc = filePath;
   if (!quiet) setViewerTab(tab || tabForPath(filePath));
   elements.docPathLabel.textContent = filePath;
+  if (!quiet && state.documentPath !== filePath) {
+    state.documentPath = null;
+    state.documentContent = null;
+    elements.markdownContainer.replaceChildren();
+    elements.docMetaLabel.textContent = "";
+  }
 
   try {
     const res = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
@@ -335,6 +548,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     rewriteEmbeddedImageUrls(elements.markdownContainer, filePath);
     rewriteDocumentLinks(elements.markdownContainer, filePath);
     highlightBlocks(elements.markdownContainer);
+    if (filePath.endsWith(".md")) renderMath(elements.markdownContainer);
     if (anchor) {
       const target = [...elements.markdownContainer.querySelectorAll("[id]")]
         .find((element) => element.id === anchor);
@@ -382,19 +596,19 @@ export function rewriteDocumentLinks(container, documentPath) {
 }
 
 export function rewriteEmbeddedImageUrls(container, documentPath) {
-  const documentDir = documentPath.includes("/")
-    ? documentPath.slice(0, documentPath.lastIndexOf("/"))
-    : "";
-
   container.querySelectorAll("img[src]").forEach((image) => {
     const source = image.getAttribute("src")?.trim();
     if (!source || source.startsWith("/") || source.startsWith("//") ||
-        source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
+      source.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(source)) {
       return;
     }
-
-    const assetPath = documentDir ? `${documentDir}/${source}` : source;
-    image.src = `/api/asset?path=${encodeURIComponent(assetPath)}`;
+    try {
+      const target = new URL(source, `https://workspace.invalid/${documentPath}`);
+      const assetPath = decodeURIComponent(target.pathname.slice(1));
+      image.src = `/api/asset?path=${encodeURIComponent(assetPath)}`;
+    } catch (error) {
+      // Leave malformed image paths unchanged.
+    }
   });
 }
 
