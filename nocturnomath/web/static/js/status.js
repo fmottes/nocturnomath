@@ -5,7 +5,7 @@ let kernelBusy = false;
 let agentStatus = "idle";
 
 function syncInterruptButton() {
-  const agentInterruptible = agentStatus === "thinking" || agentStatus === "probing";
+  const agentInterruptible = agentStatus === "thinking" || agentStatus === "probing" || agentStatus === "compacting";
   elements.btnInterrupt.classList.toggle(
     "hidden",
     !(kernelAlive && kernelBusy) && !agentInterruptible,

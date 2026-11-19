@@ -426,6 +426,7 @@ export async function openWorkspace(path, python = null) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "Unable to prepare research environment");
   applyWorkspace(data.workspace);
+  window.dispatchEvent(new CustomEvent("nocturnomath:workspace-opened", { detail: data.workspace }));
   return data.workspace;
 }
 

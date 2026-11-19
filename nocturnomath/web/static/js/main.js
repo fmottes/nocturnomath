@@ -262,6 +262,7 @@ async function compactExplorer() {
     if (!response.ok) throw new Error(data.detail || "Unable to compact explorer");
     await refreshContextUsage(agentId);
   } catch (error) {
+    await refreshContextUsage(agentId);
     if (state.activeAgentId === agentId) appendErrorMessage(error.message);
   } finally {
     updateCompactButton();
@@ -302,7 +303,14 @@ function handleServerEvent(event) {
     }
     if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
     if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
-    if (event.type === "user_message" && event.session_id) current.session_id = event.session_id;
+    if (event.type === "user_message") {
+      if (event.session_id) current.session_id = event.session_id;
+      if (event.model) {
+        current.model = event.model;
+        current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
+      }
+      if (event.effort !== undefined) current.effort = event.effort;
+    }
     state.agents.set(event.agent_id, current);
     renderExplorerTabs();
     if (
@@ -338,8 +346,11 @@ function handleServerEvent(event) {
     case "agent_removed": {
       const removedActive = event.agent_id === state.activeAgentId;
       state.agents.delete(event.agent_id);
-      if (removedActive) state.activeAgentId = state.agents.keys().next().value || null;
-      if (state.activeAgentId) applyExplorer(state.agents.get(state.activeAgentId), true);
+      if (removedActive) {
+        state.activeAgentId = null;
+        const nextId = state.agents.keys().next().value || null;
+        if (nextId) selectExplorer(nextId);
+      }
       renderExplorerTabs();
       break;
     }
@@ -354,14 +365,19 @@ function handleServerEvent(event) {
       break;
     }
 
-    case "user_message":
-      if (event.session_id && state.agents.has(event.agent_id)) {
-        state.agents.get(event.agent_id).session_id = event.session_id;
+    case "user_message": {
+      const agent = state.agents.get(event.agent_id);
+      if (agent && (event.model !== undefined || event.effort !== undefined) && !agent.draftModel && !agent.draftRawModel) {
+        setActiveModelAndEffort(agent.model, agent.effort);
+      }
+      if (event.session_id && agent) {
+        agent.session_id = event.session_id;
         setSessionId(event.session_id);
         renderExplorerTabs();
       }
       appendUserMessage(event.text);
       break;
+    }
 
     case "probe_start":
       appendProbeStart(event.expected, event.code, event.probe_id, event.backend);
@@ -420,11 +436,22 @@ function handleServerEvent(event) {
       refreshContextUsage(event.agent_id);
       break;
 
-    case "status_change":
-      state.agents.get(event.agent_id).is_busy = !["idle", "cancelled"].includes(event.status);
+    case "status_change": {
+      const agent = state.agents.get(event.agent_id);
+      if (agent) {
+        agent.is_busy = !["idle", "cancelled"].includes(event.status);
+        if (
+          ["cancelled", "idle"].includes(event.status) &&
+          !agent.draftModel &&
+          !agent.draftRawModel
+        ) {
+          setActiveModelAndEffort(agent.model, agent.effort);
+        }
+      }
       updateAgentStatus(event.status);
       renderExplorerTabs();
       break;
+    }
 
     case "kernel_restarted":
       appendSystemMessage("Kernel restarted. In-memory variables and state cleared.");
@@ -547,6 +574,7 @@ function handleServerEvent(event) {
 // ============================================================================
 function setupEventListeners() {
   window.addEventListener("nocturnomath:focus-explorer", (event) => selectExplorer(event.detail));
+  window.addEventListener("nocturnomath:workspace-opened", (event) => installExplorers(event.detail?.agents || [], false));
   elements.chatMessages.addEventListener("scroll", () => {
     const log = elements.chatMessages;
     state.followChat = log.scrollHeight - log.clientHeight - log.scrollTop < 60;

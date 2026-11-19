@@ -111,7 +111,7 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
   });
   try {
     if (!state.activeAgentId && !openAgentId) throw new Error("No explorer is selected");
-    if (openAgentId) {
+    if (openAgentId && !(restoreKernel && openAgentId === state.activeAgentId)) {
       window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
       elements.historyModal.classList.add("hidden");
       return;

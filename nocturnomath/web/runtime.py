@@ -20,7 +20,7 @@ class WebRuntime(Runtime):
             return
         message = {"type": event_type, **data}
         dead = []
-        for websocket in self.websockets:
+        for websocket in list(self.websockets):
             try:
                 await websocket.send_json(message)
             except Exception:

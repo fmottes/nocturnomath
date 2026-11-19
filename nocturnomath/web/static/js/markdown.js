@@ -66,9 +66,9 @@ function escapeHtml(text) {
 function protectMath(markdown) {
   const formulas = [];
   const protectedText = markdown.replace(
-    /(```[\s\S]*?```|~~~[\s\S]*?~~~|`+[^`\n]*?`+)|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\n])+?(?<!\s)\$/g,
-    (match, codeSpan) => {
-      if (codeSpan !== undefined) return codeSpan;
+    /(?:^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*(?:\n|$)|(`+)(?!`)(?:(?!\2)[\s\S])*?\2(?!`))|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\\)\$(?!\s)(?:\\.|[^$\\\n])+?(?<!\s)\$/gm,
+    (match, fence, ticks) => {
+      if (fence !== undefined || ticks !== undefined) return match;
       const token = `NocturnomathMathToken${formulas.length}End`;
       formulas.push(match);
       return token;

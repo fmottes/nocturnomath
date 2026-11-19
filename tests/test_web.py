@@ -1300,3 +1300,212 @@ def test_prefixed_raw_model_ids_and_session_reset_resume_payloads(
         body = resume_res.json()
         assert body["session_id"] == "S001"
         assert body["can_compact"] is True
+        assert body["agent_id"] == agent_id
+        assert body["status"] == "idle"
+        assert body["is_busy"] is False
+        assert body["model"] == "openai/gpt-oss-120b"
+        assert body["effort"] == "high"
+
+
+def test_kernel_restart_conflicts_while_primary_agent_changing_and_user_message_carries_model(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TextBlockDone, TurnResult
+
+    workspace = tmp_path / "ws_state"
+    workspace.mkdir()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        efforts=["low", "medium"],
+        is_default=True,
+    )
+
+    class SimpleBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-1")
+            yield TextBlockDone("ok")
+            yield TurnResult()
+
+    backend_model_catalog["anthropic"] = SimpleBackend("anthropic", models=[spec])
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        rt = client.app.state.runtime
+
+        rt._changing_agents.add(rt.primary_agent_id)
+        try:
+            res = client.post("/api/kernel/restart")
+            assert res.status_code == 409
+        finally:
+            rt._changing_agents.discard(rt.primary_agent_id)
+
+        with patch.object(
+            rt,
+            "transition_agent",
+            AsyncMock(side_effect=RuntimeError("already changing")),
+        ):
+            res2 = client.post("/api/kernel/restart")
+            assert res2.status_code == 409
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": rt.primary_agent_id,
+                "text": "hello",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+                "effort": "medium",
+            }
+        )
+        seen = None
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "user_message":
+                seen = evt
+                break
+        assert seen is not None
+        assert seen["model"] == "claude-test"
+        assert seen["effort"] == "medium"
+        while websocket.receive_json()["type"] != "turn_complete":
+            pass
+        while rt.get_agent(rt.primary_agent_id).has_active_query():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_web_runtime_broadcast_handles_set_mutation(session):
+    from nocturnomath.runtime import Runtime
+    from nocturnomath.web.runtime import WebRuntime
+
+    core = Runtime(session)
+    web_rt = WebRuntime(core)
+    delivered = []
+
+    class MutatingSocket:
+        def __init__(self, name, remove_other=None):
+            self.name = name
+            self.remove_other = remove_other
+
+        async def send_json(self, message):
+            delivered.append((self.name, message["type"]))
+            if self.remove_other is not None:
+                web_rt.websockets.discard(self.remove_other)
+
+    other = MutatingSocket("other")
+    first = MutatingSocket("first", remove_other=other)
+    web_rt.websockets.update({first, other})
+
+    await web_rt.broadcast("ping", {"value": 1})
+    assert ("first", "ping") in delivered
+
+
+def test_websocket_interrupt_is_nonblocking_and_second_stop_breaks_shield(
+    tmp_path, backend_model_catalog
+):
+    from nocturnomath.backends import SessionStarted, TurnResult
+
+    workspace = tmp_path / "ws_ws_int"
+    workspace.mkdir()
+    entered = threading.Event()
+    unwinding = threading.Event()
+    spec = ModelSpec(
+        id="claude-test",
+        raw_id="claude-test",
+        provider="anthropic",
+        label="Claude Test",
+        is_default=True,
+    )
+
+    class ShieldedCancelBackend(FakeWebBackend):
+        async def run_turn(self, prompt, **kwargs):
+            entered.set()
+            blocker = asyncio.create_task(asyncio.sleep(30))
+            try:
+                yield SessionStarted("ant-shield")
+                await asyncio.Event().wait()
+                yield TurnResult()
+            except asyncio.CancelledError:
+                unwinding.set()
+                await asyncio.shield(blocker)
+                raise
+            finally:
+                if not blocker.done():
+                    blocker.cancel()
+                    try:
+                        await blocker
+                    except asyncio.CancelledError:
+                        pass
+
+    backend_model_catalog["anthropic"] = ShieldedCancelBackend(
+        "anthropic", models=[spec]
+    )
+    backend_model_catalog["openai"] = FakeWebBackend("openai", models=[])
+    backend_model_catalog["google"] = FakeWebBackend("google", models=[])
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        TestClient(create_app(navigator_root=tmp_path)) as client,
+        client.websocket_connect("/ws") as websocket,
+    ):
+        websocket.receive_json()
+        assert (
+            client.post("/api/workspace", json={"path": str(workspace)}).status_code
+            == 200
+        )
+        websocket.receive_json()
+        rt = client.app.state.runtime
+        agent_id = rt.primary_agent_id
+
+        websocket.send_json(
+            {
+                "action": "query",
+                "agent_id": agent_id,
+                "text": "hang in shielded unwind",
+                "model": "claude-test",
+                "provider": "anthropic",
+                "raw_model": "claude-test",
+            }
+        )
+        assert entered.wait(timeout=5)
+
+        # First Stop enters unwinding inside asyncio.shield(blocker); WS loop must stay responsive.
+        websocket.send_json({"action": "interrupt", "agent_id": agent_id})
+        assert unwinding.wait(timeout=5)
+
+        websocket.send_json({"action": "query", "agent_id": agent_id, "text": "/notes"})
+        notes_evt = None
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "system_message":
+                notes_evt = evt
+                break
+        assert notes_evt is not None
+
+        # Second Stop breaks out of the shielded unwind cleanly.
+        websocket.send_json({"action": "interrupt", "agent_id": agent_id})
+        cancelled_seen = False
+        idle_seen = False
+        for _ in range(20):
+            evt = websocket.receive_json()
+            if evt["type"] == "status_change" and evt["status"] == "cancelled":
+                cancelled_seen = True
+            if evt["type"] == "status_change" and evt["status"] == "idle":
+                idle_seen = True
+                break
+        assert cancelled_seen and idle_seen
+        assert not rt.get_agent(agent_id).has_active_query()

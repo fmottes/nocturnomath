@@ -129,6 +129,7 @@ def create_app(
     )
 
     initial_python = python
+    interrupt_tasks: dict[str, asyncio.Task] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -148,6 +149,11 @@ def create_app(
             if browser_task and not browser_task.done():
                 browser_task.cancel()
             await runtime.drain()
+            for task in list(interrupt_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            if interrupt_tasks:
+                await asyncio.gather(*interrupt_tasks.values(), return_exceptions=True)
             runtime.shutdown()
 
     app = FastAPI(title="Nocturnomath Web App", lifespan=lifespan)
@@ -219,9 +225,10 @@ def create_app(
 
     def require_idle(action: str, agent_id: str | None = None):
         session = active_session(agent_id)
+        resolved_agent_id = agent_id or runtime.primary_agent_id
         if (
             runtime.changing
-            or agent_id in runtime._changing_agents
+            or resolved_agent_id in runtime._changing_agents
             or session.has_active_query()
         ):
             raise HTTPException(
@@ -595,7 +602,10 @@ def create_app(
         require_idle("restart the kernel", agent_id)
         session = active_session(agent_id)
         resolved_agent_id = agent_id or runtime.primary_agent_id
-        await runtime.transition_agent(resolved_agent_id, session.kernel.restart)
+        try:
+            await runtime.transition_agent(resolved_agent_id, session.kernel.restart)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await runtime.broadcast(
             "kernel_restarted",
             {
@@ -722,6 +732,7 @@ def create_app(
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        nonlocal initial_python
         origin = websocket.headers.get("origin")
         if origin and not _same_origin(
             origin, websocket.url.scheme, websocket.headers.get("host", "")
@@ -778,8 +789,11 @@ def create_app(
                         try:
                             target_path = navigation_path(target_path)
                             await runtime.transition(
-                                runtime.open_workspace, target_path, data.get("python")
+                                runtime.open_workspace,
+                                target_path,
+                                data.get("python") or initial_python,
                             )
+                            initial_python = None
                             info = await workspace_snapshot()
                             await runtime.broadcast(
                                 "workspace_updated", {"workspace": info}
@@ -889,6 +903,8 @@ def create_app(
                                 "agent_id": agent_id,
                                 "session_id": session.workspace.session_id,
                                 "text": text,
+                                "model": session.model,
+                                "effort": session.effort,
                             },
                         )
                     elif session._last_pending_task is not None:
@@ -900,7 +916,34 @@ def create_app(
                         await session.remove_pending_prompt(prompt_id)
 
                 elif action == "interrupt":
-                    await session.interrupt()
+                    existing = interrupt_tasks.get(agent_id)
+                    if existing is not None and not existing.done():
+                        task = session._current_task
+                        if task is not None and not task.done():
+                            task.cancel()
+                    else:
+
+                        async def run_interrupt(
+                            target_id=agent_id, target_session=session
+                        ):
+                            try:
+                                await target_session.interrupt()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.exception(
+                                    "Interrupt failed for explorer %s", target_id
+                                )
+                            finally:
+                                if (
+                                    interrupt_tasks.get(target_id)
+                                    is asyncio.current_task()
+                                ):
+                                    interrupt_tasks.pop(target_id, None)
+
+                        bg = asyncio.create_task(run_interrupt())
+                        if not bg.done():
+                            interrupt_tasks[agent_id] = bg
                 elif action == "restart_kernel":
                     try:
                         await runtime.transition_agent(agent_id, session.kernel.restart)
