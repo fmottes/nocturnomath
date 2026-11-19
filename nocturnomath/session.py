@@ -50,6 +50,7 @@ class PendingPrompt:
     effort: str | None = None
     provider: ProviderId | None = None
     raw_model: str | None = None
+    epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ class ExplorationSession:
         self._record_acked_seq = 0
         self._record_reload_reason = "concurrent"
         self._pending_prompts: list[PendingPrompt] = []
+        self._interrupt_epoch = 0
         self._turn_model: str | None = None
         self._turn_selection: tuple[ProviderId, str, str | None] | None = None
         self._bound_turn: BoundTurnConfig | None = None
@@ -509,6 +511,7 @@ class ExplorationSession:
             effort=effort,
             provider=self.provider_for_model(model) if model is not None else None,
             raw_model=self.raw_model_id(model) if model is not None else None,
+            epoch=self._interrupt_epoch,
         )
         self._pending_prompts.append(prompt)
         try:
@@ -538,12 +541,24 @@ class ExplorationSession:
         )
         return True
 
-    async def clear_pending_prompts(self) -> None:
-        """Drop all pending prompts and notify listeners if any were present."""
-        had_pending = bool(self._pending_prompts)
-        self._pending_prompts.clear()
-        if had_pending:
+    async def clear_pending_prompts(self, *, through_epoch: int | None = None) -> None:
+        """Drop pending prompts and notify listeners if any were present."""
+        if not self._pending_prompts:
+            return
+        if through_epoch is None:
+            self._pending_prompts.clear()
             await self.emit("pending_prompts_changed", pending_prompts=[])
+            return
+        remaining = [
+            item for item in self._pending_prompts if item.epoch > through_epoch
+        ]
+        if len(remaining) == len(self._pending_prompts):
+            return
+        self._pending_prompts = remaining
+        await self.emit(
+            "pending_prompts_changed",
+            pending_prompts=self.pending_prompts_snapshot(),
+        )
 
     def pop_next_turn_prompts(self) -> list[PendingPrompt]:
         """Pop the next queued turn, batching matching leading steer prompts together."""
@@ -800,13 +815,18 @@ class ExplorationSession:
         return replayed
 
     async def interrupt(self):
-        await self.clear_pending_prompts()
+        self._interrupt_epoch += 1
+        await self.clear_pending_prompts(through_epoch=self._interrupt_epoch - 1)
         if self.kernel.busy:
             self._kernel_interrupt_requested = True
             self.kernel.interrupt()
             await self.emit("kernel_interrupted")
         task = self._current_task
         if task and not task.done():
+            if task is asyncio.current_task():
+                await self.emit("query_cancelled")
+                task.cancel()
+                return
             task.cancel()
             await self.emit("query_cancelled")
         if task is not None and task is not asyncio.current_task():
@@ -819,23 +839,9 @@ class ExplorationSession:
         self.log_transcript("compaction", record_reloaded=record_reloaded)
         await self.emit("context_compacted", record_reloaded=record_reloaded)
 
-    async def compact(self):
-        current = asyncio.current_task()
-        if (
-            self._is_busy
-            or self.kernel.busy
-            or self._probe_operation_lock.locked()
-            or bool(self._pending_prompts)
-            or (self._probe_task is not None and not self._probe_task.done())
-            or (
-                self._current_task is not None
-                and not self._current_task.done()
-                and self._current_task is not current
-            )
-        ):
-            raise RuntimeError(
-                "Cannot compact this explorer while the agent is running a query."
-            )
+    async def compact(self, *, _reserved: bool = False):
+        if not _reserved:
+            self.require_idle("compact this explorer")
         if not self._sdk_session_id or self._active_provider is None:
             raise RuntimeError("This explorer has no conversation context to compact.")
         provider = self._active_provider
@@ -1003,6 +1009,7 @@ class ExplorationSession:
         self._is_busy = True
         self._turn_model = turn_catalogue_model
         self._turn_selection = (provider, turn_raw_model, turn_effort)
+        turn_epoch = self._interrupt_epoch
         try:
             prior_records = self.workspace.current_records()
             switching_provider = (
@@ -1300,9 +1307,18 @@ class ExplorationSession:
                         continue
                     raise RuntimeError(str(exc)) from exc
 
+            if slurm_probe_id is None and not self.workspace.session_pending:
+                from . import slurm
+
+                await asyncio.to_thread(
+                    slurm.clear_reviewed_pending,
+                    self.workspace,
+                    self.workspace.session_id,
+                )
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
+            await self.clear_pending_prompts(through_epoch=turn_epoch)
             await self.emit("status_change", status="cancelled")
             raise
         except Exception as exc:

@@ -300,8 +300,13 @@ def build_tools(session: "ExplorationSession"):
             text, images, kernel_note, plot_paths, status = await asyncio.shield(
                 execution
             )
+            if session._kernel_notice and (kernel_note or len(preface) > 0):
+                session._kernel_notice = ""
         except asyncio.CancelledError:
             cancelled.set()
+            if session.kernel.busy:
+                session._kernel_interrupt_requested = True
+                session.kernel.interrupt()
 
             async def finish_cancelled_probe():
                 # The worker owns artifact saving; report its outcome only after it finishes.
@@ -597,6 +602,7 @@ def build_tools(session: "ExplorationSession"):
         )
         try:
             await asyncio.shield(task)
+            session._kernel_notice = ""
         finally:
             if task.done():
                 session._probe_task = None

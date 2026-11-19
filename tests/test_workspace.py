@@ -370,3 +370,42 @@ def test_document_write_ignores_symlink_at_old_temporary_name(tmp_path):
     assert workspace.read_document("report.md")["content"] == "Revised\n"
     assert evidence.read_text() == original_evidence
     assert temporary.is_symlink()
+
+
+def test_recap_formats_slurm_predictions_verdicts_and_plot_names(tmp_path):
+    workspace = Workspace(tmp_path)
+    workspace.log_transcript("user", text="Compare batch outputs")
+    workspace.log_transcript(
+        "probe_started",
+        probe_id="S001/P001",
+        expected="convergence under 1e-6",
+        code="run_batch()",
+        backend="slurm",
+    )
+    workspace.log_transcript(
+        "slurm_submitted",
+        probe_id="S001/P001",
+        job_id="12345",
+        backend="slurm",
+    )
+    workspace.log_transcript(
+        "run",
+        probe_id="S001/P001",
+        output="loss=1e-7\n",
+        images=[".nocturnomath/sessions/S001/probes/P001/plot-2.png"],
+        status="completed",
+        backend="slurm",
+    )
+    workspace.log_transcript(
+        "verdict",
+        probe_id="S001/P001",
+        text="Prediction confirmed.",
+    )
+
+    recap = Workspace.recap(workspace.load_session("S001"))
+    assert (
+        "Submitted Slurm probe S001/P001 (job 12345), expecting: convergence under 1e-6"
+        in recap
+    )
+    assert "Sources: S001/P001/output.txt, S001/P001/plot-2.png" in recap
+    assert "Recorded verdict for S001/P001: Prediction confirmed." in recap

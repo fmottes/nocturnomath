@@ -1259,3 +1259,33 @@ async def test_user_interrupt_during_kernel_probe_records_interrupted_status(ses
 def test_install_packages_rejects_bare_string_argument(session):
     with pytest.raises(ValueError, match="package requirements"):
         session.install_packages("scipy")
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_restart_kernel_tool_preserves_provider_switch_status(session):
+    class RestartingBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-restart")
+            by_name = {spec.name: spec for spec in tools}
+            res = await by_name["restart_kernel"].handler({"reason": "fresh state"})
+            assert not res.get("is_error")
+            yield TextBlockDone("Kernel restarted cleanly.")
+            yield TurnResult()
+
+    attach_backend(session, RestartingBackend(provider="anthropic"), "anthropic")
+    openai = attach_backend(
+        session, FakeBackend(provider="openai", session_id="oai-2"), "openai"
+    )
+    session.model_providers = {"claude-test": "anthropic", "gpt-5.4": "openai"}
+    session.model_raw_ids = {"claude-test": "claude-test", "gpt-5.4": "gpt-5.4"}
+
+    session.model = "claude-test"
+    await session.query("Restart the kernel and verify")
+    assert session._kernel_notice == ""
+
+    session.model = "gpt-5.4"
+    await session.query("Continue on OpenAI")
+    assert (
+        "The live Jupyter kernel and its in-memory variables are still intact"
+        in openai.calls[-1].prompt
+    )

@@ -332,6 +332,7 @@ class Runtime:
             if (
                 terminal
                 and self._discovering_models == 0
+                and self._creating_agents == 0
                 and agent_id is None
                 and key not in self._slurm_review_attempts
                 and not self._changing_agents
@@ -459,7 +460,9 @@ class Runtime:
                     await asyncio.to_thread(
                         slurm.set_review_pending, session.workspace, probe_id, False
                     )
-                elif slurm.needs_review(session.workspace, probe_id):
+                elif await asyncio.to_thread(
+                    slurm.needs_review, session.workspace, probe_id
+                ):
                     reason = (
                         "did not record a verdict"
                         if not reviewed
@@ -859,13 +862,7 @@ class Runtime:
         self._apply_resumed_owner_model(session)
         self.model = session.model
         self.effort = session.effort
-        return {
-            **data,
-            "session_id": session.workspace.session_id,
-            "can_compact": session.can_compact,
-            "model": session.model,
-            "effort": session.effort,
-        }
+        return {**self.agent_snapshot(self.primary_agent_id), **data}
 
     async def authenticate(
         self, provider: ProviderId, method: str, credential: str | None = None
@@ -1170,6 +1167,10 @@ class Runtime:
                 replacement, default_model, default_effort, default_provider
             )
         self._apply_resumed_owner_model(replacement)
+        existing = self.find_agent_for_session(session_id)
+        if existing is not None and existing != agent_id:
+            replacement.shutdown()
+            return existing, self.agent_snapshot(existing), True
         self._unsubscribe_agent(agent_id)
         old.shutdown()
         self.agents[agent_id] = replacement
@@ -1318,41 +1319,59 @@ class Runtime:
             raise RuntimeError("This explorer is already changing. Please wait.")
         session = self.get_agent(agent_id)
         session.require_idle("compact this explorer")
+        if not session._sdk_session_id or session._active_provider is None:
+            raise RuntimeError("This explorer has no conversation context to compact.")
+        session._is_busy = True
         session.status = "compacting"
-        task = asyncio.create_task(session.compact())
+        compact_epoch = session._interrupt_epoch
+        task = asyncio.create_task(session.compact(_reserved=True))
         session._current_task = task
         succeeded = False
+        outer = asyncio.current_task()
         try:
             result = await asyncio.shield(task)
             succeeded = True
             return result
         except asyncio.CancelledError:
-            with suppress(asyncio.CancelledError, Exception):
-                await task
-            await session.clear_pending_prompts()
-            raise
+            outer_cancelled = outer is not None and bool(outer.cancelling())
+            try:
+                result = await task
+                succeeded = True
+            except asyncio.CancelledError:
+                await session.clear_pending_prompts(through_epoch=compact_epoch)
+                if outer_cancelled:
+                    raise
+                raise RuntimeError("Compaction was cancelled.") from None
+            except Exception:
+                await session.clear_pending_prompts(through_epoch=compact_epoch)
+                raise
+            if outer_cancelled:
+                raise
+            return result
         except Exception:
-            await session.clear_pending_prompts()
+            await session.clear_pending_prompts(through_epoch=compact_epoch)
             raise
         finally:
             if session._current_task is task:
                 session._current_task = None
+            if not succeeded:
+                session._is_busy = False
+                if session.status == "compacting":
+                    session.status = "idle"
             if (
-                not succeeded
-                and not session._is_busy
-                and session.status == "compacting"
-            ):
-                session.status = "idle"
-            if (
-                succeeded
-                and self._started
+                self._started
                 and not self.changing
                 and session._pending_prompts
                 and session._current_task is None
             ):
-                session._current_task = asyncio.create_task(
-                    self._drain_pending_queries(session, agent_id)
-                )
+                if succeeded or not any(
+                    item.epoch <= compact_epoch for item in session._pending_prompts
+                ):
+                    session._current_task = asyncio.create_task(
+                        self._drain_pending_queries(session, agent_id)
+                    )
+                else:
+                    await session.clear_pending_prompts()
             self._wake_slurm_monitor()
 
     async def set_prompt_mode(self, mode: str) -> str:
@@ -1549,6 +1568,8 @@ class Runtime:
                     "user_message",
                     session_id=session.workspace.session_id,
                     text=item.text,
+                    model=session.model,
+                    effort=session.effort,
                 )
             await session.emit(
                 "pending_prompts_changed",
@@ -1571,6 +1592,7 @@ class Runtime:
         self, session: ExplorationSession, agent_id: str | None
     ):
         current = asyncio.current_task()
+        wait_epoch = session._interrupt_epoch
         try:
             while True:
                 probe_task = session._probe_task
@@ -1598,9 +1620,18 @@ class Runtime:
                     continue
                 break
         except asyncio.CancelledError:
-            await session.clear_pending_prompts()
+            await session.clear_pending_prompts(through_epoch=wait_epoch)
             if session._current_task is current:
                 session._current_task = None
+            if (
+                self._started
+                and not self.changing
+                and session._pending_prompts
+                and session._current_task is None
+            ):
+                session._current_task = asyncio.create_task(
+                    self._drain_pending_queries(session, agent_id)
+                )
             return
         await self._run_query_body(session, agent_id)
 

@@ -1649,3 +1649,139 @@ async def test_failed_compaction_clears_queued_prompts_and_blocks_duplicate_resu
     finally:
         await runtime.drain()
         runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_interrupting_compaction_cleans_up_state_and_handles_same_tick_prompt(
+    session,
+):
+    from nocturnomath.backends import CompactResult, SessionStarted, TurnResult
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen_prompts: list[str] = []
+
+    class InteractiveCompactBackend(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            seen_prompts.append(prompt)
+            yield SessionStarted("ant-1")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return CompactResult(session_id="ant-1", context_usage=None)
+
+    runtime = Runtime(
+        session,
+        backends=stub_backends(anthropic=InteractiveCompactBackend("anthropic")),
+    )
+    runtime.start()
+    try:
+        session._sdk_session_id = "ant-1"
+        session._active_provider = "anthropic"
+        session.activate_session()
+        session.log_transcript("user", text="seed")
+
+        compact_task = asyncio.create_task(
+            runtime.compact_agent(runtime.primary_agent_id)
+        )
+        await entered.wait()
+        assert runtime.start_query("queued-during-compact") == "pending"
+
+        await session.interrupt()
+        with pytest.raises(RuntimeError, match="Compaction was cancelled."):
+            await compact_task
+        assert session.status == "idle"
+        assert session._pending_prompts == []
+
+        # Same-tick prompt before compact() starts should queue and drain after compaction.
+        entered.clear()
+        release.clear()
+        compact_task = asyncio.create_task(
+            runtime.compact_agent(runtime.primary_agent_id)
+        )
+        await asyncio.sleep(0)
+        assert not entered.is_set()
+        assert runtime.start_query("same-tick-before-compact-starts") == "pending"
+        release.set()
+        await compact_task
+        await runtime.wait_for_query()
+        assert len(seen_prompts) == 1
+        assert seen_prompts[0].endswith("same-tick-before-compact-starts")
+    finally:
+        release.set()
+        await runtime.drain()
+        runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_outer_disconnect_preserves_compaction_while_server_cancel_clears_queue(
+    session,
+):
+    from nocturnomath.backends import CompactResult, SessionStarted, TurnResult
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen_prompts: list[str] = []
+
+    class DisconnectCompactBackend(StubBackend):
+        async def run_turn(self, prompt, **kwargs):
+            seen_prompts.append(prompt)
+            yield SessionStarted("ant-1")
+            yield TurnResult()
+
+        async def compact(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return CompactResult(
+                session_id="ant-2",
+                context_usage={"used_tokens": 500, "window_tokens": 200000},
+            )
+
+    runtime = Runtime(
+        session, backends=stub_backends(anthropic=DisconnectCompactBackend("anthropic"))
+    )
+    runtime.start()
+    try:
+        session._sdk_session_id = "ant-1"
+        session._active_provider = "anthropic"
+        session.activate_session()
+        session.log_transcript("user", text="seed")
+
+        # 1. Outer caller (e.g. HTTP client) disconnects: shielded compaction finishes and drains queued prompts.
+        outer_task = asyncio.create_task(
+            runtime.compact_agent(runtime.primary_agent_id)
+        )
+        await entered.wait()
+        assert runtime.start_query("after-outer-disconnect") == "pending"
+        outer_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
+        await runtime.wait_for_query()
+        assert len(seen_prompts) == 1
+        assert seen_prompts[0].endswith("after-outer-disconnect")
+
+        # 2. Server-initiated cancellation of session._current_task without session.interrupt()
+        # clears pre-queued prompts from that turn.
+        turn_entered = asyncio.Event()
+
+        class BlockingTurnBackend(StubBackend):
+            async def run_turn(self, prompt, **kwargs):
+                turn_entered.set()
+                await asyncio.Event().wait()
+                yield TurnResult()
+
+        session.backends["anthropic"] = BlockingTurnBackend("anthropic")
+        assert runtime.start_query("first-turn") == "started"
+        await turn_entered.wait()
+        assert runtime.start_query("queued-before-server-cancel") == "pending"
+        session._current_task.cancel()
+        await runtime.wait_for_query()
+        assert session._pending_prompts == []
+        assert session.status == "idle"
+    finally:
+        release.set()
+        await runtime.drain()
+        runtime.shutdown()

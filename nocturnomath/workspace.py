@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .auth import PROVIDERS
@@ -857,6 +857,13 @@ class Workspace:
         *,
         kernel_preserved: bool = False,
     ) -> str:
+        expected_by_probe = {
+            record["probe_id"]: record["expected"]
+            for record in records
+            if record.get("kind") == "probe_started"
+            and record.get("probe_id")
+            and record.get("expected")
+        }
         lines = []
         for record in records:
             kind = record.get("kind")
@@ -873,10 +880,12 @@ class Workspace:
                     else "You ran a probe expecting: "
                 ) + record.get("expected", "")
                 if probe_id:
-                    sources = [f"{probe_id}/output.txt"] + [
-                        f"{probe_id}/plot-{i}.png"
-                        for i in range(1, len(record.get("images") or []) + 1)
+                    plot_sources = [
+                        f"{probe_id}/{PurePosixPath(img).name}"
+                        for img in (record.get("images") or [])
+                        if isinstance(img, str) and img
                     ]
+                    sources = [f"{probe_id}/output.txt", *plot_sources]
                     header += "\nSources: " + ", ".join(sources)
                 lines.append(
                     header + "\nIt printed: " + _clip(record.get("output", ""), 400)
@@ -887,12 +896,23 @@ class Workspace:
                     + _clip(record.get("text", ""), 300)
                 )
             elif kind == "slurm_submitted":
-                lines.append(
-                    f"Submitted Slurm probe {record.get('probe_id', '')} "
-                    f"(job {record.get('job_id', '')}), expecting: "
-                    + record.get("expected", "")
+                probe_id = record.get("probe_id", "")
+                line = (
+                    f"Submitted Slurm probe {probe_id} (job {record.get('job_id', '')})"
                 )
-            elif kind in ("evidence", "thought", "evidence_struck", "verdict"):
+                expected = record.get("expected") or expected_by_probe.get(probe_id, "")
+                if expected:
+                    line += f", expecting: {expected}"
+                lines.append(line)
+            elif kind == "verdict":
+                probe_id = record.get("probe_id")
+                prefix = (
+                    f"Recorded verdict for {probe_id}: "
+                    if probe_id
+                    else "Recorded verdict: "
+                )
+                lines.append(prefix + record.get("text", ""))
+            elif kind in ("evidence", "thought", "evidence_struck"):
                 lines.append(
                     f"Recorded {kind} {record.get('entry_id', '')}: "
                     + record.get("text", "")

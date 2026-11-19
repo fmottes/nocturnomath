@@ -1353,3 +1353,50 @@ async def test_slurm_review_defers_steer_prompts_and_preserves_null_correction_o
     assert replacement_meta["correction_of"] == probe_id
     assert not slurm.needs_review(session.workspace, probe_id)
     assert len(session._pending_prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_slurm_probe_with_verdict_does_not_need_review(
+    session, cluster
+):
+    probe_id, job_id = await submit(session)
+    complete(session, cluster, probe_id, job_id, state="COMPLETED")
+    # Simulate check_slurm_job finalizing probe.json as "completed" and recording verdict
+    # even if the review turn were interrupted before clearing anything else.
+    session._slurm_review_probe_id = probe_id
+    try:
+        await tools(session)["check_slurm_job"].handler({"probe_id": probe_id})
+        await tools(session)["verdict"].handler({"text": "Job finished cleanly."})
+    finally:
+        session._slurm_review_probe_id = None
+
+    assert slurm.has_verdict(session.workspace, probe_id)
+    assert not slurm.needs_review(session.workspace, probe_id)
+
+    # Also verify a failed probe with review_pending=True and a verdict clears review_pending
+    # once a manual follow-up turn completes.
+    failed_id, failed_job_id = await submit(session)
+    complete(session, cluster, failed_id, failed_job_id, state="FAILED")
+    session._slurm_review_probe_id = failed_id
+    try:
+        await tools(session)["check_slurm_job"].handler({"probe_id": failed_id})
+        await tools(session)["verdict"].handler(
+            {"text": "Recorded verdict; user will handle follow-up manually."}
+        )
+    finally:
+        session._slurm_review_probe_id = None
+    slurm.set_review_pending(session.workspace, failed_id, True)
+    assert slurm.needs_review(session.workspace, failed_id)
+
+    class ManualBackend:
+        provider = "anthropic"
+        uses_compact_hook = True
+
+        async def run_turn(self, prompt, **kwargs):
+            yield SessionStarted("ant-manual")
+            yield TextBlockDone("Continuing manually.")
+            yield TurnResult()
+
+    session.backends["anthropic"] = ManualBackend()
+    assert await session.query("continue manually") is True
+    assert not slurm.needs_review(session.workspace, failed_id)
