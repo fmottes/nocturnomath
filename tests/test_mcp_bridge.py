@@ -319,3 +319,120 @@ async def test_mcp_bridge_validates_schema_types_and_strips_optional_nulls():
         res = await call(bad)
         assert res["isError"] is True, bad
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_enforces_additional_properties_false():
+    @tool("strict", "Strict no-args tool.", {})
+    async def strict(_args):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    bridge = McpToolBridge([strict])
+    resp = await bridge._dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "strict", "arguments": {"extra": 1}},
+        }
+    )
+    assert resp["result"]["isError"] is True
+    assert "Unexpected argument" in resp["result"]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_single_cancel_shield_and_malformed_ids():
+    started = asyncio.Event()
+    shield_release = asyncio.Event()
+    cancel_count = 0
+    shield_completed = False
+
+    @tool("shielded_run", "Hold lock inside shield on first cancel.", {})
+    async def shielded_run(_args):
+        nonlocal cancel_count, shield_completed
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_count += 1
+            await asyncio.shield(shield_release.wait())
+            shield_completed = True
+            raise
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    async with McpToolBridge([shielded_run]) as bridge:
+        cfg = bridge.stdio_server_config()
+        proc = await asyncio.create_subprocess_exec(
+            cfg["command"],
+            *cfg["args"],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **cfg["env"]},
+        )
+
+        async def send(msg):
+            proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+
+        try:
+            await send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": {"bad": "id"},
+                    "method": "ping",
+                }
+            )
+            bad_id_resp = json.loads(
+                await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+            )
+            assert bad_id_resp["result"] == {}
+
+            await send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {"name": "shielded_run", "arguments": {}},
+                }
+            )
+            await asyncio.wait_for(started.wait(), timeout=5)
+
+            # Malformed notifications/cancelled must be ignored without closing connection.
+            await send(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": []}
+            )
+            await send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": [1]},
+                }
+            )
+            await send({"jsonrpc": "2.0", "id": 11, "method": "ping"})
+            ping_resp = json.loads(
+                await asyncio.wait_for(proc.stdout.readline(), timeout=5)
+            )
+            assert ping_resp == {"jsonrpc": "2.0", "id": 11, "result": {}}
+
+            # CLI notifications/cancelled followed by bridge.cancel_in_flight() must only
+            # cancel `req_task` once so the shield finishes before shutdown.
+            await send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 10},
+                }
+            )
+            await asyncio.sleep(0.05)
+            cancel_task = asyncio.create_task(bridge.cancel_in_flight())
+            await asyncio.sleep(0.05)
+            assert cancel_count == 1
+            assert not cancel_task.done()
+            shield_release.set()
+            await asyncio.wait_for(cancel_task, timeout=5)
+            assert shield_completed is True
+            assert cancel_count == 1
+        finally:
+            proc.stdin.close()
+            await asyncio.wait_for(proc.wait(), timeout=5)

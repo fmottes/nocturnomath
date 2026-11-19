@@ -90,6 +90,10 @@ def _validate_property_value(name: str, value: Any, prop: dict[str, Any]) -> Non
                 _validate_property_value(f"{name}[{index}]", item, items_schema)
 
 
+def _is_rpc_id(value: Any) -> bool:
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
 def _validate_arguments(
     schema: dict[str, Any], arguments: dict[str, Any]
 ) -> dict[str, Any]:
@@ -99,9 +103,12 @@ def _validate_arguments(
     required_list = (
         schema.get("required") if isinstance(schema.get("required"), list) else []
     )
+    disallow_extra = schema.get("additionalProperties") is False
     required = {item for item in required_list if isinstance(item, str)}
     cleaned: dict[str, Any] = {}
     for key, value in arguments.items():
+        if disallow_extra and key not in properties:
+            raise ValueError(f"Unexpected argument: '{key}'.")
         prop = properties.get(key)
         if value is None:
             prop_type = prop.get("type") if isinstance(prop, dict) else None
@@ -160,10 +167,33 @@ class McpToolBridge:
 
     async def cancel_in_flight(self) -> None:
         """Cancel active client connections and running tool handlers immediately."""
-        for task in list(self._client_tasks):
+        tasks = [task for task in self._client_tasks if not task.done()]
+        for task in tasks:
             task.cancel()
-        if self._client_tasks:
-            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        if not tasks:
+            return
+        try:
+            done, _ = await asyncio.wait(tasks)
+            for finished in done:
+                if not finished.cancelled():
+                    with suppress(Exception):
+                        finished.exception()
+        except asyncio.CancelledError:
+            for client_task in list(self._client_tasks):
+                if not client_task.done():
+                    client_task.cancel()
+            remaining = [
+                client_task
+                for client_task in self._client_tasks
+                if not client_task.done()
+            ]
+            if remaining:
+                done, _ = await asyncio.wait(remaining, timeout=0.5)
+                for finished in done:
+                    if not finished.cancelled():
+                        with suppress(Exception):
+                            finished.exception()
+            raise
 
     async def __aexit__(self, *args: object) -> None:
         await self.cancel_in_flight()
@@ -212,6 +242,7 @@ class McpToolBridge:
             write_lock = asyncio.Lock()
             in_flight: set[asyncio.Task[None]] = set()
             in_flight_by_id: dict[Any, asyncio.Task[None]] = {}
+            already_cancelled: set[asyncio.Task[None]] = set()
 
             async def send_json(payload: dict[str, Any]) -> None:
                 async with write_lock:
@@ -219,13 +250,20 @@ class McpToolBridge:
                     await writer.drain()
 
             async def handle_parsed(request: Any, msg_id: Any) -> None:
+                current = asyncio.current_task()
                 try:
                     response = await self._dispatch(request, notify=send_json)
                     if response is not None:
                         await send_json(response)
                 finally:
-                    if msg_id is not None:
+                    if _is_rpc_id(msg_id) and in_flight_by_id.get(msg_id) is current:
                         in_flight_by_id.pop(msg_id, None)
+
+            def _drain_done(done_tasks: set[asyncio.Task[None]]) -> None:
+                for finished in done_tasks:
+                    if not finished.cancelled():
+                        with suppress(Exception):
+                            finished.exception()
 
             try:
                 async for line in lines:
@@ -240,23 +278,49 @@ class McpToolBridge:
                         isinstance(parsed, dict)
                         and parsed.get("method") == "notifications/cancelled"
                     ):
-                        cancel_id = (parsed.get("params") or {}).get("requestId")
-                        if cancel_id is not None and cancel_id in in_flight_by_id:
-                            in_flight_by_id[cancel_id].cancel()
+                        raw_params = parsed.get("params")
+                        cancel_id = (
+                            raw_params.get("requestId")
+                            if isinstance(raw_params, dict)
+                            else None
+                        )
+                        if _is_rpc_id(cancel_id):
+                            target = in_flight_by_id.get(cancel_id)
+                            if (
+                                target is not None
+                                and not target.done()
+                                and target not in already_cancelled
+                            ):
+                                already_cancelled.add(target)
+                                target.cancel()
                         continue
                     msg_id = parsed.get("id") if isinstance(parsed, dict) else None
-                    req_task = asyncio.create_task(handle_parsed(parsed, msg_id))
+                    valid_id = msg_id if _is_rpc_id(msg_id) else None
+                    req_task = asyncio.create_task(handle_parsed(parsed, valid_id))
                     in_flight.add(req_task)
-                    if msg_id is not None:
-                        in_flight_by_id[msg_id] = req_task
+                    if valid_id is not None:
+                        in_flight_by_id[valid_id] = req_task
                     req_task.add_done_callback(in_flight.discard)
                 if in_flight:
-                    await asyncio.gather(*in_flight, return_exceptions=True)
+                    done, _ = await asyncio.wait(list(in_flight))
+                    _drain_done(done)
             finally:
                 for req_task in list(in_flight):
-                    req_task.cancel()
+                    if not req_task.done() and req_task not in already_cancelled:
+                        already_cancelled.add(req_task)
+                        req_task.cancel()
                 if in_flight:
-                    await asyncio.gather(*in_flight, return_exceptions=True)
+                    try:
+                        done, _ = await asyncio.wait(list(in_flight))
+                        _drain_done(done)
+                    except asyncio.CancelledError:
+                        for req_task in list(in_flight):
+                            if not req_task.done():
+                                req_task.cancel()
+                        if in_flight:
+                            done, _ = await asyncio.wait(list(in_flight), timeout=0.5)
+                            _drain_done(done)
+                        raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
