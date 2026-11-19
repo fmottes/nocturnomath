@@ -244,6 +244,8 @@ def build_tools(session: "ExplorationSession"):
             code=code,
         )
         cancelled = threading.Event()
+        probe_epoch = session._interrupt_epoch
+        query_task = session._query_task
         session._kernel_interrupt_requested = False
 
         def execute_and_save():
@@ -303,10 +305,16 @@ def build_tools(session: "ExplorationSession"):
             if session._kernel_notice and (kernel_note or len(preface) > 0):
                 session._kernel_notice = ""
         except asyncio.CancelledError:
-            cancelled.set()
-            if session.kernel.busy:
-                session._kernel_interrupt_requested = True
-                session.kernel.interrupt()
+            turn_interrupted = (
+                session._interrupt_epoch != probe_epoch
+                or query_task is None
+                or bool(query_task.cancelling())
+            )
+            if turn_interrupted:
+                cancelled.set()
+                if session.kernel.busy:
+                    session._kernel_interrupt_requested = True
+                    session.kernel.interrupt()
 
             async def finish_cancelled_probe():
                 # The worker owns artifact saving; report its outcome only after it finishes.
@@ -320,6 +328,14 @@ def build_tools(session: "ExplorationSession"):
                         [],
                         "failed",
                     )
+                if (
+                    session._interrupt_epoch == probe_epoch
+                    and query_task is not None
+                    and not query_task.cancelling()
+                    and status not in ("error", "interrupted", "failed")
+                ):
+                    session._pending_verdict = expected
+                    session._pending_verdict_probe_id = source_id
                 await session.emit(
                     "probe_finish",
                     probe_id=source_id,
@@ -373,11 +389,11 @@ def build_tools(session: "ExplorationSession"):
                 "Pick the one that answers the question.",
             )
 
-        if not session.kernel.errored:
+        if status not in ("error", "interrupted"):
             session._pending_verdict = expected
             session._pending_verdict_probe_id = source_id
 
-        if not session.kernel.errored and (images or text.strip()):
+        if status not in ("error", "interrupted") and (images or text.strip()):
             session._results_since_note += 1
             if session._results_since_note == 1:
                 preface.append(

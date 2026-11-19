@@ -1400,3 +1400,35 @@ async def test_completed_slurm_probe_with_verdict_does_not_need_review(
     session.backends["anthropic"] = ManualBackend()
     assert await session.query("continue manually") is True
     assert not slurm.needs_review(session.workspace, failed_id)
+
+
+@pytest.mark.asyncio
+async def test_cross_session_slurm_check_does_not_block_resumed_checking_session(
+    session, runtime, reviewer, cluster
+):
+    probe_s1, job_s1 = await submit(session)
+    complete(session, cluster, probe_s1, job_s1)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+    assert slurm.has_verdict(session.workspace, probe_s1)
+
+    # Start S002 and manually inspect S001/P001, logging run(S001/P001) in S002.
+    runtime.reset_session()
+    session.log_transcript("user", text="Inspect S001/P001 from S002")
+    inspected = await tools(session)["check_slurm_job"].handler({"probe_id": probe_s1})
+    assert not inspected.get("is_error")
+    assert "Existing verdict" in inspected["content"][0]["text"]
+    assert session._pending_verdict is None
+
+    # Submit S002/P001, switch away, and let S002 reopen/resume; S001/P001 must not
+    # poison S002._pending_verdict_probe_id or block S002/P001's automatic review.
+    probe_s2, job_s2 = await submit(session)
+    runtime.reset_session()
+    complete(session, cluster, probe_s2, job_s2)
+    await runtime._poll_slurm_jobs()
+    await finish_reviews(runtime)
+    assert slurm.has_verdict(session.workspace, probe_s2)
+
+    runtime.reset_session()
+    session.resume_session("S002")
+    assert session._pending_verdict is None

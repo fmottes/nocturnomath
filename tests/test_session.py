@@ -1289,3 +1289,126 @@ async def test_mid_turn_restart_kernel_tool_preserves_provider_switch_status(ses
         "The live Jupyter kernel and its in-memory variables are still intact"
         in openai.calls[-1].prompt
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_probe_not_resurrected_and_unsolicited_tool_cancel_spares_kernel(
+    session,
+):
+    import threading
+
+    from nocturnomath.backends import SessionResumeError
+
+    entered = threading.Event()
+    finish_exec = threading.Event()
+    interrupts_called = 0
+
+    def mark_interrupt():
+        nonlocal interrupts_called
+        interrupts_called += 1
+        finish_exec.set()
+
+    # 1. Interrupted probe with kernel.errored=False neither sets _pending_verdict
+    # nor resurrects after a later probe's verdict or session resume.
+    def race_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        finish_exec.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = False
+        return "partial output", [], None
+
+    session.kernel.execute = race_execute
+    session.kernel.interrupt = mark_interrupt
+
+    class InterruptRaceBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-1")
+            by_name = {spec.name: spec for spec in tools}
+            await by_name["run"].handler({"code": "x = 1", "expected": "x is 1"})
+            await asyncio.Event().wait()
+
+    attach_backend(session, InterruptRaceBackend(provider="anthropic"), "anthropic")
+    task = asyncio.create_task(session.query("run interrupted"))
+    session._current_task = task
+    await asyncio.to_thread(entered.wait, 5)
+    await session.interrupt()
+    session._current_task = None
+    assert session._pending_verdict is None
+
+    # Complete a second probe and record its verdict; P001 must not come back.
+    session.kernel.execute = lambda _c, _t: ("2\n", [], None)
+    by_name = {spec.name: spec for spec in session.tools}
+    await by_name["run"].handler({"code": "print(2)", "expected": "2"})
+    assert session._pending_verdict_probe_id == "S001/P002"
+    verdict_res = await by_name["verdict"].handler({"text": "Matched 2."})
+    assert not verdict_res.get("is_error")
+    assert session._pending_verdict is None
+    resumed = session.resume_session("S001")
+    assert resumed["context_restored"] is True
+    assert session._pending_verdict is None
+
+    # 2. Unsolicited MCP tool cancellation mid-turn (e.g. client 180s RPC timeout)
+    # must NOT interrupt the kernel, and must save completed artifacts + pending verdict.
+    entered.clear()
+    finish_exec.clear()
+    interrupts_called = 0
+
+    def long_execute(_code, _timeout_s):
+        session.kernel.busy = True
+        entered.set()
+        finish_exec.wait(timeout=5)
+        session.kernel.busy = False
+        session.kernel.errored = False
+        return "49\n", [], None
+
+    session.kernel.execute = long_execute
+
+    class ClientTimeoutBackend(FakeBackend):
+        async def run_turn(self, prompt, *, tools, **kwargs):
+            yield SessionStarted("ant-1")
+            tool_map = {spec.name: spec for spec in tools}
+            tool_task = asyncio.create_task(
+                tool_map["run"].handler({"code": "7**2", "expected": "49"})
+            )
+            await asyncio.to_thread(entered.wait, 5)
+            tool_task.cancel()
+            await asyncio.sleep(0.02)
+            assert interrupts_called == 0
+            finish_exec.set()
+            with pytest.raises(asyncio.CancelledError):
+                await tool_task
+            yield TextBlockDone("Tool call timed out in client wrapper.")
+            yield TurnResult()
+
+    attach_backend(session, ClientTimeoutBackend(provider="anthropic"), "anthropic")
+    saw_idle_on_turn_complete = []
+    session.subscribe(
+        lambda kind, _payload: (
+            saw_idle_on_turn_complete.append(session.has_active_query())
+            if kind == "turn_complete"
+            else None
+        )
+    )
+    assert await session.query("run 4m probe") is True
+    assert interrupts_called == 0
+    assert saw_idle_on_turn_complete == [False]
+    assert session._pending_verdict_probe_id == "S001/P003"
+    p3_meta = json.loads(
+        (
+            session.workspace.sessions_path / "S001" / "probes" / "P003" / "probe.json"
+        ).read_text()
+    )
+    assert p3_meta["status"] == "completed"
+
+    # 3. Stale session during compact() persists context_rebuilt=True on disk.
+    class StaleCompactBackend(FakeBackend):
+        async def compact(self, **kwargs):
+            raise SessionResumeError("missing session")
+
+    attach_backend(session, StaleCompactBackend(provider="anthropic"), "anthropic")
+    with pytest.raises(RuntimeError, match="no longer available"):
+        await session.compact()
+    resumed_after_stale = session.resume_session("S001")
+    assert resumed_after_stale["context_restored"] is False
+    assert session.can_compact is False

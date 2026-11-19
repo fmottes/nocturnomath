@@ -7,7 +7,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,6 +104,8 @@ class ExplorationSession:
         self._compaction_reserved = False
         self.status = "idle"
         self._current_task: asyncio.Task | None = None
+        self._finishing_task: asyncio.Task | None = None
+        self._query_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_operation_lock = asyncio.Lock()
         self._session_initialized = False
@@ -193,7 +195,11 @@ class ExplorationSession:
             or self._probe_operation_lock.locked()
             or bool(self._pending_prompts)
             or (self._probe_task is not None and not self._probe_task.done())
-            or (self._current_task is not None and not self._current_task.done())
+            or (
+                self._current_task is not None
+                and self._current_task is not self._finishing_task
+                and not self._current_task.done()
+            )
         )
 
     def require_idle(self, action: str):
@@ -676,16 +682,24 @@ class ExplorationSession:
         for record in reversed(records):
             if record.get("kind") != "run":
                 continue
-            if not include_slurm and record.get("backend") == "slurm":
+            is_slurm = record.get("backend") == "slurm"
+            if not include_slurm and is_slurm:
                 continue
             status = record.get("status", "completed")
-            if status in ("failed", "error") and record.get("backend") != "slurm":
+            if status in ("failed", "error", "interrupted") and not is_slurm:
                 continue
             probe_id = record.get("probe_id")
-            if probe_id and probe_id not in reviewed and record.get("expected"):
-                self._pending_verdict = record["expected"]
-                self._pending_verdict_probe_id = probe_id
-                break
+            if not probe_id or probe_id in reviewed or not record.get("expected"):
+                continue
+            if is_slurm:
+                from . import slurm
+
+                with suppress(FileNotFoundError, ValueError):
+                    if slurm.has_verdict(self.workspace, probe_id):
+                        continue
+            self._pending_verdict = record["expected"]
+            self._pending_verdict_probe_id = probe_id
+            break
 
     def resume_session(
         self, session_id: str, restore_kernel: bool = False
@@ -873,8 +887,10 @@ class ExplorationSession:
                 )
             except SessionResumeError as exc:
                 prior_records = self.workspace.current_records()
+                stale_id = self._sdk_session_id
                 self._sdk_session_id = None
                 self._active_provider = None
+                self._owner_provider = provider
                 self._sent_documents = {}
                 self.context_usage = None
                 self._session_initialized = False
@@ -887,7 +903,13 @@ class ExplorationSession:
                     if prior_records
                     else None
                 )
-                self.log_transcript("meta", context_usage=None)
+                self.log_transcript(
+                    "meta",
+                    context_rebuilt=True,
+                    provider=provider,
+                    stale_sdk_session_id=stale_id,
+                    context_usage=None,
+                )
                 await self.emit("context_usage_changed", context_usage=None)
                 raise RuntimeError(
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
@@ -1010,9 +1032,13 @@ class ExplorationSession:
         turn_auth = bound.auth
         backend = self.backends[provider]
         self._is_busy = True
+        self._finishing_task = None
+        self._query_task = asyncio.current_task()
         self._turn_model = turn_catalogue_model
         self._turn_selection = (provider, turn_raw_model, turn_effort)
         turn_epoch = self._interrupt_epoch
+        finishing_done = False
+        finishing_task: asyncio.Task | None = None
         try:
             prior_records = self.workspace.current_records()
             switching_provider = (
@@ -1318,6 +1344,15 @@ class ExplorationSession:
                     self.workspace,
                     self.workspace.session_id,
                 )
+            if not (self._draining_queries and self._pending_prompts):
+                finishing_done = True
+                finishing_task = self._current_task
+                self._finishing_task = finishing_task
+                self._turn_model = None
+                self._turn_selection = None
+                self._query_task = None
+                self._is_busy = False
+                self.status = "idle"
             await self.emit("turn_complete", full_text="\n\n".join(accumulated_text))
             return True
         except asyncio.CancelledError:
@@ -1332,11 +1367,28 @@ class ExplorationSession:
         finally:
             self._pending_user_logs = None
             self._commit_turn_accepted = None
+            self._query_task = None
             self._turn_model = None
             self._turn_selection = None
-            self._is_busy = False
-            if not (self._draining_queries and self._pending_prompts):
-                await self.emit("status_change", status="idle")
+            if finishing_done and (
+                self._is_busy
+                or self._pending_prompts
+                or (
+                    self._current_task is not None
+                    and self._current_task is not finishing_task
+                )
+            ):
+                if self._finishing_task is finishing_task:
+                    self._finishing_task = None
+            else:
+                self._is_busy = False
+                if not (self._draining_queries and self._pending_prompts):
+                    await self.emit("status_change", status="idle")
+                if (
+                    self._finishing_task is finishing_task
+                    and self._current_task is None
+                ):
+                    self._finishing_task = None
 
     def _track_session_id(
         self,

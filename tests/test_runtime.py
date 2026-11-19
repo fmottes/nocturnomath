@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1783,5 +1784,51 @@ async def test_outer_disconnect_preserves_compaction_while_server_cancel_clears_
         assert session.status == "idle"
     finally:
         release.set()
+        await runtime.drain()
+        runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_open_workspace_validation_failure_preserves_explorers_and_concurrent_close_keeps_one(
+    session, tmp_path
+):
+    runtime = Runtime(session, backends=stub_backends())
+    runtime.start()
+    try:
+        second_id = await runtime.create_agent_async()
+        assert len(runtime.agents) == 2
+        bad_key = (session.workspace_path, "S001/P001")
+        runtime._slurm_review_attempts.add(bad_key)
+
+        bad_ws = tmp_path / "bad_ws"
+        bad_ws.mkdir()
+
+        def failing_factory(**kwargs):
+            if Path(kwargs["workspace_path"]).resolve() == bad_ws.resolve():
+                raise ValueError("Invalid Python interpreter")
+            return session
+
+        runtime.session_factory = failing_factory
+        with pytest.raises(ValueError, match="Invalid Python interpreter"):
+            await runtime.transition(runtime.open_workspace, bad_ws)
+
+        assert len(runtime.agents) == 2
+        assert runtime.session is session
+        assert bad_key in runtime._slurm_review_attempts
+
+        results = await asyncio.gather(
+            runtime.transition_agent(
+                runtime.primary_agent_id, runtime.close_agent, runtime.primary_agent_id
+            ),
+            runtime.transition_agent(second_id, runtime.close_agent, second_id),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "Keep one explorer open" in str(errors[0])
+        assert len(runtime.agents) == 1
+        assert runtime.session is runtime.agents[runtime.primary_agent_id]
+    finally:
         await runtime.drain()
         runtime.shutdown()

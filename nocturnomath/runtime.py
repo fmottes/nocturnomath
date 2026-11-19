@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import threading
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -79,6 +80,8 @@ class Runtime:
         self._changing_agents: set[str] = set()
         self._creating_agents = 0
         self._discovering_models = 0
+        self._agents_lock = threading.RLock()
+        self._resuming_sessions: set[str] = set()
         self._agent_subscribers: dict[str, Callable[[str, dict[str, Any]], Any]] = {}
         self._workspace_defaults_pending = session is not None
         self._slurm_task: asyncio.Task | None = None
@@ -336,7 +339,9 @@ class Runtime:
                 and agent_id is None
                 and key not in self._slurm_review_attempts
                 and not self._changing_agents
-                and not any(agent.has_active_query() for agent in self.agents.values())
+                and not any(
+                    agent.has_active_query() for agent in list(self.agents.values())
+                )
             ):
                 review_model, _, owner_provider = self._slurm_review_model(
                     workspace, session_id
@@ -483,6 +488,8 @@ class Runtime:
             session._bound_turn = None
             session._slurm_review_probe_id = None
             if session._current_task is asyncio.current_task():
+                if session._finishing_task is session._current_task:
+                    session._finishing_task = None
                 session._current_task = None
             if (
                 self._started
@@ -894,10 +901,6 @@ class Runtime:
         target = Path(path).expanduser().resolve()
         if not target.is_dir():
             raise ValueError("Choose an existing folder for the workspace.")
-        self._slurm_seen.clear()
-        self._slurm_review_attempts.clear()
-        self._slurm_waiting_notices.clear()
-        self._closed_session_meta_cache.clear()
 
         # Keep the terminal's long-standing in-place session contract when it
         # is the only explorer. Multi-tab workspace changes intentionally tear
@@ -905,25 +908,51 @@ class Runtime:
         if len(self.agents) == 1:
             session = self.require_session()
             session.set_workspace(target, python)
+            self._slurm_seen.clear()
+            self._slurm_review_attempts.clear()
+            self._slurm_waiting_notices.clear()
+            self._closed_session_meta_cache.clear()
             self._workspace_defaults_pending = True
             if self.models or self._models_discovered:
                 self._apply_workspace_defaults()
             self._wake_slurm_monitor()
             return session
 
-        for agent_id in list(self.agents):
-            self._unsubscribe_agent(agent_id)
-            self.agents[agent_id].shutdown()
-        self.agents.clear()
-        self.primary_agent_id = None
-        self.session = None
-        self._workspace_defaults_pending = True
-        self.create_agent(target, python=python)
-        self._workspace_defaults_pending = True
-        if self.models or self._models_discovered:
-            self._apply_workspace_defaults()
+        new_session = self.session_factory(
+            workspace_path=target,
+            python=python,
+            model=self.model,
+            effort=self.effort,
+            timeout_s=self.timeout_s,
+            image_cap=self.image_cap,
+            auth=self._auth,
+            backends=self.backends,
+            model_providers=self.model_providers,
+            model_raw_ids=self.model_raw_ids,
+        )
+        with self._agents_lock:
+            old_sessions = [self.agents[aid] for aid in list(self.agents)]
+            for agent_id in list(self.agents):
+                self._unsubscribe_agent(agent_id)
+            self.agents.clear()
+            self._slurm_seen.clear()
+            self._slurm_review_attempts.clear()
+            self._slurm_waiting_notices.clear()
+            self._closed_session_meta_cache.clear()
+            new_session.model_providers = dict(self.model_providers)
+            new_session.model_raw_ids = dict(self.model_raw_ids)
+            agent_id = self._new_agent_id()
+            self.agents[agent_id] = new_session
+            self.primary_agent_id = agent_id
+            self.session = new_session
+            self._workspace_defaults_pending = True
+            if self.models or self._models_discovered:
+                self._apply_workspace_defaults()
+            self._subscribe_to_agent(agent_id, new_session)
+        for old_session in old_sessions:
+            old_session.shutdown()
         self._wake_slurm_monitor()
-        return self.require_session()
+        return new_session
 
     def _new_agent_id(self) -> str:
         return uuid.uuid4().hex
@@ -934,7 +963,7 @@ class Runtime:
 
         async def forward(event_type: str, payload: dict[str, Any]):
             if event_type == "record_changed":
-                for other_id, other in self.agents.items():
+                for other_id, other in list(self.agents.items()):
                     if other_id != agent_id:
                         other.mark_record_dirty()
             await self.emit(event_type, {"agent_id": agent_id, **payload})
@@ -1018,27 +1047,28 @@ class Runtime:
         session.model_providers = dict(self.model_providers)
         session.model_raw_ids = dict(self.model_raw_ids)
         agent_id = self._new_agent_id()
-        self.agents[agent_id] = session
-        if self.primary_agent_id is None:
-            self.primary_agent_id = agent_id
-            self.session = session
-        if self.models or self._models_discovered:
-            default_model, default_effort, default_provider = self._workspace_defaults(
-                session
-            )
-            self._apply_defaults_to(
-                session, default_model, default_effort, default_provider
-            )
-            if session_id is not None:
-                self._apply_resumed_owner_model(session)
-        elif session_id is not None:
-            owner_provider = session._active_provider or session._owner_provider
-            if owner_provider is not None and (
-                session.model is None
-                or session.provider_for_model(session.model) != owner_provider
-            ):
-                self._apply_resumed_owner_model(session)
-        self._subscribe_to_agent(agent_id, session)
+        with self._agents_lock:
+            self.agents[agent_id] = session
+            if self.primary_agent_id is None:
+                self.primary_agent_id = agent_id
+                self.session = session
+            if self.models or self._models_discovered:
+                default_model, default_effort, default_provider = (
+                    self._workspace_defaults(session)
+                )
+                self._apply_defaults_to(
+                    session, default_model, default_effort, default_provider
+                )
+                if session_id is not None:
+                    self._apply_resumed_owner_model(session)
+            elif session_id is not None:
+                owner_provider = session._active_provider or session._owner_provider
+                if owner_provider is not None and (
+                    session.model is None
+                    or session.provider_for_model(session.model) != owner_provider
+                ):
+                    self._apply_resumed_owner_model(session)
+            self._subscribe_to_agent(agent_id, session)
         return agent_id
 
     async def create_agent_async(self) -> str:
@@ -1107,21 +1137,22 @@ class Runtime:
         }
 
     def close_agent(self, agent_id: str):
-        if len(self.agents) == 1:
-            raise RuntimeError("Keep one explorer open.")
-        session = self.get_agent(agent_id)
-        session.require_idle("close this explorer")
-        self._unsubscribe_agent(agent_id)
+        with self._agents_lock:
+            if len(self.agents) <= 1:
+                raise RuntimeError("Keep one explorer open.")
+            session = self.get_agent(agent_id)
+            session.require_idle("close this explorer")
+            self._unsubscribe_agent(agent_id)
+            del self.agents[agent_id]
+            if self.primary_agent_id == agent_id:
+                self.primary_agent_id = next(iter(self.agents))
+                self.session = self.agents[self.primary_agent_id]
+                self.model = self.session.model
+                self.effort = self.session.effort
         session.shutdown()
-        del self.agents[agent_id]
-        if self.primary_agent_id == agent_id:
-            self.primary_agent_id = next(iter(self.agents))
-            self.session = self.agents[self.primary_agent_id]
-            self.model = self.session.model
-            self.effort = self.session.effort
 
     def find_agent_for_session(self, session_id: str) -> str | None:
-        for agent_id, session in self.agents.items():
+        for agent_id, session in list(self.agents.items()):
             if (
                 not session.workspace.session_pending
                 and session.workspace.session_id == session_id
@@ -1133,53 +1164,72 @@ class Runtime:
         self, agent_id: str, session_id: str, restore_kernel: bool = False
     ) -> tuple[str, dict[str, Any], bool]:
         """Load history into an idle tab, unless it is already open elsewhere."""
-        existing = self.find_agent_for_session(session_id)
-        if existing is not None and existing != agent_id:
-            return existing, self.agent_snapshot(existing), True
-        old = self.get_agent(agent_id)
-        old.require_idle("resume a past session")
-        replacement = self.session_factory(
-            workspace_path=old.workspace_path,
-            model=old.model,
-            effort=old.effort,
-            timeout_s=old.timeout_s,
-            image_cap=old.image_cap,
-            auth=self._auth,
-            backends=self.backends,
-            model_providers=self.model_providers,
-            model_raw_ids=self.model_raw_ids,
-        )
-        replacement.default_model = old.default_model
-        replacement.default_effort = old.default_effort
-        replacement.default_provider = old.default_provider
+        with self._agents_lock:
+            existing = self.find_agent_for_session(session_id)
+            if existing is not None and existing != agent_id:
+                return existing, self.agent_snapshot(existing), True
+            if session_id in self._resuming_sessions:
+                raise RuntimeError(
+                    f"Session {session_id} is already being resumed in another explorer."
+                )
+            old = self.get_agent(agent_id)
+            old.require_idle("resume a past session")
+            self._resuming_sessions.add(session_id)
         try:
-            data = replacement.resume_session(session_id, restore_kernel)
-        except Exception:
-            replacement.shutdown()
-            raise
-        replacement.model_providers = dict(self.model_providers)
-        replacement.model_raw_ids = dict(self.model_raw_ids)
-        if self.models or self._models_discovered:
-            default_model, default_effort, default_provider = self._workspace_defaults(
-                replacement
+            replacement = self.session_factory(
+                workspace_path=old.workspace_path,
+                model=old.model,
+                effort=old.effort,
+                timeout_s=old.timeout_s,
+                image_cap=old.image_cap,
+                auth=self._auth,
+                backends=self.backends,
+                model_providers=self.model_providers,
+                model_raw_ids=self.model_raw_ids,
             )
-            self._apply_defaults_to(
-                replacement, default_model, default_effort, default_provider
-            )
-        self._apply_resumed_owner_model(replacement)
-        existing = self.find_agent_for_session(session_id)
-        if existing is not None and existing != agent_id:
-            replacement.shutdown()
-            return existing, self.agent_snapshot(existing), True
-        self._unsubscribe_agent(agent_id)
-        old.shutdown()
-        self.agents[agent_id] = replacement
-        if self.primary_agent_id == agent_id:
-            self.session = replacement
-            self.model = replacement.model
-            self.effort = replacement.effort
-        self._subscribe_to_agent(agent_id, replacement)
-        return agent_id, {**self.agent_snapshot(agent_id), **data}, False
+            replacement.default_model = old.default_model
+            replacement.default_effort = old.default_effort
+            replacement.default_provider = old.default_provider
+            try:
+                data = replacement.resume_session(session_id, restore_kernel)
+            except Exception:
+                replacement.shutdown()
+                raise
+            with self._agents_lock:
+                replacement.model_providers = dict(self.model_providers)
+                replacement.model_raw_ids = dict(self.model_raw_ids)
+                if self.models or self._models_discovered:
+                    default_model, default_effort, default_provider = (
+                        self._workspace_defaults(replacement)
+                    )
+                    self._apply_defaults_to(
+                        replacement, default_model, default_effort, default_provider
+                    )
+                self._apply_resumed_owner_model(replacement)
+                existing = self.find_agent_for_session(session_id)
+                if existing is not None and existing != agent_id:
+                    discard = replacement
+                    snapshot = self.agent_snapshot(existing)
+                    focused_id = existing
+                else:
+                    discard = None
+                    self._unsubscribe_agent(agent_id)
+                    self.agents[agent_id] = replacement
+                    if self.primary_agent_id == agent_id:
+                        self.session = replacement
+                        self.model = replacement.model
+                        self.effort = replacement.effort
+                    self._subscribe_to_agent(agent_id, replacement)
+                    snapshot = {**self.agent_snapshot(agent_id), **data}
+                    focused_id = agent_id
+            if discard is not None:
+                discard.shutdown()
+                return focused_id, snapshot, True
+            old.shutdown()
+            return focused_id, snapshot, False
+        finally:
+            with self._agents_lock:
+                self._resuming_sessions.discard(session_id)
 
     def workspace_snapshot(self) -> dict[str, Any]:
         """Describe the current workspace for a client that just connected."""
@@ -1243,7 +1293,11 @@ class Runtime:
             "folders": session.workspace.list_document_folders(),
             "documents_default": session.documents_default,
             "plots": session.list_plots(),
-            "agents": [self.agent_snapshot(agent_id) for agent_id in self.agents],
+            "agents": [
+                self.agent_snapshot(agent_id)
+                for agent_id in list(self.agents)
+                if agent_id in self.agents
+            ],
             "auth": auth_public,
         }
 
@@ -1271,7 +1325,7 @@ class Runtime:
     def require_all_idle(self, action: str):
         if self._changing_agents or self._creating_agents:
             raise RuntimeError(f"Cannot {action} while an explorer is changing.")
-        for session in self.agents.values():
+        for session in list(self.agents.values()):
             session.require_idle(action)
 
     async def transition(self, operation, *args):
@@ -1377,7 +1431,7 @@ class Runtime:
         """Persist workspace prompt delivery mode and update any still-pending prompts."""
         session = self.require_session()
         resolved = session.set_prompt_mode(mode)
-        for other in self.agents.values():
+        for other in list(self.agents.values()):
             if (
                 other.workspace_path == session.workspace_path
                 and other._pending_prompts
@@ -1678,6 +1732,8 @@ class Runtime:
             if not session._is_busy and session.status != "idle":
                 await session.emit("status_change", status="idle")
             if session._current_task is asyncio.current_task():
+                if session._finishing_task is session._current_task:
+                    session._finishing_task = None
                 session._current_task = None
             if session._pending_prompts:
                 if not failed and not self.changing and session._current_task is None:
