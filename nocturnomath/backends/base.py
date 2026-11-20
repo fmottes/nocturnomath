@@ -117,6 +117,7 @@ class CompactResult:
 
     session_id: str | None
     context_usage: dict[str, Any] | None
+    record_reloaded: bool | None = None
 
 
 class AgentBackend(Protocol):

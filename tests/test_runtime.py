@@ -1177,11 +1177,21 @@ async def test_saved_session_defaults_recover_after_empty_discovery_on_reset(ses
 
 @pytest.mark.asyncio
 async def test_superseded_discovery_does_not_overwrite_backend_cli_path(
-    session, tmp_path
+    session, tmp_path, monkeypatch
 ):
     import sys
 
     from nocturnomath.backends.anthropic import AnthropicBackend
+
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
     started_flag = tmp_path / "first_started"
     release_flag = tmp_path / "first_release"
@@ -1238,7 +1248,7 @@ print(json.dumps({{
                 while not started_flag.exists():
                     await asyncio.sleep(0.01)
 
-            await runtime.authenticate("anthropic", "api_key", "sk-new")
+            await runtime.authenticate("anthropic", "subscription", "tok-new")
             assert runtime.models == ["claude-new"]
             assert backend.cli_path == cli_second
 

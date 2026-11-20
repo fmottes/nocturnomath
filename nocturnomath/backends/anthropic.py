@@ -39,6 +39,12 @@ from .base import (
     read_jsonl,
     terminate_process,
 )
+from .http import (
+    compact_anthropic_http,
+    discover_anthropic_http_models,
+    is_http_session_id,
+    run_anthropic_http_turn,
+)
 
 logger = logging.getLogger("nocturnomath.backends.anthropic")
 
@@ -212,8 +218,15 @@ class AnthropicBackend:
     provider: ProviderId = "anthropic"
     uses_compact_hook: bool = True
 
-    def __init__(self, cli_path: Path | None = None):
+    def __init__(
+        self,
+        cli_path: Path | None = None,
+        *,
+        http_client_factory: Callable[..., Any] | None = None,
+    ):
         self.cli_path = cli_path
+        self._http_client_factory = http_client_factory
+        self._http_model_info: dict[str, dict[str, Any]] = {}
 
     def _resolve_cli(self) -> Path:
         if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
@@ -274,6 +287,19 @@ class AnthropicBackend:
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            specs, info = await discover_anthropic_http_models(
+                api_key, http_client_factory=self._http_client_factory
+            )
+
+            def commit_http(
+                discovered_info: dict[str, dict[str, Any]] = info,
+            ) -> None:
+                self._http_model_info = dict(discovered_info)
+
+            return specs, commit_http
+
         env = auth.process_env()
         for candidate in claude_cli_candidates():
             proc: asyncio.subprocess.Process | None = None
@@ -477,6 +503,27 @@ class AnthropicBackend:
         resume_session_id: str | None = None,
         tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            async for event in run_anthropic_http_turn(
+                prompt,
+                api_key=api_key,
+                system_prompt=system_prompt,
+                tools=tools,
+                workspace_path=workspace_path,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                tool_timeout_s=tool_timeout_s,
+                model_info=self._http_model_info.get(model),
+                http_client_factory=self._http_client_factory,
+            ):
+                yield event
+            return
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         cli_path = self._resolve_cli()
         env = {
             **auth.process_env(),
@@ -688,6 +735,21 @@ class AnthropicBackend:
         auth: ProviderAuth,
         resume_session_id: str,
     ) -> CompactResult:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            return await compact_anthropic_http(
+                api_key=api_key,
+                system_prompt=system_prompt,
+                workspace_path=workspace_path,
+                model=model,
+                resume_session_id=resume_session_id,
+                model_info=self._http_model_info.get(model or ""),
+                http_client_factory=self._http_client_factory,
+            )
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         del tools
         cli_path = self._resolve_cli()
         env = {

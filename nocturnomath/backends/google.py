@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import json
 import logging
 import os
 import re
 import sys
 import tempfile
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from ..auth import ProviderAuth, ProviderId, env_flag_enabled
+from ..auth import ProviderAuth, ProviderId
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
@@ -35,6 +34,12 @@ from .base import (
     find_cli_executables,
     is_usable_cli_binary,
     terminate_process,
+)
+from .http import (
+    compact_google_http,
+    discover_google_http_models,
+    is_http_session_id,
+    run_google_http_turn,
 )
 
 logger = logging.getLogger("nocturnomath.backends.google")
@@ -158,26 +163,22 @@ def _mcp_server_entry(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _uses_api_key_mode(auth: ProviderAuth, env: Mapping[str, str]) -> bool:
-    if auth.method == "api_key":
-        return True
-    if env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", env):
-        return False
-    return bool(env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY"))
-
-
 class GoogleBackend:
     """Drive the local ``agy acp`` server over JSON-RPC stdio."""
 
     provider: ProviderId = "google"
     uses_compact_hook: bool = False
 
-    def __init__(self, cli_path: Path | None = None):
+    def __init__(
+        self,
+        cli_path: Path | None = None,
+        *,
+        http_client_factory: Callable[..., Any] | None = None,
+    ):
         self.cli_path = cli_path
+        self._http_client_factory = http_client_factory
+        self._http_model_info: dict[str, dict[str, Any]] = {}
         self._slug_map: dict[tuple[str, str], str] = {}
-        self._api_key_dir: tempfile.TemporaryDirectory[str] | None = None
-        self._api_key_secret: tuple[str, str | None, str, str] | None = None
-        self._atexit_registered = False
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
@@ -191,47 +192,9 @@ class GoogleBackend:
         self.cli_path = candidates[0]
         return self.cli_path
 
-    def _cleanup_api_dir(self) -> None:
-        if self._api_key_dir is not None:
-            with suppress(Exception):
-                self._api_key_dir.cleanup()
-            self._api_key_dir = None
-            self._api_key_secret = None
-
     @staticmethod
-    def _write_api_settings(api_dir: Path) -> None:
-        cli_dir = api_dir / "antigravity-cli"
-        cli_dir.mkdir(parents=True, exist_ok=True)
-        (cli_dir / "settings.json").write_text(
-            json.dumps({"modelProvider": "gemini"}) + "\n", encoding="utf-8"
-        )
-
-    def _prepare_env_and_flags(
-        self, auth: ProviderAuth
-    ) -> tuple[dict[str, str], list[str]]:
-        env = auth.process_env()
-        flags = ["--include-default-customizations=false"]
-        if _uses_api_key_mode(auth, env):
-            secret_key = (
-                auth.method,
-                auth.credential,
-                env.get("GOOGLE_API_KEY") or "",
-                env.get("GEMINI_API_KEY") or "",
-            )
-            if self._api_key_dir is None or self._api_key_secret != secret_key:
-                self._cleanup_api_dir()
-                self._api_key_dir = tempfile.TemporaryDirectory(
-                    prefix="nocturnomath-agy-"
-                )
-                self._api_key_secret = secret_key
-                self._write_api_settings(Path(self._api_key_dir.name))
-                if not self._atexit_registered:
-                    atexit.register(self._cleanup_api_dir)
-                    self._atexit_registered = True
-            flags.extend(["--gemini-dir", self._api_key_dir.name])
-        else:
-            self._cleanup_api_dir()
-        return env, flags
+    def _prepare_env_and_flags(auth: ProviderAuth) -> tuple[dict[str, str], list[str]]:
+        return auth.process_env(), ["--include-default-customizations=false"]
 
     def _next_id(self) -> int:
         self._next_rpc_id += 1
@@ -338,10 +301,7 @@ class GoogleBackend:
         self,
         proc: asyncio.subprocess.Process,
         messages: JsonMessageStream,
-        auth: ProviderAuth,
         stderr: StderrCollector | None = None,
-        *,
-        env: Mapping[str, str] | None = None,
     ) -> None:
         await self._rpc(
             proc,
@@ -350,114 +310,88 @@ class GoogleBackend:
             {"protocolVersion": 1, "clientCapabilities": {}},
             stderr=stderr,
         )
-        effective_env = env if env is not None else auth.process_env()
-        if _uses_api_key_mode(auth, effective_env):
-            await self._rpc(
-                proc,
-                messages,
-                "authenticate",
-                {"methodId": "gemini-api-key"},
-                stderr=stderr,
-            )
 
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
-        env = auth.process_env()
-        use_api_dir = _uses_api_key_mode(auth, env)
-
-        def commit_auth_dir() -> None:
-            self._prepare_env_and_flags(auth)
-
-        def commit_cleanup() -> None:
-            secret_key = (
-                auth.method,
-                auth.credential,
-                env.get("GOOGLE_API_KEY") or "",
-                env.get("GEMINI_API_KEY") or "",
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            specs, info = await discover_google_http_models(
+                api_key, http_client_factory=self._http_client_factory
             )
-            if not use_api_dir or self._api_key_secret != secret_key:
-                self._cleanup_api_dir()
+
+            def commit_http(
+                discovered_info: dict[str, dict[str, Any]] = info,
+            ) -> None:
+                self._http_model_info = dict(discovered_info)
+
+            return specs, commit_http
 
         candidates = agy_cli_candidates()
         if not candidates:
-            return [], commit_cleanup
-        base_flags = ["--include-default-customizations=false"]
-        with (
-            tempfile.TemporaryDirectory(prefix="nocturnomath-agy-")
-            if use_api_dir
-            else nullcontext()
-        ) as probe_dir:
-            flags = list(base_flags)
-            if probe_dir is not None:
-                self._write_api_settings(Path(probe_dir))
-                flags.extend(["--gemini-dir", probe_dir])
-            for candidate in candidates:
-                with tempfile.TemporaryDirectory(
-                    prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
-                ) as isolated_cwd:
-                    proc: asyncio.subprocess.Process | None = None
-                    stderr: StderrCollector | None = None
-                    try:
-                        async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                            proc = await asyncio.create_subprocess_exec(
-                                str(candidate),
-                                "acp",
-                                *flags,
-                                stdin=asyncio.subprocess.PIPE,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                cwd=isolated_cwd,
-                                env=env,
-                                start_new_session=(os.name == "posix"),
-                            )
-                            stderr = StderrCollector(proc.stderr)
-                            messages = JsonMessageStream(proc.stdout)
-                            await self._initialize_acp(
-                                proc, messages, auth, stderr, env=env
-                            )
-                            session_info = await self._rpc(
-                                proc,
-                                messages,
-                                "session/new",
-                                {
-                                    "cwd": isolated_cwd,
-                                    "mcpServers": [],
-                                    "_meta": {"disableBuiltInTools": True},
-                                },
-                                stderr=stderr,
-                            )
-                            models_state = session_info.get("models") or {}
-                            available = models_state.get("availableModels") or []
-                            current_model_id = models_state.get("currentModelId")
-                            specs, slug_map = _parse_gemini_models(
-                                available, current_model_id=current_model_id
-                            )
-                            if specs:
-
-                                def commit(
-                                    chosen: Path = candidate,
-                                    discovered_slugs: dict[
-                                        tuple[str, str], str
-                                    ] = slug_map,
-                                ) -> None:
-                                    commit_auth_dir()
-                                    self._slug_map = dict(discovered_slugs)
-                                    self.cli_path = chosen
-
-                                return specs, commit
-                    except Exception as exc:
-                        logger.warning(
-                            "Google Antigravity model discovery with %s failed: %s",
-                            candidate,
-                            exc,
+            return [], lambda: None
+        env, flags = self._prepare_env_and_flags(auth)
+        for candidate in candidates:
+            with tempfile.TemporaryDirectory(
+                prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
+            ) as isolated_cwd:
+                proc: asyncio.subprocess.Process | None = None
+                stderr: StderrCollector | None = None
+                try:
+                    async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
+                        proc = await asyncio.create_subprocess_exec(
+                            str(candidate),
+                            "acp",
+                            *flags,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=isolated_cwd,
+                            env=env,
+                            start_new_session=(os.name == "posix"),
                         )
-                    finally:
-                        if proc is not None:
-                            await terminate_process(proc, stderr)
-                        elif stderr is not None:
-                            await stderr.close()
-        return [], commit_cleanup
+                        stderr = StderrCollector(proc.stderr)
+                        messages = JsonMessageStream(proc.stdout)
+                        await self._initialize_acp(proc, messages, stderr)
+                        session_info = await self._rpc(
+                            proc,
+                            messages,
+                            "session/new",
+                            {
+                                "cwd": isolated_cwd,
+                                "mcpServers": [],
+                                "_meta": {"disableBuiltInTools": True},
+                            },
+                            stderr=stderr,
+                        )
+                        models_state = session_info.get("models") or {}
+                        available = models_state.get("availableModels") or []
+                        current_model_id = models_state.get("currentModelId")
+                        specs, slug_map = _parse_gemini_models(
+                            available, current_model_id=current_model_id
+                        )
+                        if specs:
+
+                            def commit(
+                                chosen: Path = candidate,
+                                discovered_slugs: dict[tuple[str, str], str] = slug_map,
+                            ) -> None:
+                                self._slug_map = dict(discovered_slugs)
+                                self.cli_path = chosen
+
+                            return specs, commit
+                except Exception as exc:
+                    logger.warning(
+                        "Google Antigravity model discovery with %s failed: %s",
+                        candidate,
+                        exc,
+                    )
+                finally:
+                    if proc is not None:
+                        await terminate_process(proc, stderr)
+                    elif stderr is not None:
+                        await stderr.close()
+        return [], lambda: None
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -555,6 +489,27 @@ class GoogleBackend:
         resume_session_id: str | None = None,
         tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            async for event in run_google_http_turn(
+                prompt,
+                api_key=api_key,
+                system_prompt=system_prompt,
+                tools=tools,
+                workspace_path=workspace_path,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                tool_timeout_s=tool_timeout_s,
+                model_info=self._http_model_info.get(model),
+                http_client_factory=self._http_client_factory,
+            ):
+                yield event
+            return
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         del tool_timeout_s
         cli_path = self._resolve_cli()
         env, flags = self._prepare_env_and_flags(auth)
@@ -583,7 +538,7 @@ class GoogleBackend:
                 session_id = resume_session_id
                 try:
                     messages = JsonMessageStream(proc.stdout)
-                    await self._initialize_acp(proc, messages, auth, stderr, env=env)
+                    await self._initialize_acp(proc, messages, stderr)
                     session_params: dict[str, Any] = {
                         "cwd": isolated_cwd,
                         "mcpServers": mcp_servers,
@@ -757,6 +712,21 @@ class GoogleBackend:
         auth: ProviderAuth,
         resume_session_id: str,
     ) -> CompactResult:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            return await compact_google_http(
+                api_key=api_key,
+                system_prompt=system_prompt,
+                workspace_path=workspace_path,
+                model=model,
+                resume_session_id=resume_session_id,
+                model_info=self._http_model_info.get(model or ""),
+                http_client_factory=self._http_client_factory,
+            )
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         cli_path = self._resolve_cli()
         env, flags = self._prepare_env_and_flags(auth)
         with tempfile.TemporaryDirectory(
@@ -781,9 +751,7 @@ class GoogleBackend:
                 unexpected_chunks: list[str] = []
                 try:
                     async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                        await self._initialize_acp(
-                            proc, messages, auth, stderr, env=env
-                        )
+                        await self._initialize_acp(proc, messages, stderr)
                         try:
                             await self._rpc(
                                 proc,

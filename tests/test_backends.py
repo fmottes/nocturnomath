@@ -21,6 +21,31 @@ from nocturnomath.backends import (
 )
 from nocturnomath.tools import tool
 
+_ENV_VARS_TO_CLEAR = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_BASE_URL",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_provider_env(monkeypatch):
+    for var in _ENV_VARS_TO_CLEAR:
+        monkeypatch.delenv(var, raising=False)
+
 
 def _write_fake_cli(path: Path, body: str) -> Path:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
@@ -137,7 +162,7 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_openai_backend_discovery_turn_compact_and_api_key_isolation(
+async def test_openai_backend_discovery_turn_compact_and_cli_isolation(
     tmp_path, monkeypatch
 ):
     real_home = tmp_path / "real_codex_home"
@@ -147,6 +172,7 @@ async def test_openai_backend_discovery_turn_compact_and_api_key_isolation(
     )
     (real_home / "auth.json").write_text('{"keep":"untouched"}\n', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(real_home))
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "oauth-access-token")
 
     log_path = tmp_path / "openai_log.json"
     fake = _write_fake_cli(
@@ -164,10 +190,8 @@ for line in sys.stdin:
     req_id = msg.get("id")
     if method == "initialize":
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"userAgent": "codex"}}}}), flush=True)
-    elif method == "account/login/start":
-        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
     elif method == "account/read":
-        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"requiresOpenaiAuth": True, "account": {{"type": "apiKey"}}}}}}), flush=True)
+        print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"requiresOpenaiAuth": True, "account": {{"type": "chatgpt"}}}}}}), flush=True)
     elif method == "model/list":
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"data": [
             {{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True, "supportedReasoningEfforts": [{{"reasoningEffort": "low"}}, {{"reasoningEffort": "high"}}, {{"reasoningEffort": "ultra"}}]}},
@@ -189,11 +213,11 @@ for line in sys.stdin:
 """,
     )
     backend = OpenAIBackend()
-    api_auth = ProviderAuth.interactive("openai", "api_key", "sk-openai-secret")
+    cli_auth = ProviderAuth("openai", "cli")
     with patch(
         "nocturnomath.backends.openai.codex_cli_candidates", return_value=[fake]
     ):
-        models = await backend.discover_models(api_auth)
+        models = await backend.discover_models(cli_auth)
         assert len(models) == 1
         assert models[0].id == "gpt-5.6-sol"
         assert models[0].efforts == ["low", "high", "ultra"]
@@ -211,7 +235,7 @@ for line in sys.stdin:
                 workspace_path=tmp_path,
                 model="gpt-5.6-sol",
                 effort="ultra",
-                auth=api_auth,
+                auth=cli_auth,
             )
         ]
         assert SessionStarted("thr-1") in events
@@ -232,37 +256,23 @@ for line in sys.stdin:
             workspace_path=tmp_path,
             model="gpt-5.6-sol",
             effort="ultra",
-            auth=api_auth,
+            auth=cli_auth,
             resume_session_id="thr-1",
         )
         assert compact.session_id == "thr-1"
         assert compact.context_usage["used_tokens"] == 300
 
-        # In CLI mode, user-configured MCP servers from CODEX_HOME/config.toml are disabled,
-        # and the temporary API-key CODEX_HOME is removed immediately.
-        api_home_path = Path(backend._api_key_home.name)
-        assert api_home_path.is_dir()
-        cli_models = await backend.discover_models(ProviderAuth("openai", "cli"))
-        assert len(cli_models) == 1
-        assert backend._api_key_home is None
-        assert not api_home_path.exists()
-
     logs = json.loads(log_path.read_text())
-    assert logs[0]["codex_home"] != str(real_home)
+    assert logs[0]["codex_home"] == str(real_home)
     assert logs[1]["cwd"] != str(tmp_path)
-    assert 'cli_auth_credentials_store="ephemeral"' in logs[0]["argv"]
-    assert 'cli_auth_credentials_store="ephemeral"' in logs[1]["argv"]
-    assert 'cli_auth_credentials_store="ephemeral"' not in logs[3]["argv"]
     assert "developerInstructions" not in logs[1]["thread_params"]
     assert "baseInstructions" in logs[1]["thread_params"]
     assert "NOCTURNOMATH_MCP_TOKEN" not in json.dumps(logs[1]["argv"])
     assert 'default_tools_approval_mode="approve"' in " ".join(logs[1]["argv"])
     assert "mcp_servers.node_repl.enabled=false" not in logs[1]["argv"]
-    assert "mcp_servers.node_repl.enabled=false" not in logs[3]["argv"]
-    assert "mcp_servers.user_extra.enabled=false" not in logs[1]["argv"]
-    assert "mcp_servers.user_extra.enabled=false" in logs[3]["argv"]
+    assert "mcp_servers.user_extra.enabled=false" in logs[0]["argv"]
+    assert "mcp_servers.user_extra.enabled=false" in logs[1]["argv"]
     assert (real_home / "auth.json").read_text() == '{"keep":"untouched"}\n'
-    backend._cleanup_api_home()
 
 
 @pytest.mark.asyncio
@@ -317,7 +327,7 @@ for line in sys.stdin:
 """,
     )
     backend = GoogleBackend()
-    auth = ProviderAuth.interactive("google", "api_key", "AIza-secret")
+    auth = ProviderAuth("google", "cli")
 
     @tool("run", "Run.", {"code": str})
     async def run(_args):
@@ -375,12 +385,10 @@ for line in sys.stdin:
         }
 
     logs = json.loads(log_path.read_text())
-    assert "--gemini-dir" in logs[1]["argv"]
     assert "--include-default-customizations=false" in logs[1]["argv"]
     assert logs[1]["set_model"] == "gemini-4-carbon-high"
     assert logs[1]["perms"] == ["deny", "allow"]
     assert logs[1]["cwd"] != str(tmp_path)
-    backend._cleanup_api_dir()
 
 
 @pytest.mark.asyncio
@@ -599,17 +607,10 @@ for line in sys.stdin:
 """,
     )
     backend = GoogleBackend(cli_path=fake)
-    api_auth = ProviderAuth.interactive("google", "api_key", "AIza-secret")
+    cli_auth = ProviderAuth("google", "cli")
     with patch("nocturnomath.backends.google.agy_cli_candidates", return_value=[fake]):
-        models = await backend.discover_models(api_auth)
+        models = await backend.discover_models(cli_auth)
         assert [m.is_default for m in models] == [False, True]
-        api_dir_path = Path(backend._api_key_dir.name)
-        assert api_dir_path.is_dir()
-
-        cli_auth = ProviderAuth("google", "cli")
-        await backend.discover_models(cli_auth)
-        assert backend._api_key_dir is None
-        assert not api_dir_path.exists()
 
     with pytest.raises(SessionResumeError, match="Session not found"):
         async for _ in backend.run_turn(
@@ -673,7 +674,7 @@ for line in sys.stdin:
         "model": "gemini-4-carbon",
     }
     logs = json.loads(log_path.read_text())
-    assert logs[3]["perm_outcome"] == {"outcome": "cancelled"}
+    assert logs[2]["perm_outcome"] == {"outcome": "cancelled"}
     assert logs[-1]["set_model"] == "gemini-4-carbon-high"
 
 
@@ -741,10 +742,10 @@ for line in sys.stdin:
         "nocturnomath.backends.anthropic.claude_cli_candidates", return_value=[fake]
     ):
         assert await backend.discover_models(ProviderAuth("anthropic", "cli")) == []
-        api_models = await backend.discover_models(
-            ProviderAuth.interactive("anthropic", "api_key", "sk-ant-test")
+        sub_models = await backend.discover_models(
+            ProviderAuth.interactive("anthropic", "subscription", "oauth-tok-test")
         )
-        assert [m.id for m in api_models] == ["claude-sonnet-5-5"]
+        assert [m.id for m in sub_models] == ["claude-sonnet-5-5"]
 
     with patch(
         "nocturnomath.backends.anthropic.claude_cli_candidates",
@@ -1051,7 +1052,7 @@ print(json.dumps({{"type": "result", "subtype": "success"}}), flush=True)
 
 
 @pytest.mark.asyncio
-async def test_google_cli_mode_disables_builtin_tools_and_honors_gemini_api_key(
+async def test_google_cli_mode_disables_builtin_tools_and_keeps_vertex_on_cli(
     tmp_path, monkeypatch
 ):
     log_path = tmp_path / "agy_cli_env_log.json"
@@ -1070,18 +1071,18 @@ for line in sys.stdin:
         entry["meta"] = (msg.get("params") or {{}}).get("_meta")
         open(log_path, "w").write(json.dumps(entry))
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": "agy-env-1", "models": {{"availableModels": [{{"modelId": "gemini-4-carbon-ultra", "name": "Gemini 4 Carbon (Ultra)"}}]}}}}}}), flush=True)
-    elif method in ("initialize", "authenticate", "session/set_model"):
+    elif method in ("initialize", "session/set_model"):
         open(log_path, "w").write(json.dumps(entry))
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
     elif method == "session/prompt":
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn"}}}}), flush=True)
 """,
     )
-    monkeypatch.setenv("GEMINI_API_KEY", "gem-from-shell")
     monkeypatch.setenv("OPENAI_API_KEY", "other-provider-secret")
-    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     backend = GoogleBackend(cli_path=fake)
     cli_auth = ProviderAuth("google", "cli")
+    assert cli_auth.direct_api_key() is None
     assert "OPENAI_API_KEY" not in cli_auth.process_env()
 
     with patch("nocturnomath.backends.google.agy_cli_candidates", return_value=[fake]):
@@ -1100,11 +1101,9 @@ for line in sys.stdin:
             pass
 
     entry = json.loads(log_path.read_text())
-    assert "--gemini-dir" in entry["argv"]
-    assert "authenticate" in entry["methods"]
+    assert "authenticate" not in entry["methods"]
     assert entry["meta"]["disableBuiltInTools"] is True
     assert "disableBuiltInTools" not in entry["meta"].get("antigravity", {})
-    backend._cleanup_api_dir()
 
 
 @pytest.mark.asyncio
@@ -1413,10 +1412,7 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_google_drains_post_rpc_setup_updates_and_honors_google_api_key(
-    tmp_path, monkeypatch
-):
-    prompts_seen: list[str] = []
+async def test_google_drains_post_rpc_setup_updates(tmp_path):
     prompt_log = tmp_path / "prompts.json"
     fake_agy = _write_fake_cli(
         tmp_path / "agy_post_rpc",
@@ -1430,11 +1426,6 @@ for line in sys.stdin:
     req_id = msg.get("id")
     if method == "initialize":
         print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"protocolVersion": 1}}}}), flush=True)
-    elif method == "authenticate":
-        if not os.environ.get("GEMINI_API_KEY"):
-            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "error": {{"code": -32000, "message": "GEMINI_API_KEY is not set"}}}}), flush=True)
-        else:
-            print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}), flush=True)
     elif method in ("session/new", "session/resume"):
         sid = (msg.get("params") or {{}}).get("sessionId") or "agy-s1"
         cmds = [] if sid == "no-compact" else [{{"name": "compact"}}]
@@ -1457,8 +1448,6 @@ for line in sys.stdin:
             print(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": {{"stopReason": "end_turn", "usage": {{"inputTokens": 320}}}}}}), flush=True)
 """,
     )
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GOOGLE_API_KEY", "google-only-key")
     auth = ProviderAuth("google", "cli")
     backend = GoogleBackend(cli_path=fake_agy)
 
@@ -1510,5 +1499,3 @@ for line in sys.stdin:
         "window_tokens": None,
         "model": "gemini-4-carbon",
     }
-    del prompts_seen
-    backend._cleanup_api_dir()

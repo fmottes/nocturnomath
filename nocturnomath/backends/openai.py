@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import json
 import logging
 import os
@@ -12,7 +11,7 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +37,12 @@ from .base import (
     is_usable_cli_binary,
     package_version,
     terminate_process,
+)
+from .http import (
+    compact_openai_http,
+    discover_openai_http_models,
+    is_http_session_id,
+    run_openai_http_turn,
 )
 
 logger = logging.getLogger("nocturnomath.backends.openai")
@@ -200,11 +205,15 @@ class OpenAIBackend:
     provider: ProviderId = "openai"
     uses_compact_hook: bool = False
 
-    def __init__(self, cli_path: Path | None = None):
+    def __init__(
+        self,
+        cli_path: Path | None = None,
+        *,
+        http_client_factory: Callable[..., Any] | None = None,
+    ):
         self.cli_path = cli_path
-        self._api_key_home: tempfile.TemporaryDirectory[str] | None = None
-        self._api_key_secret: str | None = None
-        self._atexit_registered = False
+        self._http_client_factory = http_client_factory
+        self._http_model_info: dict[str, dict[str, Any]] = {}
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
@@ -218,41 +227,11 @@ class OpenAIBackend:
         self.cli_path = candidates[0]
         return self.cli_path
 
-    def _cleanup_api_home(self) -> None:
-        if self._api_key_home is not None:
-            with suppress(Exception):
-                self._api_key_home.cleanup()
-            self._api_key_home = None
-            self._api_key_secret = None
-
     @staticmethod
-    def _env_and_flags_for_home(
-        auth: ProviderAuth, api_home: Path | None
-    ) -> tuple[dict[str, str], Path, list[str]]:
+    def _prepare_env(auth: ProviderAuth) -> tuple[dict[str, str], Path]:
         env = auth.process_env()
-        if auth.method == "api_key":
-            assert api_home is not None
-            env["CODEX_HOME"] = str(api_home)
-            return env, api_home, ["-c", 'cli_auth_credentials_store="ephemeral"']
         codex_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
-        return env, codex_home, []
-
-    def _prepare_env_and_flags(
-        self, auth: ProviderAuth
-    ) -> tuple[dict[str, str], Path, list[str]]:
-        if auth.method == "api_key":
-            if self._api_key_home is None or self._api_key_secret != auth.credential:
-                self._cleanup_api_home()
-                self._api_key_home = tempfile.TemporaryDirectory(
-                    prefix="nocturnomath-codex-"
-                )
-                self._api_key_secret = auth.credential
-                if not self._atexit_registered:
-                    atexit.register(self._cleanup_api_home)
-                    self._atexit_registered = True
-            return self._env_and_flags_for_home(auth, Path(self._api_key_home.name))
-        self._cleanup_api_home()
-        return self._env_and_flags_for_home(auth, None)
+        return env, codex_home
 
     def _next_id(self) -> int:
         self._next_rpc_id += 1
@@ -358,7 +337,6 @@ class OpenAIBackend:
         self,
         proc: asyncio.subprocess.Process,
         messages: JsonMessageStream,
-        auth: ProviderAuth,
         stderr: StderrCollector | None = None,
     ) -> None:
         await self._rpc(
@@ -374,155 +352,136 @@ class OpenAIBackend:
         await self._send(
             proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}}
         )
-        if auth.method == "api_key":
-            await self._rpc(
-                proc,
-                messages,
-                "account/login/start",
-                {"type": "apiKey", "apiKey": auth.credential or ""},
-                stderr,
-            )
 
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
-        def commit_auth_home() -> None:
-            self._prepare_env_and_flags(auth)
-
-        def commit_cleanup() -> None:
-            if auth.method != "api_key" or self._api_key_secret != auth.credential:
-                self._cleanup_api_home()
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            specs = await discover_openai_http_models(
+                api_key, http_client_factory=self._http_client_factory
+            )
+            return specs, lambda: None
 
         candidates = codex_cli_candidates()
         if not candidates:
-            return [], commit_cleanup
-        with (
-            tempfile.TemporaryDirectory(prefix="nocturnomath-codex-")
-            if auth.method == "api_key"
-            else nullcontext()
-        ) as temp_home:
-            env, codex_home, auth_flags = self._env_and_flags_for_home(
-                auth, Path(temp_home) if temp_home is not None else None
-            )
-            fallback_commit: Callable[[], None] | None = None
-            for candidate in candidates:
-                proc: asyncio.subprocess.Process | None = None
-                stderr: StderrCollector | None = None
-                try:
-                    async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                        proc = await asyncio.create_subprocess_exec(
-                            str(candidate),
-                            "app-server",
-                            *CODEX_DISABLE_FLAGS,
-                            *auth_flags,
-                            "-c",
-                            "mcp_servers={}",
-                            *_disabled_mcp_overrides(codex_home),
-                            "--listen",
-                            "stdio://",
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=env,
-                            start_new_session=(os.name == "posix"),
-                        )
-                        stderr = StderrCollector(proc.stderr)
-                        messages = JsonMessageStream(proc.stdout)
-                        await self._initialize_session(proc, messages, auth, stderr)
-                        acct = await self._rpc(
-                            proc,
-                            messages,
-                            "account/read",
-                            {"refreshToken": False},
-                            stderr,
-                        )
-                        has_env_key = bool(
-                            env.get("CODEX_API_KEY")
-                            or env.get("OPENAI_API_KEY")
-                            or env.get("CODEX_ACCESS_TOKEN")
-                        )
-                        if (
-                            acct.get("requiresOpenaiAuth", True)
-                            and acct.get("account") is None
-                            and auth.method != "api_key"
-                            and not has_env_key
-                        ):
-
-                            def commit(chosen: Path = candidate) -> None:
-                                commit_auth_home()
-                                self.cli_path = chosen
-
-                            return [], commit
-
-                        raw_models: list[dict[str, Any]] = []
-                        cursor: str | None = None
-                        while True:
-                            params: dict[str, Any] = {"includeHidden": False}
-                            if cursor is not None:
-                                params["cursor"] = cursor
-                            page = await self._rpc(
-                                proc, messages, "model/list", params, stderr
-                            )
-                            data = page.get("data") or []
-                            if isinstance(data, list):
-                                raw_models.extend(
-                                    item for item in data if isinstance(item, dict)
-                                )
-                            next_cursor = page.get("nextCursor")
-                            if not isinstance(next_cursor, str) or not next_cursor:
-                                break
-                            cursor = next_cursor
-
-                        specs: list[ModelSpec] = []
-                        for item in raw_models:
-                            raw_id = item.get("model") or item.get("id")
-                            if not isinstance(raw_id, str) or not raw_id:
-                                continue
-                            raw_efforts = item.get("supportedReasoningEfforts") or []
-                            efforts: list[str] = []
-                            for entry in raw_efforts:
-                                val = (
-                                    entry.get("reasoningEffort")
-                                    if isinstance(entry, dict)
-                                    else entry
-                                )
-                                if (
-                                    isinstance(val, str)
-                                    and val in EFFORT_LEVELS
-                                    and val not in efforts
-                                ):
-                                    efforts.append(val)
-                            specs.append(
-                                ModelSpec(
-                                    id=raw_id,
-                                    raw_id=raw_id,
-                                    provider="openai",
-                                    label=raw_id,
-                                    efforts=efforts,
-                                    is_default=bool(item.get("isDefault")),
-                                )
-                            )
+            return [], lambda: None
+        env, codex_home = self._prepare_env(auth)
+        fallback_commit: Callable[[], None] | None = None
+        for candidate in candidates:
+            proc: asyncio.subprocess.Process | None = None
+            stderr: StderrCollector | None = None
+            try:
+                async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
+                    proc = await asyncio.create_subprocess_exec(
+                        str(candidate),
+                        "app-server",
+                        *CODEX_DISABLE_FLAGS,
+                        "-c",
+                        "mcp_servers={}",
+                        *_disabled_mcp_overrides(codex_home),
+                        "--listen",
+                        "stdio://",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        start_new_session=(os.name == "posix"),
+                    )
+                    stderr = StderrCollector(proc.stderr)
+                    messages = JsonMessageStream(proc.stdout)
+                    await self._initialize_session(proc, messages, stderr)
+                    acct = await self._rpc(
+                        proc,
+                        messages,
+                        "account/read",
+                        {"refreshToken": False},
+                        stderr,
+                    )
+                    has_env_key = bool(
+                        env.get("CODEX_API_KEY")
+                        or env.get("OPENAI_API_KEY")
+                        or env.get("CODEX_ACCESS_TOKEN")
+                    )
+                    if (
+                        acct.get("requiresOpenaiAuth", True)
+                        and acct.get("account") is None
+                        and not has_env_key
+                    ):
 
                         def commit(chosen: Path = candidate) -> None:
-                            commit_auth_home()
                             self.cli_path = chosen
 
-                        if specs:
-                            return specs, commit
-                        if fallback_commit is None:
-                            fallback_commit = commit
-                except Exception as exc:
-                    logger.warning(
-                        "Codex model discovery with %s failed: %s", candidate, exc
-                    )
-                finally:
-                    if proc is not None:
-                        await terminate_process(proc, stderr)
-                    elif stderr is not None:
-                        await stderr.close()
-            if fallback_commit is not None:
-                return [], fallback_commit
-        return [], commit_cleanup
+                        return [], commit
+
+                    raw_models: list[dict[str, Any]] = []
+                    cursor: str | None = None
+                    while True:
+                        params: dict[str, Any] = {"includeHidden": False}
+                        if cursor is not None:
+                            params["cursor"] = cursor
+                        page = await self._rpc(
+                            proc, messages, "model/list", params, stderr
+                        )
+                        data = page.get("data") or []
+                        if isinstance(data, list):
+                            raw_models.extend(
+                                item for item in data if isinstance(item, dict)
+                            )
+                        next_cursor = page.get("nextCursor")
+                        if not isinstance(next_cursor, str) or not next_cursor:
+                            break
+                        cursor = next_cursor
+
+                    specs: list[ModelSpec] = []
+                    for item in raw_models:
+                        raw_id = item.get("model") or item.get("id")
+                        if not isinstance(raw_id, str) or not raw_id:
+                            continue
+                        raw_efforts = item.get("supportedReasoningEfforts") or []
+                        efforts: list[str] = []
+                        for entry in raw_efforts:
+                            val = (
+                                entry.get("reasoningEffort")
+                                if isinstance(entry, dict)
+                                else entry
+                            )
+                            if (
+                                isinstance(val, str)
+                                and val in EFFORT_LEVELS
+                                and val not in efforts
+                            ):
+                                efforts.append(val)
+                        specs.append(
+                            ModelSpec(
+                                id=raw_id,
+                                raw_id=raw_id,
+                                provider="openai",
+                                label=raw_id,
+                                efforts=efforts,
+                                is_default=bool(item.get("isDefault")),
+                            )
+                        )
+
+                    def commit(chosen: Path = candidate) -> None:
+                        self.cli_path = chosen
+
+                    if specs:
+                        return specs, commit
+                    if fallback_commit is None:
+                        fallback_commit = commit
+            except Exception as exc:
+                logger.warning(
+                    "Codex model discovery with %s failed: %s", candidate, exc
+                )
+            finally:
+                if proc is not None:
+                    await terminate_process(proc, stderr)
+                elif stderr is not None:
+                    await stderr.close()
+        if fallback_commit is not None:
+            return [], fallback_commit
+        return [], lambda: None
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -542,8 +501,28 @@ class OpenAIBackend:
         resume_session_id: str | None = None,
         tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S,
     ) -> AsyncIterator[TurnEvent]:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            async for event in run_openai_http_turn(
+                prompt,
+                api_key=api_key,
+                system_prompt=system_prompt,
+                tools=tools,
+                workspace_path=workspace_path,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                tool_timeout_s=tool_timeout_s,
+                http_client_factory=self._http_client_factory,
+            ):
+                yield event
+            return
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         cli_path = self._resolve_cli()
-        env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
+        env, codex_home = self._prepare_env(auth)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
@@ -553,7 +532,6 @@ class OpenAIBackend:
                     str(cli_path),
                     "app-server",
                     *CODEX_DISABLE_FLAGS,
-                    *auth_flags,
                     "-c",
                     _toml_mcp_override(cfg, tool_timeout_s=tool_timeout_s),
                     *_disabled_mcp_overrides(codex_home),
@@ -571,7 +549,7 @@ class OpenAIBackend:
                 turn_id: str | None = None
                 try:
                     messages = JsonMessageStream(proc.stdout)
-                    await self._initialize_session(proc, messages, auth, stderr)
+                    await self._initialize_session(proc, messages, stderr)
                     thread_params = {
                         "cwd": isolated_cwd,
                         "baseInstructions": system_prompt,
@@ -783,8 +761,22 @@ class OpenAIBackend:
         auth: ProviderAuth,
         resume_session_id: str,
     ) -> CompactResult:
+        api_key = auth.direct_api_key()
+        if api_key is not None:
+            return await compact_openai_http(
+                api_key=api_key,
+                system_prompt=system_prompt,
+                workspace_path=workspace_path,
+                model=model,
+                resume_session_id=resume_session_id,
+                http_client_factory=self._http_client_factory,
+            )
+        if is_http_session_id(resume_session_id):
+            raise SessionResumeError(
+                "Session was created in HTTP API mode and cannot be resumed by the CLI."
+            )
         cli_path = self._resolve_cli()
-        env, codex_home, auth_flags = self._prepare_env_and_flags(auth)
+        env, codex_home = self._prepare_env(auth)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
@@ -792,7 +784,6 @@ class OpenAIBackend:
                 str(cli_path),
                 "app-server",
                 *CODEX_DISABLE_FLAGS,
-                *auth_flags,
                 "-c",
                 "mcp_servers={}",
                 *_disabled_mcp_overrides(codex_home),
@@ -812,7 +803,7 @@ class OpenAIBackend:
                 context_usage: dict[str, Any] | None = None
                 try:
                     async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                        await self._initialize_session(proc, messages, auth, stderr)
+                        await self._initialize_session(proc, messages, stderr)
                         try:
                             await self._rpc(
                                 proc,

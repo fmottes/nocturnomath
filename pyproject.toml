@@ -16,6 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115.0",
+    "httpx>=0.28.1",
     "jupyter-client>=8.10.0",
     "prompt-toolkit>=3.0.53",
     "rich>=15.0.0",
@@ -42,7 +43,6 @@ packages = ["nocturnomath"]
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pre-commit>=4.6.2",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",

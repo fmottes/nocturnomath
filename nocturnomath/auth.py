@@ -139,6 +139,49 @@ class ProviderAuth:
             )
         return cls(provider=provider, method=method, credential=value)
 
+    def direct_api_key(self, env: Mapping[str, str] | None = None) -> str | None:
+        """Return the plain API key to use over direct HTTP, or ``None`` for CLI mode."""
+        source = os.environ if env is None else env
+        if self.method == "api_key":
+            return (self.credential or "").strip() or None
+        if self.method != "cli":
+            return None
+        if self.provider == "anthropic":
+            if any(
+                env_flag_enabled(name, source)
+                for name in (
+                    "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY",
+                )
+            ) or any(
+                (source.get(name) or "").strip()
+                for name in (
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+                )
+            ):
+                return None
+            return (source.get("ANTHROPIC_API_KEY") or "").strip() or None
+        if self.provider == "openai":
+            if (source.get("CODEX_ACCESS_TOKEN") or "").strip():
+                return None
+            return (
+                (source.get("CODEX_API_KEY") or "").strip()
+                or (source.get("OPENAI_API_KEY") or "").strip()
+                or None
+            )
+        if self.provider == "google":
+            if env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", source):
+                return None
+            return (
+                (source.get("GEMINI_API_KEY") or "").strip()
+                or (source.get("GOOGLE_API_KEY") or "").strip()
+                or None
+            )
+        return None
+
     def sdk_env(self) -> dict[str, str]:
         """Return the environment overlay passed directly to the provider CLI."""
         if self.method == "cli":
@@ -187,10 +230,16 @@ class ProviderAuth:
         if self.method == "cli":
             name = inherited_credential(self.provider)
             if name:
-                note = (
-                    f"{name} is set in the environment and takes precedence "
-                    f"over {PROVIDER_TITLES[self.provider]}'s saved CLI login."
-                )
+                if self.direct_api_key():
+                    note = (
+                        f"{name} is set in the environment and uses the direct "
+                        f"{PROVIDER_TITLES[self.provider]} HTTP API (no CLI required)."
+                    )
+                else:
+                    note = (
+                        f"{name} is set in the environment and takes precedence "
+                        f"over {PROVIDER_TITLES[self.provider]}'s saved CLI login."
+                    )
         return {
             "provider": self.provider,
             "title": PROVIDER_TITLES[self.provider],

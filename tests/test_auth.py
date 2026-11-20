@@ -7,11 +7,13 @@ INHERITED = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
+    "CODEX_ACCESS_TOKEN",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "GOOGLE_GENAI_USE_VERTEXAI",
@@ -51,18 +53,25 @@ def test_automatic_mode_reports_inherited_credentials(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "api-secret")
     public = ProviderAuth("anthropic").public()
     assert "ANTHROPIC_API_KEY" in public["note"]
+    assert "direct Anthropic HTTP API" in public["note"]
     assert "api-secret" not in repr(public)
     assert ProviderAuth("anthropic").sdk_env() == {}
 
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
-    assert "CLAUDE_CODE_USE_BEDROCK" in ProviderAuth("anthropic").public()["note"]
+    bedrock_note = ProviderAuth("anthropic").public()["note"]
+    assert "CLAUDE_CODE_USE_BEDROCK" in bedrock_note
+    assert "saved CLI login" in bedrock_note
 
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
-    assert "OPENAI_API_KEY" in ProviderAuth("openai").public()["note"]
+    openai_note = ProviderAuth("openai").public()["note"]
+    assert "OPENAI_API_KEY" in openai_note
+    assert "direct OpenAI HTTP API" in openai_note
     assert ProviderAuth("openai").sdk_env() == {}
 
     monkeypatch.setenv("GEMINI_API_KEY", "gem-secret")
-    assert "GEMINI_API_KEY" in ProviderAuth("google").public()["note"]
+    google_note = ProviderAuth("google").public()["note"]
+    assert "GEMINI_API_KEY" in google_note
+    assert "direct Google HTTP API" in google_note
     assert ProviderAuth("google").sdk_env() == {}
 
 
@@ -169,3 +178,67 @@ def test_google_cli_mode_forwards_google_api_key_when_gemini_api_key_is_unset(
     monkeypatch.delenv("GEMINI_API_KEY")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     assert "GEMINI_API_KEY" not in auth.process_env()
+
+
+def test_direct_api_key_routing_and_precedence(monkeypatch):
+    # Manual API key overrides everything and bypasses CLIs.
+    assert (
+        ProviderAuth.interactive("anthropic", "api_key", "sk-manual").direct_api_key()
+        == "sk-manual"
+    )
+    assert (
+        ProviderAuth.interactive("openai", "api_key", "sk-oai").direct_api_key()
+        == "sk-oai"
+    )
+    assert (
+        ProviderAuth.interactive("google", "api_key", "AIza-manual").direct_api_key()
+        == "AIza-manual"
+    )
+    assert (
+        ProviderAuth.interactive(
+            "anthropic", "subscription", "oauth-tok"
+        ).direct_api_key()
+        is None
+    )
+
+    # Anthropic CLI mode honors ambient ANTHROPIC_API_KEY unless gateway/OAuth vars override it.
+    assert ProviderAuth("anthropic", "cli").direct_api_key() is None
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    assert ProviderAuth("anthropic", "cli").direct_api_key() == "sk-ant-env"
+    for blocking_toggle in (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ):
+        monkeypatch.setenv(blocking_toggle, "true")
+        assert ProviderAuth("anthropic", "cli").direct_api_key() is None
+        monkeypatch.delenv(blocking_toggle)
+    for blocking_var in (
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ):
+        monkeypatch.setenv(blocking_var, "token-or-fd")
+        assert ProviderAuth("anthropic", "cli").direct_api_key() is None
+        monkeypatch.delenv(blocking_var)
+
+    # OpenAI CLI mode honors CODEX_API_KEY then OPENAI_API_KEY unless CODEX_ACCESS_TOKEN is set.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env")
+    assert ProviderAuth("openai", "cli").direct_api_key() == "sk-openai-env"
+    monkeypatch.setenv("CODEX_API_KEY", "sk-codex-env")
+    assert ProviderAuth("openai", "cli").direct_api_key() == "sk-codex-env"
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-oauth")
+    assert ProviderAuth("openai", "cli").direct_api_key() is None
+    monkeypatch.delenv("CODEX_ACCESS_TOKEN")
+
+    # Google CLI mode honors GEMINI_API_KEY then GOOGLE_API_KEY unless Vertex AI is enabled.
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-google-env")
+    assert ProviderAuth("google", "cli").direct_api_key() == "AIza-google-env"
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-gemini-env")
+    assert ProviderAuth("google", "cli").direct_api_key() == "AIza-gemini-env"
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "1")
+    assert ProviderAuth("google", "cli").direct_api_key() is None
+    assert (
+        ProviderAuth.interactive("google", "api_key", "AIza-manual").direct_api_key()
+        == "AIza-manual"
+    )

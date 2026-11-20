@@ -913,8 +913,13 @@ class ExplorationSession:
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
                 ) from exc
             self._track_session_id(result.session_id, provider)
-            await self._record_compaction(record_reloaded=backend.uses_compact_hook)
-            if not backend.uses_compact_hook:
+            record_reloaded = (
+                backend.uses_compact_hook
+                if result.record_reloaded is None
+                else result.record_reloaded
+            )
+            await self._record_compaction(record_reloaded=record_reloaded)
+            if not record_reloaded:
                 self.mark_record_dirty(reason="compaction")
             logger.info(
                 "%s compaction completed in %.1fs",
