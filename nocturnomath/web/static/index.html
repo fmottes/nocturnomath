@@ -285,7 +285,7 @@
         <div class="modal-body">
           <h4>Model providers</h4>
           <p id="auth-summary" class="modal-help"></p>
-          <button class="btn btn-outline" id="btn-auth-settings" type="button">Configure provider logins</button>
+          <button class="btn btn-outline" id="btn-auth-settings" type="button">Configure model providers</button>
           <h4>New session defaults</h4>
           <form id="session-defaults-form" class="settings-card session-defaults-form">
             <div class="session-default-fields">
@@ -410,7 +410,7 @@
       </div>
       <div class="modal-body">
         <p class="modal-help">
-          By default Nocturnomath uses each installed CLI's existing login (Claude Code, Codex, Antigravity), or an API key set in the environment. Entering an API key here connects directly to that provider's HTTP API without requiring its CLI to be installed, stays in memory until the app stops, and is checked on your next message.
+          By default Nocturnomath uses each installed CLI's existing login (Claude Code, Codex, Antigravity), or an API key set in the environment. Entering an API key here connects directly to that provider's HTTP API without requiring its CLI to be installed and refreshes its model list right away. Subscription tokens invoke the installed CLI. Credentials stay in memory until the app stops.
         </p>
         <p class="modal-help hidden" id="auth-note"></p>
         <form id="auth-form">
@@ -493,7 +493,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261119-1"></script>
+  <script type="module" src="/static/js/main.js?v=20261120-1"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

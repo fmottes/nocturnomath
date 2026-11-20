@@ -1580,3 +1580,27 @@ def test_agent_snapshot_is_idle_immediately_upon_idle_status_change(
         assert snap["is_busy"] is False
         assert snap["status"] == "idle"
         assert snap["can_compact"] is True
+
+
+def test_api_auth_reports_provider_discovery_errors(backend_model_catalog):
+    backend_model_catalog["google"].models = []
+    backend_model_catalog["google"].last_discovery_error = "Invalid Gemini API key"
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/auth",
+            json={
+                "provider": "google",
+                "method": "api_key",
+                "credential": "AIza-bad-key",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert (
+            payload["auth"]["providers"]["google"]["error"] == "Invalid Gemini API key"
+        )
+        assert "AIza-bad-key" not in response.text
+        fetched = client.get("/api/auth").json()
+        assert (
+            fetched["auth"]["providers"]["google"]["error"] == "Invalid Gemini API key"
+        )

@@ -56,7 +56,7 @@ COMMANDS = [
     (
         "/auth",
         "[status|<provider> <method>]",
-        "show or change model provider logins",
+        "show or change model provider authentication",
     ),
     ("/compact", "", "compact the current chat context"),
     ("/env", "<python>|managed", "switch the research environment; starts a new chat"),
@@ -226,11 +226,13 @@ class TerminalApp:
             self.write(f"model: {session.model or 'No model available'}", style="dim")
             if session.effort:
                 self.write(f"effort: {session.effort}", style="dim")
-            auth = self.runtime.auth.public(self.runtime._provider_models)
+            auth = self.runtime.auth_public()
             self.write(f"auth: {auth['label']}", style="dim")
             for info in auth["providers"].values():
                 if info["note"]:
                     self.write(info["note"], style="dim")
+                if info.get("error"):
+                    self.write(f"  {info['title']}: {info['error']}", style="red")
             self.write(
                 f"next transcript: {session.transcript_path} "
                 "(created with first message)",
@@ -261,11 +263,13 @@ class TerminalApp:
         effort_part = f" · effort {effort}" if effort else ""
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
-        custom_auth = [
-            f"{provider}:{self.runtime.auth.get(provider).method}"
-            for provider in PROVIDERS
-            if self.runtime.auth.get(provider).method != "cli"
-        ]
+        custom_auth = []
+        for provider in PROVIDERS:
+            auth_entry = self.runtime.auth.get(provider)
+            if auth_entry.method != "cli":
+                custom_auth.append(f"{provider}:{auth_entry.method}")
+            elif auth_entry.direct_api_key():
+                custom_auth.append(f"{provider}:api_key(env)")
         auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
         return (
             f"kernel {kernel} · model {model}{effort_part} · "
@@ -478,8 +482,11 @@ class TerminalApp:
         usage = payload.get("context_usage") or {}
         used = usage.get("used_tokens")
         window = usage.get("window_tokens")
-        if isinstance(used, int) and isinstance(window, int) and window > 0:
-            self.write(f"Context: {round(100 * used / window)}%", style="dim")
+        if isinstance(used, int) and not isinstance(used, bool):
+            if isinstance(window, int) and window > 0:
+                self.write(f"Context: {round(100 * used / window)}%", style="dim")
+            elif used >= 0:
+                self.write(f"Context: {used:,} tokens", style="dim")
 
     def _render_pending_prompts_changed(self, payload):
         pass
@@ -738,7 +745,7 @@ class TerminalApp:
         runtime = self.runtime
         if not argument:
             current = runtime.session.model if runtime.session else runtime.model
-            self.write(f"model: {current}")
+            self.write(f"model: {current or 'No model available'}")
             if self.pending_model:
                 self.write(
                     f"{self.pending_model} applies from the next message.", style="dim"
@@ -804,7 +811,7 @@ class TerminalApp:
     async def _command_auth(self, argument: str) -> bool:
         parts = argument.split()
         if not parts or parts == ["status"]:
-            auth = self.runtime.auth.public(self.runtime._provider_models)
+            auth = self.runtime.auth_public()
             self.write(f"Authentication: {auth['label']}")
             for provider in PROVIDERS:
                 info = auth["providers"][provider]
@@ -817,6 +824,8 @@ class TerminalApp:
                 self.write(f"  {info['title']}: {info['label']}{count_text}")
                 if info["note"]:
                     self.write(f"    {info['note']}", style="dim")
+                if info.get("error"):
+                    self.write(f"    Error: {info['error']}", style="red")
             self.write(
                 "Use /auth <anthropic|openai|google> <cli|subscription|api-key> to change a provider.",
                 style="dim",
@@ -831,7 +840,8 @@ class TerminalApp:
         if provider not in PROVIDER_METHODS:
             self.error("Choose a provider: anthropic, openai, or google.")
             return True
-        method = "api_key" if parts[1] == "api-key" else parts[1]
+        raw_method = parts[1].lower()
+        method = "api_key" if raw_method == "api-key" else raw_method
         if method not in PROVIDER_METHODS[provider]:
             choices = "|".join(
                 "api-key" if key == "api_key" else key
@@ -839,7 +849,7 @@ class TerminalApp:
             )
             self.error(f"Use /auth {provider} <{choices}>.")
             return True
-        self.require_idle("change authentication")
+        self.runtime.require_all_idle("change authentication")
         credential = None
         if method != "cli":
             prompt = _CREDENTIAL_PROMPTS[(provider, method)]
@@ -855,7 +865,12 @@ class TerminalApp:
             return True
         selected = auth["providers"][provider]
         self.write(f"Selected {selected['title']}: {selected['label']}.")
-        self.write("Credentials will be checked on your next message.", style="dim")
+        if selected.get("note"):
+            self.write(selected["note"], style="dim")
+        if selected.get("error"):
+            self.error(f"{selected['title']}: {selected['error']}")
+        else:
+            self.write("Credentials will be checked on your next message.", style="dim")
         if self.pending_model:
             resolved = self.runtime.resolve_model(
                 self.pending_model, self.pending_model_provider

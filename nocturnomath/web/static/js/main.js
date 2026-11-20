@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261118-2";
+import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261120-1";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
@@ -383,10 +383,15 @@ function handleServerEvent(event) {
     case "auth_changed": {
       applyAuthChange(event);
       const changed = event.provider ? event.auth?.providers?.[event.provider] : null;
-      const summary = changed
-        ? `${changed.title} authentication changed to ${changed.label}.`
-        : `Authentication changed to ${event.auth?.label || "the selected method"}.`;
-      appendSystemMessage(summary);
+      if (changed?.error) {
+        appendErrorMessage(`${changed.title}: ${changed.error}`);
+      } else {
+        const noteSuffix = changed?.note ? ` (${changed.note})` : "";
+        const summary = changed
+          ? `${changed.title} authentication changed to ${changed.label}.${noteSuffix}`
+          : `Authentication changed to ${event.auth?.label || "the selected method"}.`;
+        appendSystemMessage(summary);
+      }
       break;
     }
 
@@ -625,9 +630,14 @@ function setupEventListeners() {
     elements.authError.textContent = "";
     elements.authError.classList.add("hidden");
     populateAuthMethods(elements.authProvider.value);
-    updateAuthForm();
+    updateAuthForm(true);
   });
-  elements.authMethod.addEventListener("change", updateAuthForm);
+  elements.authMethod.addEventListener("change", () => {
+    elements.authCredential.value = "";
+    elements.authError.textContent = "";
+    elements.authError.classList.add("hidden");
+    updateAuthForm(false);
+  });
   elements.authModalClose.addEventListener("click", closeAuthModal);
   elements.authModalCancel.addEventListener("click", closeAuthModal);
   elements.authModal.addEventListener("click", (event) => {
@@ -998,14 +1008,14 @@ const AUTH_PROVIDER_METHODS = {
     {
       value: "cli",
       label: "Claude CLI (automatic)",
-      help: "Use whatever Claude Code is already signed in with on this machine.",
+      help: "Use whatever Claude Code is already signed in with on this machine, or ANTHROPIC_API_KEY from the environment over direct HTTP.",
     },
     {
       value: "subscription",
       label: "Claude subscription",
       credentialLabel: "Subscription token",
       placeholder: "Token from claude setup-token",
-      help: "Run `claude setup-token` in a terminal, then paste the generated token here. It replaces any credential set in the environment.",
+      help: "Run `claude setup-token` in a terminal, then paste the generated token here. Requires the `claude` CLI and replaces any credential in the environment.",
     },
     {
       value: "api_key",
@@ -1019,7 +1029,7 @@ const AUTH_PROVIDER_METHODS = {
     {
       value: "cli",
       label: "Codex CLI (automatic)",
-      help: "Use whatever Codex CLI is already signed in with on this machine.",
+      help: "Use whatever Codex CLI is already signed in with on this machine, or OPENAI_API_KEY / CODEX_API_KEY from the environment over direct HTTP.",
     },
     {
       value: "api_key",
@@ -1033,7 +1043,7 @@ const AUTH_PROVIDER_METHODS = {
     {
       value: "cli",
       label: "Antigravity CLI (automatic)",
-      help: "Use whatever Antigravity (`agy`) is already signed in with on this machine.",
+      help: "Use whatever Antigravity (`agy`) is already signed in with on this machine, or GEMINI_API_KEY / GOOGLE_API_KEY from the environment over direct HTTP.",
     },
     {
       value: "api_key",
@@ -1061,7 +1071,7 @@ function openAuthModal() {
   elements.authCredential.value = "";
   elements.authError.textContent = "";
   elements.authError.classList.add("hidden");
-  updateAuthForm();
+  updateAuthForm(true);
   elements.authModal.classList.remove("hidden");
 }
 
@@ -1071,7 +1081,7 @@ function closeAuthModal() {
   elements.authModal.classList.add("hidden");
 }
 
-function updateAuthForm() {
+function updateAuthForm(showProviderError = false) {
   const provider = elements.authProvider.value || "anthropic";
   const method = elements.authMethod.value || "cli";
   const methods = AUTH_PROVIDER_METHODS[provider] || AUTH_PROVIDER_METHODS.anthropic;
@@ -1091,6 +1101,10 @@ function updateAuthForm() {
   const noteText = providerInfo?.note || "";
   elements.authNote.textContent = noteText;
   elements.authNote.classList.toggle("hidden", !noteText);
+  if (showProviderError && providerInfo?.error) {
+    elements.authError.textContent = providerInfo.error;
+    elements.authError.classList.remove("hidden");
+  }
 }
 
 async function submitAuth(event) {
@@ -1108,11 +1122,22 @@ async function submitAuth(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to update authentication");
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = Array.isArray(data.detail)
+        ? data.detail.map((item) => item?.msg || JSON.stringify(item)).join("; ")
+        : data.detail;
+      throw new Error(detail || "Unable to update authentication");
+    }
     applyAuthChange(data);
     elements.authCredential.value = "";
-    elements.authModal.classList.add("hidden");
+    const providerError = data.auth?.providers?.[provider]?.error;
+    if (providerError) {
+      elements.authError.textContent = providerError;
+      elements.authError.classList.remove("hidden");
+    } else {
+      elements.authModal.classList.add("hidden");
+    }
   } catch (error) {
     elements.authCredential.value = "";
     elements.authError.textContent = error.message;

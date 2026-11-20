@@ -131,7 +131,8 @@ export function setAuthStatus(auth) {
         ? ` (${info.models_count} ${info.models_count === 1 ? "model" : "models"})`
         : "";
       const note = info.note ? ` — ${info.note}` : "";
-      return `${title}: ${info.label}${count}${note}`;
+      const error = info.error ? ` — Error: ${info.error}` : "";
+      return `${title}: ${info.label}${count}${note}${error}`;
     });
   elements.authSummary.textContent = lines.length
     ? lines.join(" · ")
@@ -145,6 +146,13 @@ export function setAuthStatus(auth) {
   const noteText = active?.note || "";
   elements.authNote.textContent = noteText;
   elements.authNote.classList.toggle("hidden", !noteText);
+  if (active?.error) {
+    elements.authError.textContent = active.error;
+    elements.authError.classList.remove("hidden");
+  } else {
+    elements.authError.textContent = "";
+    elements.authError.classList.add("hidden");
+  }
 }
 
 function fillModelSelect(select, models, labels, preferred, providers = {}) {

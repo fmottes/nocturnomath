@@ -941,3 +941,34 @@ async def test_resume_command_reclaims_session_opened_by_background_batch_review
     assert "S001: Resumed this chat." in out
     assert len(terminal.runtime.agents) == 1
     assert terminal.session.workspace.session_id == "S001"
+
+
+@pytest.mark.asyncio
+async def test_cli_reports_env_api_key_unknown_window_usage_and_discovery_error(
+    terminal, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-cli-env")
+    assert "openai:api_key(env)" in terminal.app.bottom_toolbar()
+    terminal.app.banner()
+    assert "OpenAI: API key (env)" in terminal.output()
+
+    await terminal.session.emit(
+        "context_usage_changed",
+        context_usage={"used_tokens": 1234, "window_tokens": None},
+    )
+    assert "Context: 1,234 tokens" in terminal.output()
+
+    class FailingGoogleBackend:
+        provider = "google"
+        uses_compact_hook = False
+        last_discovery_error = "Google API key invalid"
+
+        async def discover_models_staged(self, auth):
+            return [], lambda: None
+
+    terminal.runtime.backends["google"] = FailingGoogleBackend()
+    terminal.app.credential_reader = lambda _prompt: "AIza-bad"
+    await terminal.run("/auth google api-key")
+    err_out = terminal.output()
+    assert "Google: Google API key invalid" in err_out
+    assert "Credentials will be checked on your next message." not in err_out

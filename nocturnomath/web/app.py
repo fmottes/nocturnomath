@@ -330,7 +330,7 @@ def create_app(
 
     def auth_payload():
         return {
-            "auth": runtime.auth.public(runtime._provider_models),
+            "auth": runtime.auth_public(),
             "model": runtime.session.model if runtime.session else runtime.model,
             "models": runtime.models,
             "model_labels": runtime.model_labels,

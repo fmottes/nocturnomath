@@ -104,7 +104,7 @@ class CommandCompleter(Completer):
                     ("status", "show current authentication across providers"),
                     ("anthropic", "configure Anthropic / Claude credentials"),
                     ("openai", "configure OpenAI / Codex credentials"),
-                    ("google", "configure Google / Antigravity credentials"),
+                    ("google", "configure Google / Gemini / Antigravity credentials"),
                 ]
             provider = head.lower()
             if provider not in PROVIDER_METHODS or " " in rest:
