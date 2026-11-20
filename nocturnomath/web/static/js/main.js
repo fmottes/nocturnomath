@@ -1012,7 +1012,7 @@ const AUTH_PROVIDER_METHODS = {
       label: "Anthropic API key",
       credentialLabel: "API key",
       placeholder: "sk-ant-api…",
-      help: "Create a key in the Anthropic Console. API usage is billed separately from a subscription.",
+      help: "Create a key in the Anthropic Console. Connects directly to Anthropic's HTTP API with no CLI required, and stays in memory only.",
     },
   ],
   openai: [
@@ -1026,7 +1026,7 @@ const AUTH_PROVIDER_METHODS = {
       label: "OpenAI API key",
       credentialLabel: "API key",
       placeholder: "sk-…",
-      help: "Create an OpenAI API key. It overrides environment keys only for the Codex CLI launched by Nocturnomath.",
+      help: "Create an OpenAI API key. Connects directly to OpenAI's HTTP API with no CLI required, and stays in memory only.",
     },
   ],
   google: [
@@ -1040,7 +1040,7 @@ const AUTH_PROVIDER_METHODS = {
       label: "Google Gemini API key",
       credentialLabel: "Gemini API key",
       placeholder: "AIza…",
-      help: "Create a Gemini API key in Google AI Studio. It runs in an isolated Antigravity state directory while keeping your local login untouched.",
+      help: "Create a Gemini API key in Google AI Studio. Connects directly to Gemini's HTTP API with no CLI required, and stays in memory only.",
     },
   ],
 };

@@ -8,7 +8,7 @@ Prefer plain code, explicit state, and small changes over abstractions, framewor
 
 ## Project Structure & Module Organization
 
-Package code lives in `nocturnomath/`. `session.py` coordinates model conversations, `runtime.py` handles shared orchestration, `backends/` drives the Anthropic (`claude`), OpenAI (`codex`), and Google (`agy`) CLIs without provider SDKs, `mcp_bridge.py` exposes local scientific tools over stdio MCP, `workspace.py` owns artifacts, `notes.py` manages the scientific record, and `kernel.py` controls Jupyter. Interface adapters live in `cli/` and `web/`; browser assets are in `web/static/`. Tests and fixtures live in `tests/`.
+Package code lives in `nocturnomath/`. `session.py` coordinates model conversations, `runtime.py` handles shared orchestration, `backends/` drives Anthropic, OpenAI, and Google via direct HTTP APIs (for API-key auth) and local CLIs (`claude`, `codex`, `agy`) without provider SDKs, `mcp_bridge.py` exposes local scientific tools over stdio MCP, `workspace.py` owns artifacts, `notes.py` manages the scientific record, and `kernel.py` controls Jupyter. Interface adapters live in `cli/` and `web/`; browser assets are in `web/static/`. Tests and fixtures live in `tests/`.
 
 Treat the generated `.nocturnomath/` workspace directory as runtime data. Do not commit sessions, probe output, knowledge-base entries, documents, or scratch files.
 

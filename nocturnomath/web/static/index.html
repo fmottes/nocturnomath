@@ -410,7 +410,7 @@
       </div>
       <div class="modal-body">
         <p class="modal-help">
-          By default Nocturnomath uses each installed CLI's existing login (Claude Code, Codex, Antigravity). A token or API key entered here is passed only to that provider's CLI, stays in memory until the app stops, and is checked on your next message.
+          By default Nocturnomath uses each installed CLI's existing login (Claude Code, Codex, Antigravity), or an API key set in the environment. Entering an API key here connects directly to that provider's HTTP API without requiring its CLI to be installed, stays in memory until the app stops, and is checked on your next message.
         </p>
         <p class="modal-help hidden" id="auth-note"></p>
         <form id="auth-form">
@@ -493,7 +493,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261118-3"></script>
+  <script type="module" src="/static/js/main.js?v=20261119-1"></script>
   <script src="/static/js/sketch.js?v=20260913-1"></script>
 </body>
 </html>

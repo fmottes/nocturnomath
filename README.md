@@ -9,7 +9,7 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It com
 
 ## Quick start
 
-Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to at least one supported CLI backend (`claude` for Anthropic, `codex` for OpenAI, or `agy` for Google) through a CLI login or API key.
+Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to at least one supported provider (Anthropic, OpenAI, or Google) via either an API key (manual or environment variable, directly over HTTP with no CLI installed) or an installed provider CLI (`claude`, `codex`, or `agy`).
 
 Install the current version directly from GitHub:
 
@@ -79,15 +79,15 @@ The web Settings panel can override the model and effort used for each new sessi
 
 ### Model provider authentication
 
-By default, Nocturnomath uses whatever each installed provider CLI (`claude`, `codex`, `agy`) is already signed in with. Models across all signed-in providers appear together in the model selector, grouped under **Anthropic**, **OpenAI**, and **Google**. If `claude`, `codex`, or `agy` works in your terminal, no additional login is needed for that provider.
+By default, Nocturnomath uses each installed provider CLI's login (`claude`, `codex`, `agy`), or any provider API key already set in the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`) directly over HTTP. Models across all configured providers appear together in the model selector, grouped under **Anthropic**, **OpenAI**, and **Google**. If `claude`, `codex`, or `agy` works in your terminal — or you provide an API key with no CLIs installed — Nocturnomath can discover and use that provider's models.
 
 Use the web app's **Auth** button (or **Settings → Model providers**) or the terminal's `/auth` command to inspect or configure each provider:
 
-- **Anthropic (`anthropic`):** **Claude CLI (automatic)**, **Claude subscription** (run `claude setup-token`, then enter the token), or **Anthropic API key**.
-- **OpenAI (`openai`):** **Codex CLI (automatic)** or **OpenAI API key** (runs `codex` with an isolated temporary `CODEX_HOME`).
-- **Google (`google`):** **Antigravity CLI (automatic)** (`agy`) or **Google Gemini API key** (runs `agy` with an isolated temporary `--gemini-dir`).
+- **Anthropic (`anthropic`):** **Claude CLI (automatic)**, **Claude subscription** (run `claude setup-token`, then enter the token), or **Anthropic API key** (direct HTTP API, no CLI required).
+- **OpenAI (`openai`):** **Codex CLI (automatic)** or **OpenAI API key** (direct HTTP API, no CLI required).
+- **Google (`google`):** **Antigravity CLI (automatic)** (`agy`) or **Google Gemini API key** (direct HTTP API, no CLI required).
 
-Manually entered credentials override environment variables only for the launched provider CLI process. They are kept in memory only, never written to browser storage, shell history, transcripts, `~/.claude*`, `~/.codex/`, `~/.gemini/`, or workspace files, and must be re-entered after restarting. Selecting a method does not validate it or make a billable request; errors appear when you send the next message. Authentication changes do not restart the kernel or conversation.
+Manually entered credentials are kept in memory only, never written to browser storage, shell history, transcripts, `~/.claude*`, `~/.codex/`, `~/.gemini/`, or workspace files, and must be re-entered after restarting. Plain API keys connect directly to the provider's HTTPS API without needing a CLI installed, while subscription and CLI modes invoke the installed CLI. Selecting a method does not validate it or make a billable request; errors appear when you send the next message. Authentication changes do not restart the kernel or conversation, and switching between CLI and HTTP modes rebuilds conversation context from the saved transcript automatically.
 
 ### Terminal mode
 
