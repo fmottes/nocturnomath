@@ -55,13 +55,14 @@ _INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "ANTHROPIC_API_KEY",
     ),
     "openai": (
+        "CODEX_ACCESS_TOKEN",
         "CODEX_API_KEY",
         "OPENAI_API_KEY",
-        "CODEX_ACCESS_TOKEN",
     ),
     "google": (
         "GOOGLE_GENAI_USE_VERTEXAI",
@@ -94,12 +95,12 @@ def env_flag_enabled(name: str, env: Mapping[str, str] | None = None) -> bool:
 
 
 def inherited_credential(provider: ProviderId = "anthropic") -> str | None:
-    """Name the environment variable a CLI uses instead of its saved login."""
+    """Name the environment variable a CLI or direct HTTP client uses."""
     for name in _INHERITED_ENV[provider]:
         if name in _BOOL_TOGGLE_ENV:
             if env_flag_enabled(name):
                 return name
-        elif os.environ.get(name):
+        elif (os.environ.get(name) or "").strip():
             return name
     return None
 
@@ -133,9 +134,9 @@ class ProviderAuth:
         if not value:
             noun = "subscription token" if method == "subscription" else "API key"
             raise ValueError(f"Enter a {PROVIDER_TITLES[provider]} {noun}.")
-        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+        if any(ord(char) < 33 or ord(char) > 126 for char in value):
             raise ValueError(
-                "The credential must not contain whitespace or control characters."
+                "The credential must not contain whitespace, control, or non-ASCII characters."
             )
         return cls(provider=provider, method=method, credential=value)
 
@@ -218,10 +219,10 @@ class ProviderAuth:
         elif (
             self.provider == "google"
             and not env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", env)
-            and not env.get("GEMINI_API_KEY")
-            and env.get("GOOGLE_API_KEY")
+            and not (env.get("GEMINI_API_KEY") or "").strip()
+            and (env.get("GOOGLE_API_KEY") or "").strip()
         ):
-            env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
+            env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"].strip()
         return env
 
     def public(self) -> dict[str, Any]:
@@ -275,15 +276,21 @@ class AuthStore:
         return AuthStore(self._providers)
 
     def summary_label(self) -> str:
-        custom = [
-            f"{PROVIDER_TITLES[p]}: {PROVIDER_METHODS[p][self._providers[p].method]}"
-            for p in PROVIDERS
-            if self._providers[p].method != "cli"
-        ]
-        return ", ".join(custom) if custom else "CLI logins (automatic)"
+        entries: list[str] = []
+        for provider in PROVIDERS:
+            auth = self._providers[provider]
+            if auth.method != "cli":
+                entries.append(
+                    f"{PROVIDER_TITLES[provider]}: {PROVIDER_METHODS[provider][auth.method]}"
+                )
+            elif auth.direct_api_key():
+                entries.append(f"{PROVIDER_TITLES[provider]}: API key (env)")
+        return ", ".join(entries) if entries else "CLI logins (automatic)"
 
     def public(
-        self, provider_models: Mapping[ProviderId, Sequence[str]] | None = None
+        self,
+        provider_models: Mapping[ProviderId, Sequence[str]] | None = None,
+        provider_errors: Mapping[ProviderId, str] | None = None,
     ) -> dict[str, Any]:
         return {
             "label": self.summary_label(),
@@ -293,6 +300,11 @@ class AuthStore:
                     "models_count": (
                         len(provider_models.get(provider, ()))
                         if provider_models is not None
+                        else None
+                    ),
+                    "error": (
+                        provider_errors.get(provider)
+                        if provider_errors is not None
                         else None
                     ),
                 }

@@ -127,6 +127,10 @@ def test_interactive_validation_messages_never_echo_the_secret():
     with pytest.raises(ValueError, match="whitespace") as info:
         ProviderAuth.interactive("anthropic", "subscription", "top secret")
     assert "top secret" not in str(info.value)
+    with pytest.raises(ValueError, match="whitespace"):
+        ProviderAuth.interactive("anthropic", "api_key", "sk-ant-api\u2026")
+    with pytest.raises(ValueError, match="whitespace"):
+        ProviderAuth.interactive("openai", "api_key", "sk-zero\u200bwidth")
     with pytest.raises(ValueError, match="does not take"):
         ProviderAuth.interactive("openai", "cli", "stray")
     with pytest.raises(ValueError, match="Anthropic, OpenAI, or Google"):
@@ -135,20 +139,32 @@ def test_interactive_validation_messages_never_echo_the_secret():
         ProviderAuth.interactive("openai", "subscription", "x")
 
 
-def test_auth_store_tracks_multiple_providers_and_redacts_secrets():
+def test_auth_store_tracks_multiple_providers_and_redacts_secrets(monkeypatch):
     store = AuthStore()
     assert store.summary_label() == "CLI logins (automatic)"
     store.set("openai", "api_key", "sk-openai-secret")
     store.set("google", "api_key", "gem-secret")
 
-    public = store.public({"anthropic": ["a"], "openai": ["o1", "o2"], "google": []})
+    public = store.public(
+        {"anthropic": ["a"], "openai": ["o1", "o2"], "google": []},
+        {"google": "Google API request failed (HTTP 401)."},
+    )
     assert "sk-openai-secret" not in repr(public)
     assert "gem-secret" not in repr(public)
     assert public["providers"]["anthropic"]["method"] == "cli"
     assert public["providers"]["anthropic"]["models_count"] == 1
+    assert public["providers"]["anthropic"]["error"] is None
     assert public["providers"]["openai"]["method"] == "api_key"
     assert public["providers"]["openai"]["models_count"] == 2
     assert public["providers"]["google"]["models_count"] == 0
+    assert (
+        public["providers"]["google"]["error"]
+        == "Google API request failed (HTTP 401)."
+    )
+
+    env_store = AuthStore()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env-only")
+    assert "Anthropic: API key (env)" in env_store.summary_label()
 
 
 def test_falsey_provider_toggles_do_not_report_inherited_credentials(monkeypatch):
@@ -242,3 +258,38 @@ def test_direct_api_key_routing_and_precedence(monkeypatch):
         ProviderAuth.interactive("google", "api_key", "AIza-manual").direct_api_key()
         == "AIza-manual"
     )
+
+
+def test_inherited_credential_precedence_and_whitespace_env_vars(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env")
+    monkeypatch.setenv("CODEX_ACCESS_TOKEN", "codex-oauth")
+    openai_pub = ProviderAuth("openai", "cli").public()
+    assert "CODEX_ACCESS_TOKEN" in openai_pub["note"]
+    assert "saved CLI login" in openai_pub["note"]
+    monkeypatch.delenv("CODEX_ACCESS_TOKEN")
+    monkeypatch.delenv("OPENAI_API_KEY")
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth")
+    assert (
+        "CLAUDE_CODE_OAUTH_TOKEN" in ProviderAuth("anthropic", "cli").public()["note"]
+    )
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    monkeypatch.setenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "3")
+    assert (
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
+        in ProviderAuth("anthropic", "cli").public()["note"]
+    )
+    monkeypatch.delenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+
+    # Whitespace-only env vars are ignored just like unset variables.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+    assert ProviderAuth("anthropic", "cli").direct_api_key() is None
+    assert ProviderAuth("anthropic", "cli").public()["note"] is None
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "   ")
+    google_auth = ProviderAuth("google", "cli")
+    assert google_auth.direct_api_key() is None
+    assert google_auth.public()["note"] is None
+    assert "GEMINI_API_KEY" not in google_auth.process_env()

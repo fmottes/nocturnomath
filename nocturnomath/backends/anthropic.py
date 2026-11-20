@@ -1,4 +1,4 @@
-"""Anthropic Claude CLI backend speaking stream-json over stdio."""
+"""Anthropic backend supporting direct HTTP API and local ``claude`` CLI."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,7 @@ def _has_claude_credentials(
 ) -> bool:
     if auth.method != "cli":
         return True
-    if any(env.get(name) for name in _CLAUDE_CREDENTIAL_VARS) or any(
+    if any((env.get(name) or "").strip() for name in _CLAUDE_CREDENTIAL_VARS) or any(
         env_flag_enabled(name, env) for name in _CLAUDE_TOGGLE_VARS
     ):
         return True
@@ -213,7 +213,7 @@ def _parse_models(entries: list[Any]) -> list[ModelSpec]:
 
 
 class AnthropicBackend:
-    """Drive the local ``claude`` CLI over ``stream-json`` stdio."""
+    """Drive Anthropic via direct HTTP API or the local ``claude`` CLI."""
 
     provider: ProviderId = "anthropic"
     uses_compact_hook: bool = True
@@ -227,6 +227,7 @@ class AnthropicBackend:
         self.cli_path = cli_path
         self._http_client_factory = http_client_factory
         self._http_model_info: dict[str, dict[str, Any]] = {}
+        self.last_discovery_error: str | None = None
 
     def _resolve_cli(self) -> Path:
         if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
@@ -234,7 +235,7 @@ class AnthropicBackend:
         candidates = claude_cli_candidates()
         if not candidates:
             raise RuntimeError(
-                "Claude CLI (`claude`) was not found on PATH. Install Claude Code or sign in."
+                "Claude CLI (`claude`) was not found on PATH. Install Claude Code or configure an Anthropic API key."
             )
         self.cli_path = candidates[0]
         return self.cli_path
@@ -289,14 +290,16 @@ class AnthropicBackend:
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            specs, info = await discover_anthropic_http_models(
+            specs, info, err = await discover_anthropic_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
 
             def commit_http(
                 discovered_info: dict[str, dict[str, Any]] = info,
+                discovery_error: str | None = err,
             ) -> None:
                 self._http_model_info = dict(discovered_info)
+                self.last_discovery_error = discovery_error
 
             return specs, commit_http
 
@@ -335,6 +338,8 @@ class AnthropicBackend:
 
                         def commit(chosen: Path = candidate) -> None:
                             self.cli_path = chosen
+                            self._http_model_info = {}
+                            self.last_discovery_error = None
 
                         return [], commit
                     raw_models = resp.get("models")
@@ -344,6 +349,8 @@ class AnthropicBackend:
 
                         def commit(chosen: Path = candidate) -> None:
                             self.cli_path = chosen
+                            self._http_model_info = {}
+                            self.last_discovery_error = None
 
                         return models, commit
                     logger.warning(
@@ -358,7 +365,12 @@ class AnthropicBackend:
                     await terminate_process(proc, stderr)
                 elif stderr is not None:
                     await stderr.close()
-        return [], lambda: None
+
+        def clear_http() -> None:
+            self._http_model_info = {}
+            self.last_discovery_error = None
+
+        return [], clear_http
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         models, commit = await self.discover_models_staged(auth)
@@ -505,20 +517,23 @@ class AnthropicBackend:
     ) -> AsyncIterator[TurnEvent]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            async for event in run_anthropic_http_turn(
-                prompt,
-                api_key=api_key,
-                system_prompt=system_prompt,
-                tools=tools,
-                workspace_path=workspace_path,
-                model=model,
-                effort=effort,
-                resume_session_id=resume_session_id,
-                tool_timeout_s=tool_timeout_s,
-                model_info=self._http_model_info.get(model),
-                http_client_factory=self._http_client_factory,
-            ):
-                yield event
+            async with aclosing(
+                run_anthropic_http_turn(
+                    prompt,
+                    api_key=api_key,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    workspace_path=workspace_path,
+                    model=model,
+                    effort=effort,
+                    resume_session_id=resume_session_id,
+                    tool_timeout_s=tool_timeout_s,
+                    model_info=self._http_model_info.get(model),
+                    http_client_factory=self._http_client_factory,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
             return
         if is_http_session_id(resume_session_id):
             raise SessionResumeError(
@@ -743,7 +758,7 @@ class AnthropicBackend:
                 workspace_path=workspace_path,
                 model=model,
                 resume_session_id=resume_session_id,
-                model_info=self._http_model_info.get(model or ""),
+                model_info_by_id=self._http_model_info,
                 http_client_factory=self._http_client_factory,
             )
         if is_http_session_id(resume_session_id):

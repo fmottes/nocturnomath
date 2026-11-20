@@ -1,4 +1,4 @@
-"""Provider backends for driving Anthropic, OpenAI, and Google CLIs directly."""
+"""Provider backends for driving Anthropic, OpenAI, and Google via HTTP APIs or local CLIs."""
 
 from ..auth import ProviderId
 from .anthropic import AnthropicBackend, claude_cli_candidates
@@ -25,7 +25,7 @@ from .openai import OpenAIBackend, codex_cli_candidates
 
 
 def default_backends() -> dict[ProviderId, AgentBackend]:
-    """Create the default direct-CLI backends for all supported providers."""
+    """Create the default provider backends (direct HTTP APIs and local CLIs)."""
     return {
         "anthropic": AnthropicBackend(),
         "openai": OpenAIBackend(),

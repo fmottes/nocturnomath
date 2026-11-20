@@ -1,4 +1,4 @@
-"""OpenAI Codex CLI backend speaking app-server JSON-RPC over stdio."""
+"""OpenAI backend supporting direct HTTP Responses API and local ``codex`` CLI."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Any
 
@@ -200,7 +200,7 @@ def _extract_context_usage(
 
 
 class OpenAIBackend:
-    """Drive the local ``codex app-server`` over JSON-RPC stdio."""
+    """Drive OpenAI via direct HTTP Responses API or local ``codex app-server``."""
 
     provider: ProviderId = "openai"
     uses_compact_hook: bool = False
@@ -213,7 +213,7 @@ class OpenAIBackend:
     ):
         self.cli_path = cli_path
         self._http_client_factory = http_client_factory
-        self._http_model_info: dict[str, dict[str, Any]] = {}
+        self.last_discovery_error: str | None = None
         self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
@@ -222,7 +222,7 @@ class OpenAIBackend:
         candidates = codex_cli_candidates()
         if not candidates:
             raise RuntimeError(
-                "Codex CLI (`codex`) was not found on PATH. Install Codex or sign in."
+                "Codex CLI (`codex`) was not found on PATH. Install Codex or configure an OpenAI API key."
             )
         self.cli_path = candidates[0]
         return self.cli_path
@@ -358,14 +358,21 @@ class OpenAIBackend:
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            specs = await discover_openai_http_models(
+            specs, err = await discover_openai_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
-            return specs, lambda: None
+
+            def commit_http(discovery_error: str | None = err) -> None:
+                self.last_discovery_error = discovery_error
+
+            return specs, commit_http
+
+        def clear_error() -> None:
+            self.last_discovery_error = None
 
         candidates = codex_cli_candidates()
         if not candidates:
-            return [], lambda: None
+            return [], clear_error
         env, codex_home = self._prepare_env(auth)
         fallback_commit: Callable[[], None] | None = None
         for candidate in candidates:
@@ -399,9 +406,9 @@ class OpenAIBackend:
                         stderr,
                     )
                     has_env_key = bool(
-                        env.get("CODEX_API_KEY")
-                        or env.get("OPENAI_API_KEY")
-                        or env.get("CODEX_ACCESS_TOKEN")
+                        (env.get("CODEX_API_KEY") or "").strip()
+                        or (env.get("OPENAI_API_KEY") or "").strip()
+                        or (env.get("CODEX_ACCESS_TOKEN") or "").strip()
                     )
                     if (
                         acct.get("requiresOpenaiAuth", True)
@@ -411,6 +418,7 @@ class OpenAIBackend:
 
                         def commit(chosen: Path = candidate) -> None:
                             self.cli_path = chosen
+                            self.last_discovery_error = None
 
                         return [], commit
 
@@ -465,6 +473,7 @@ class OpenAIBackend:
 
                     def commit(chosen: Path = candidate) -> None:
                         self.cli_path = chosen
+                        self.last_discovery_error = None
 
                     if specs:
                         return specs, commit
@@ -481,7 +490,7 @@ class OpenAIBackend:
                     await stderr.close()
         if fallback_commit is not None:
             return [], fallback_commit
-        return [], lambda: None
+        return [], clear_error
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -503,19 +512,22 @@ class OpenAIBackend:
     ) -> AsyncIterator[TurnEvent]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            async for event in run_openai_http_turn(
-                prompt,
-                api_key=api_key,
-                system_prompt=system_prompt,
-                tools=tools,
-                workspace_path=workspace_path,
-                model=model,
-                effort=effort,
-                resume_session_id=resume_session_id,
-                tool_timeout_s=tool_timeout_s,
-                http_client_factory=self._http_client_factory,
-            ):
-                yield event
+            async with aclosing(
+                run_openai_http_turn(
+                    prompt,
+                    api_key=api_key,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    workspace_path=workspace_path,
+                    model=model,
+                    effort=effort,
+                    resume_session_id=resume_session_id,
+                    tool_timeout_s=tool_timeout_s,
+                    http_client_factory=self._http_client_factory,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
             return
         if is_http_session_id(resume_session_id):
             raise SessionResumeError(

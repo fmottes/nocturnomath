@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -175,7 +176,11 @@ class ExplorationSession:
         if model and model in self.model_providers:
             return self.model_providers[model]
         if model:
-            if model.startswith(("openai/", "gpt-")):
+            if model.startswith("anthropic/"):
+                return "anthropic"
+            if model.startswith(("openai/", "gpt-", "codex-", "chatgpt-")) or re.match(
+                r"^o[1-9](?:$|-)", model
+            ):
                 return "openai"
             if model.startswith(("google/", "gemini-")):
                 return "google"
@@ -616,6 +621,7 @@ class ExplorationSession:
             pending_prompts=self.pending_prompts_snapshot(),
         )
         return {
+            "steered": True,
             "content": [
                 {
                     "type": "text",
@@ -628,7 +634,7 @@ class ExplorationSession:
                         + "\n\n".join(item.text for item in steered)
                     ),
                 }
-            ]
+            ],
         }
 
     def document_context(
@@ -1131,13 +1137,21 @@ class ExplorationSession:
                 await self.emit("slurm_review", probe_id=slurm_probe_id)
 
             accumulated_text: list[str] = []
+            need_emit_context_reset = False
+
+            async def emit_context_reset_if_needed():
+                nonlocal need_emit_context_reset
+                if need_emit_context_reset:
+                    need_emit_context_reset = False
+                    await self.emit("context_usage_changed", context_usage=None)
+
             for attempt in range(2):
                 accepted = False
                 pending_session_id: str | None = None
                 resume_id = initial_resume_id if attempt == 0 else self._sdk_session_id
 
                 def commit_prompt_state() -> bool:
-                    nonlocal accepted
+                    nonlocal accepted, need_emit_context_reset
                     if accepted:
                         return True
                     accepted = True
@@ -1154,6 +1168,8 @@ class ExplorationSession:
                     if resetting_context:
                         self._sdk_session_id = None
                         self._sent_documents = dict(sent_documents)
+                        if self.context_usage is not None:
+                            need_emit_context_reset = True
                         self.context_usage = None
                     else:
                         self._sent_documents.update(sent_documents)
@@ -1182,18 +1198,25 @@ class ExplorationSession:
                     selection_changed = (
                         not was_accepted and prev_selection != new_selection
                     )
+                    reset_ctx = (
+                        {"context_usage": None}
+                        if not was_accepted and resetting_context
+                        else {}
+                    )
                     if pending_session_id is not None:
                         self._track_session_id(
                             pending_session_id,
                             provider,
-                            force_meta=selection_changed,
+                            force_meta=selection_changed or bool(reset_ctx),
+                            extra_meta=reset_ctx,
                         )
                         pending_session_id = None
-                    elif selection_changed:
+                    elif selection_changed or reset_ctx:
                         meta_fields: dict[str, Any] = {
                             "provider": provider,
                             "model": turn_catalogue_model,
                             "raw_model": turn_raw_model,
+                            **reset_ctx,
                         }
                         if self._sdk_session_id is not None:
                             meta_fields["sdk_session_id"] = self._sdk_session_id
@@ -1204,6 +1227,7 @@ class ExplorationSession:
                 def wrap_tool(spec: ToolSpec) -> ToolSpec:
                     async def wrapped_handler(args: dict[str, Any]) -> dict[str, Any]:
                         commit_progress()
+                        await emit_context_reset_if_needed()
                         return await spec.handler(args)
 
                     return ToolSpec(
@@ -1245,8 +1269,10 @@ class ExplorationSession:
                                     continue
                                 if isinstance(event, TurnStarted):
                                     commit_progress()
+                                    await emit_context_reset_if_needed()
                                     continue
                                 commit_progress()
+                                await emit_context_reset_if_needed()
                                 if isinstance(event, TextDelta):
                                     await self.emit("assistant_delta", text=event.text)
                                 elif isinstance(event, CompactionNotice):
@@ -1297,6 +1323,7 @@ class ExplorationSession:
                                             context_usage=self.context_usage,
                                         )
                         commit_progress()
+                        await emit_context_reset_if_needed()
                         break
                     finally:
                         self._commit_turn_accepted = None
@@ -1319,7 +1346,9 @@ class ExplorationSession:
                             context_rebuilt=True,
                             provider=provider,
                             stale_sdk_session_id=resume_id,
+                            context_usage=None,
                         )
+                        await self.emit("context_usage_changed", context_usage=None)
                         await self.emit(
                             "system_message",
                             text="Original provider session was unavailable; rebuilt context from the saved transcript.",
@@ -1376,6 +1405,7 @@ class ExplorationSession:
         provider: ProviderId | None = None,
         *,
         force_meta: bool = False,
+        extra_meta: Mapping[str, Any] | None = None,
     ):
         resolved_provider = (
             provider or self._active_provider or self.provider_for_model(self.model)
@@ -1392,6 +1422,7 @@ class ExplorationSession:
         meta_fields: dict[str, Any] = {
             "provider": resolved_provider,
             "sdk_session_id": session_id,
+            **(dict(extra_meta) if extra_meta else {}),
         }
         if (
             self._turn_selection is not None

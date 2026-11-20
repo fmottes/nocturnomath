@@ -121,7 +121,7 @@ class CompactResult:
 
 
 class AgentBackend(Protocol):
-    """Uniform contract for driving a provider CLI over stdio."""
+    """Uniform contract for driving a provider backend via HTTP API or local CLI."""
 
     provider: ProviderId
     uses_compact_hook: bool

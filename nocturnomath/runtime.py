@@ -64,6 +64,7 @@ class Runtime:
         self.model_raw_ids: dict[str, str] = {}
         self.model_efforts: dict[str, list[str]] = {}
         self._provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+        self._provider_errors: dict[ProviderId, str] = {}
         self._provider_default_models: dict[ProviderId, str] = {}
         self._models_discovered = False
         self._auth_revision = 0
@@ -526,7 +527,7 @@ class Runtime:
                 self._wake_slurm_monitor()
 
     async def discover_models(self):
-        """Read model catalogues concurrently across all available provider CLIs."""
+        """Read model catalogues concurrently across all available provider backends."""
         self._discovering_models += 1
         self._discovery_seq += 1
         run_seq = self._discovery_seq
@@ -555,6 +556,7 @@ class Runtime:
             model_raw_ids: dict[str, str] = {}
             model_efforts: dict[str, list[str]] = {}
             provider_models: dict[ProviderId, list[str]] = {p: [] for p in PROVIDERS}
+            provider_errors: dict[ProviderId, str] = {}
             provider_default_models: dict[ProviderId, str] = {}
             provider_defaults: list[str] = []
             seen: set[str] = set()
@@ -562,13 +564,20 @@ class Runtime:
             for provider, result in zip(PROVIDERS, results, strict=True):
                 if isinstance(result, BaseException):
                     logger.warning("Could not discover %s models: %s", provider, result)
+                    provider_errors[provider] = str(result) or type(result).__name__
                     continue
                 specs, commit = result
                 try:
                     commit()
                 except Exception as exc:
                     logger.warning("Could not discover %s models: %s", provider, exc)
+                    provider_errors[provider] = str(exc) or type(exc).__name__
                     continue
+                backend_err = getattr(
+                    self.backends[provider], "last_discovery_error", None
+                )
+                if isinstance(backend_err, str) and backend_err:
+                    provider_errors[provider] = backend_err
                 for spec in specs:
                     spec_id = spec.id
                     if spec_id in seen:
@@ -606,6 +615,7 @@ class Runtime:
                 self.model_raw_ids = model_raw_ids
                 self.model_efforts = model_efforts
                 self._provider_models = provider_models
+                self._provider_errors = provider_errors
                 self._provider_default_models = provider_default_models
                 self._models_discovered = True
                 self.sdk_default_model = (
@@ -894,19 +904,23 @@ class Runtime:
         self.effort = session.effort
         return {**self.agent_snapshot(self.primary_agent_id), **data}
 
+    def auth_public(self) -> dict[str, Any]:
+        """Describe provider authentication along with discovered counts and errors."""
+        return self.auth.public(self._provider_models, self._provider_errors)
+
     async def authenticate(
         self, provider: ProviderId, method: str, credential: str | None = None
     ) -> dict[str, Any]:
         """Select the credential for one provider backend.
 
-        Nothing is verified here: the provider CLI reports a bad credential on
-        the next message. The model catalogue is refreshed as a courtesy.
+        The model catalogue is refreshed immediately; any discovery or provider
+        API errors are reported in the returned auth status and on turns.
         """
         self.require_all_idle("change authentication")
         self.auth.set(provider, method, credential)
         self._auth_revision += 1
         await self.discover_models()
-        return self.auth.public(self._provider_models)
+        return self.auth_public()
 
     def shutdown(self):
         self._started = False
@@ -1268,7 +1282,7 @@ class Runtime:
     def workspace_snapshot(self) -> dict[str, Any]:
         """Describe the current workspace for a client that just connected."""
         session = self.session
-        auth_public = self.auth.public(self._provider_models)
+        auth_public = self.auth_public()
         if session is None:
             return {
                 "is_open": False,

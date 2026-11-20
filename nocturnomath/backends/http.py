@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
 import re
 import tempfile
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from ..auth import PROVIDER_TITLES, ProviderId
+from ..auth import ProviderId
 from ..mcp_bridge import _validate_arguments
 from ..tools import ToolSpec
 from .base import (
@@ -85,10 +87,46 @@ _GOOGLE_MODEL_EXCLUDE = (
     "computer-use",
     "deep-research",
     "-live-",
+    "-image",
+    "image-generation",
 )
 _GOOGLE_EFFORT_RE = re.compile(r"^gemini-(?:2\.5|[3-9]|[1-9]\d)")
+_GOOGLE_GEMINI_3_RE = re.compile(r"^gemini-(?:[3-9]|[1-9]\d)")
+_GOOGLE_DEFAULT_ORDER = (
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+)
 _ANTHROPIC_VERSION = "2023-06-01"
 _GEMINI_25_THINKING_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_pos_int(value: Any) -> bool:
+    return _is_int(value) and value > 0
+
+
+def _validate_http_api_key(provider_title: str, api_key: str) -> str:
+    cleaned = api_key.strip() if isinstance(api_key, str) else ""
+    if not cleaned or any(ord(ch) < 33 or ord(ch) > 126 for ch in cleaned):
+        raise RuntimeError(
+            f"The {provider_title} API key contains invalid whitespace, control, or non-ASCII characters."
+        )
+    return cleaned
+
+
+def _sanitize_error_text(text: str, secret: str | None) -> str:
+    if not secret or not text:
+        return text
+    out = text.replace(secret, "[REDACTED]")
+    stripped = secret.strip()
+    if stripped:
+        out = out.replace(stripped, "[REDACTED]")
+    return out
 
 
 def is_http_session_id(session_id: str | None) -> bool:
@@ -108,6 +146,8 @@ class HttpThreadStore:
         return f"http:{self.provider}:{uuid.uuid4().hex}"
 
     def _path_for(self, session_id: str) -> Path:
+        if not isinstance(session_id, str):
+            raise SessionResumeError(f"Unrecognized HTTP session id: {session_id!r}")
         match = _HTTP_SESSION_ID_RE.fullmatch(session_id)
         if not match:
             raise SessionResumeError(f"Unrecognized HTTP session id: {session_id}")
@@ -125,12 +165,13 @@ class HttpThreadStore:
             raise SessionResumeError(f"Saved session {session_id} was not found.")
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SessionResumeError(
                 f"Saved session {session_id} could not be read."
             ) from exc
         if (
             not isinstance(data, dict)
+            or data.get("version") != 1
             or data.get("provider") != self.provider
             or not isinstance(data.get("messages"), list)
         ):
@@ -165,7 +206,7 @@ class HttpThreadStore:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
             os.replace(tmp_path, path)
-        except Exception:
+        except BaseException:
             with suppress(OSError):
                 tmp_path.unlink()
             raise
@@ -182,27 +223,85 @@ def make_http_client(
     return factory(timeout=timeout)
 
 
+async def _iter_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf = ""
+    first_text = True
+
+    def pop_line() -> str | None:
+        nonlocal buf
+        idx_n = buf.find("\n")
+        idx_r = buf.find("\r")
+        if idx_n == -1 and idx_r == -1:
+            return None
+        if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+            if idx_r == len(buf) - 1:
+                return None
+            line = buf[:idx_r]
+            consume = idx_r + (2 if buf[idx_r + 1] == "\n" else 1)
+            buf = buf[consume:]
+            return line
+        line = buf[:idx_n]
+        buf = buf[idx_n + 1 :]
+        return line
+
+    async for chunk in response.aiter_bytes():
+        text = decoder.decode(chunk, final=False)
+        if first_text and text:
+            first_text = False
+            text = text.removeprefix("\ufeff")
+        buf += text
+        while (line := pop_line()) is not None:
+            yield line
+
+    tail = decoder.decode(b"", final=True)
+    if first_text and tail:
+        first_text = False
+        tail = tail.removeprefix("\ufeff")
+    buf += tail
+    while True:
+        idx_n = buf.find("\n")
+        idx_r = buf.find("\r")
+        if idx_n == -1 and idx_r == -1:
+            break
+        if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+            yield buf[:idx_r]
+            consume = idx_r + (
+                2 if idx_r + 1 < len(buf) and buf[idx_r + 1] == "\n" else 1
+            )
+            buf = buf[consume:]
+        else:
+            yield buf[:idx_n]
+            buf = buf[idx_n + 1 :]
+    if buf:
+        yield buf
+
+
 async def iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
     """Yield ``(event_name, data)`` tuples from an SSE HTTP response."""
     event_name: str | None = None
     data_lines: list[str] = []
-    async for raw_line in response.aiter_lines():
-        if raw_line == "":
-            if data_lines:
-                yield (event_name or "message", "\n".join(data_lines))
-                event_name = None
-                data_lines.clear()
+    async with aclosing(_iter_sse_lines(response)) as lines:
+        async for raw_line in lines:
+            if raw_line == "":
+                if data_lines:
+                    yield (event_name or "message", "\n".join(data_lines))
+                    event_name = None
+                    data_lines.clear()
+                else:
+                    event_name = None
+                continue
+            if raw_line.startswith(":"):
+                continue
+            if ":" in raw_line:
+                field, value = raw_line.split(":", 1)
+                value = value.removeprefix(" ")
             else:
-                event_name = None
-            continue
-        if raw_line.startswith(":"):
-            continue
-        if raw_line.startswith("event:"):
-            event_name = raw_line[6:].removeprefix(" ").strip()
-        elif raw_line.startswith("data:"):
-            data_lines.append(raw_line[5:].removeprefix(" "))
-    if data_lines:
-        yield (event_name or "message", "\n".join(data_lines))
+                field, value = raw_line, ""
+            if field == "event":
+                event_name = value.strip()
+            elif field == "data":
+                data_lines.append(value)
 
 
 def http_error_message(
@@ -215,6 +314,8 @@ def http_error_message(
     if text:
         with suppress(json.JSONDecodeError):
             parsed = json.loads(text)
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                parsed = parsed[0]
             if isinstance(parsed, dict):
                 err = parsed.get("error")
                 if isinstance(err, dict) and isinstance(err.get("message"), str):
@@ -232,6 +333,31 @@ def http_error_message(
     return base
 
 
+def _parse_tool_arguments(raw_json: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not raw_json.strip():
+        return {}, None
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid JSON tool arguments: {exc}"
+    if parsed is None:
+        return {}, None
+    if not isinstance(parsed, dict):
+        return None, "Tool arguments must decode to a JSON object."
+    return parsed, None
+
+
+_SKIPPED_STEER_RESULT: dict[str, Any] = {
+    "content": [
+        {
+            "type": "text",
+            "text": "Skipped: the user sent a new message. Read and address it before running further tools.",
+        }
+    ],
+    "is_error": True,
+}
+
+
 async def execute_tool_call(
     tool_by_name: Mapping[str, ToolSpec],
     name: str,
@@ -245,6 +371,8 @@ async def execute_tool_call(
             "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
             "is_error": True,
         }
+    if raw_args is None:
+        raw_args = {}
     if not isinstance(raw_args, dict):
         return {
             "content": [
@@ -279,7 +407,7 @@ async def execute_tool_call(
 
 
 def _tool_text_and_images(
-    result: dict[str, Any], *, is_error: bool
+    result: dict[str, Any], *, is_error: bool, prefix_error: bool = False
 ) -> tuple[str, list[dict[str, Any]]]:
     text_parts: list[str] = []
     images: list[dict[str, Any]] = []
@@ -296,7 +424,7 @@ def _tool_text_and_images(
     text_out = (
         "\n".join(text_parts) if text_parts else ("Error" if is_error else "(ok)")
     )
-    if is_error and not text_out.lower().startswith("error"):
+    if prefix_error and is_error and not text_out.lower().startswith("error"):
         text_out = f"Error: {text_out}"
     return text_out, images
 
@@ -305,7 +433,7 @@ def _add_int_usage(target: dict[str, int], source: Mapping[str, Any] | None) -> 
     if not isinstance(source, Mapping):
         return
     for key, value in source.items():
-        if isinstance(value, int) and not isinstance(value, bool):
+        if _is_int(value):
             target[key] = target.get(key, 0) + value
 
 
@@ -315,11 +443,18 @@ def _resume_state(
     if resume_session_id:
         saved = store.load(resume_session_id)
         ctx_window = saved.get("context_window")
+        messages = list(saved["messages"])
+        if store.provider == "anthropic":
+            _repair_anthropic_messages(messages)
+        elif store.provider == "openai":
+            _repair_openai_items(messages)
+        elif store.provider == "google":
+            _repair_google_contents(messages)
         return (
             resume_session_id,
-            list(saved["messages"]),
+            messages,
             saved.get("model") if isinstance(saved.get("model"), str) else None,
-            ctx_window if isinstance(ctx_window, int) and ctx_window > 0 else None,
+            ctx_window if _is_pos_int(ctx_window) else None,
         )
     return store.new_session_id(), [], None, None
 
@@ -330,17 +465,30 @@ def _resume_state(
 
 
 def _anthropic_base_url() -> str:
-    return (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip(
-        "/"
-    )
+    raw = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    base = (raw or "https://api.anthropic.com").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3].rstrip("/")
+    return base or "https://api.anthropic.com"
 
 
 def _anthropic_headers(api_key: str) -> dict[str, str]:
+    cleaned = _validate_http_api_key("Anthropic", api_key)
     return {
-        "x-api-key": api_key,
+        "x-api-key": cleaned,
         "anthropic-version": _ANTHROPIC_VERSION,
         "content-type": "application/json",
     }
+
+
+def _anthropic_default_max_tokens(model_id: str) -> int:
+    if re.search(
+        r"claude-(?:opus|sonnet|haiku)-(?:[4-9]|[1-9]\d)|claude-3-7", model_id
+    ):
+        return 16384
+    if "claude-3-5" in model_id:
+        return 8192
+    return 4096
 
 
 def _anthropic_capabilities(model_id: str, entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -383,12 +531,8 @@ def _anthropic_capabilities(model_id: str, entry: Mapping[str, Any]) -> dict[str
     return {
         "efforts": efforts,
         "thinking_adaptive": adaptive,
-        "context_window": max_input
-        if isinstance(max_input, int) and max_input > 0
-        else None,
-        "max_tokens": max_tokens
-        if isinstance(max_tokens, int) and max_tokens > 0
-        else None,
+        "context_window": max_input if _is_pos_int(max_input) else None,
+        "max_tokens": max_tokens if _is_pos_int(max_tokens) else None,
     }
 
 
@@ -396,14 +540,14 @@ async def discover_anthropic_http_models(
     api_key: str,
     *,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
-) -> tuple[list[ModelSpec], dict[str, dict[str, Any]]]:
+) -> tuple[list[ModelSpec], dict[str, dict[str, Any]], str | None]:
     """List Claude models via ``GET /v1/models``."""
     base = _anthropic_base_url()
-    headers = _anthropic_headers(api_key)
     raw_items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     after_id: str | None = None
     try:
+        headers = _anthropic_headers(api_key)
         async with (
             asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
             make_http_client(
@@ -418,11 +562,12 @@ async def discover_anthropic_http_models(
                     f"{base}/v1/models", headers=headers, params=params
                 )
                 if response.status_code != 200:
-                    logger.warning(
-                        "Anthropic HTTP model discovery failed: %s",
+                    err_msg = _sanitize_error_text(
                         http_error_message("Anthropic", response, response.content),
+                        api_key,
                     )
-                    return [], {}
+                    logger.warning("Anthropic HTTP model discovery failed: %s", err_msg)
+                    return [], {}, err_msg
                 payload = response.json()
                 data = payload.get("data") if isinstance(payload, dict) else None
                 if not isinstance(data, list):
@@ -444,11 +589,12 @@ async def discover_anthropic_http_models(
                 if not isinstance(after_id, str) or not after_id:
                     break
     except Exception as exc:
-        logger.warning("Anthropic HTTP model discovery failed: %s", exc)
-        return [], {}
+        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        logger.warning("Anthropic HTTP model discovery failed: %s", err_msg)
+        return [], {}, err_msg
 
     if not raw_items:
-        return [], {}
+        return [], {}, None
 
     model_info: dict[str, dict[str, Any]] = {}
     default_id = next(
@@ -470,7 +616,7 @@ async def discover_anthropic_http_models(
                 is_default=(mid == default_id),
             )
         )
-    return specs, model_info
+    return specs, model_info, None
 
 
 def _anthropic_prompt_tokens(usage: Mapping[str, Any]) -> int | None:
@@ -480,7 +626,7 @@ def _anthropic_prompt_tokens(usage: Mapping[str, Any]) -> int | None:
     total = 0
     for key in keys:
         val = usage.get(key, 0)
-        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+        if not _is_int(val) or val < 0:
             return None
         total += val
     return total
@@ -513,48 +659,108 @@ def _anthropic_tool_result_block(
     return block
 
 
-def _finalize_anthropic_cancel(
+def _finalize_anthropic_interrupted(
     working_messages: list[Any],
     *,
     partial_text: str,
     completed_tool_results: list[dict[str, Any]],
     pending_tool_ids: list[str],
+    tool_reason: str = "Cancelled by user.",
+    assistant_note: str = "(Interrupted by user.)",
 ) -> None:
     last = working_messages[-1] if working_messages else None
     if isinstance(last, dict) and last.get("role") == "assistant" and pending_tool_ids:
-        done_ids = {
-            block.get("tool_use_id")
-            for block in completed_tool_results
-            if isinstance(block, dict)
-        }
         results = list(completed_tool_results)
-        for tc_id in pending_tool_ids:
-            if tc_id not in done_ids:
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tc_id,
-                        "is_error": True,
-                        "content": [{"type": "text", "text": "Cancelled by user."}],
-                    }
-                )
+        for tc_id in pending_tool_ids[len(completed_tool_results) :]:
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tc_id,
+                    "is_error": True,
+                    "content": [{"type": "text", "text": tool_reason}],
+                }
+            )
         working_messages.append({"role": "user", "content": results})
         working_messages.append(
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": "(Interrupted by user.)"}],
+                "content": [{"type": "text", "text": assistant_note}],
             }
         )
         return
     if isinstance(last, dict) and last.get("role") == "user":
         suffix = (
-            f"{partial_text}\n\n(Interrupted by user.)"
-            if partial_text
-            else "(Interrupted by user.)"
+            f"{partial_text}\n\n{assistant_note}"
+            if partial_text.strip()
+            else assistant_note
         )
         working_messages.append(
             {"role": "assistant", "content": [{"type": "text", "text": suffix}]}
         )
+
+
+def _repair_anthropic_messages(messages: list[Any]) -> None:
+    if not messages or not isinstance(messages[-1], dict):
+        return
+    last = messages[-1]
+    if last.get("role") == "assistant":
+        content = last.get("content")
+        tool_ids = (
+            [
+                str(block.get("id") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+            if isinstance(content, list)
+            else []
+        )
+        if tool_ids:
+            _finalize_anthropic_interrupted(
+                messages,
+                partial_text="",
+                completed_tool_results=[],
+                pending_tool_ids=tool_ids,
+                tool_reason="Previous turn was interrupted.",
+                assistant_note="(Previous turn was interrupted.)",
+            )
+    elif last.get("role") == "user":
+        _finalize_anthropic_interrupted(
+            messages,
+            partial_text="",
+            completed_tool_results=[],
+            pending_tool_ids=[],
+            assistant_note="(Previous turn was interrupted.)",
+        )
+
+
+def _sanitize_anthropic_for_model_switch(messages: list[Any]) -> list[Any]:
+    cleaned: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            cleaned.append(msg)
+            continue
+        role = msg.get("role")
+        new_blocks: list[Any] = []
+        for block in content:
+            if not isinstance(block, dict):
+                new_blocks.append(block)
+                continue
+            btype = block.get("type")
+            if btype in ("thinking", "redacted_thinking"):
+                continue
+            if btype == "text" and not str(block.get("text") or "").strip():
+                continue
+            new_blocks.append(block)
+        if role == "assistant" and not new_blocks:
+            new_blocks = [{"type": "text", "text": "(continued)"}]
+        elif role == "user" and not new_blocks:
+            new_blocks = [{"type": "text", "text": "(user message)"}]
+        cleaned.append({**msg, "content": new_blocks})
+    return cleaned
 
 
 async def run_anthropic_http_turn(
@@ -572,28 +778,31 @@ async def run_anthropic_http_turn(
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> AsyncIterator[TurnEvent]:
     """Run one streaming Anthropic Messages API turn with multi-step tool calls."""
+    headers = _anthropic_headers(api_key)
     store = HttpThreadStore(workspace_path, "anthropic")
-    session_id, saved_messages, _, saved_window = _resume_state(
+    session_id, saved_messages, saved_model, saved_window = _resume_state(
         store, resume_session_id
     )
+    same_model = saved_model is None or saved_model == model
+    if saved_model and saved_model != model:
+        saved_messages = _sanitize_anthropic_for_model_switch(saved_messages)
     info = (
         dict(model_info)
         if model_info is not None
         else _anthropic_capabilities(model, {})
     )
     context_window = (
-        info.get("context_window")
-        if isinstance(info.get("context_window"), int) and info["context_window"] > 0
-        else saved_window
+        info["context_window"]
+        if _is_pos_int(info.get("context_window"))
+        else (saved_window if same_model else None)
     )
     max_tokens_meta = info.get("max_tokens")
     max_tokens = (
         min(max_tokens_meta, 16384)
-        if isinstance(max_tokens_meta, int) and max_tokens_meta > 0
-        else 16384
+        if _is_pos_int(max_tokens_meta)
+        else _anthropic_default_max_tokens(model)
     )
     base = _anthropic_base_url()
-    headers = _anthropic_headers(api_key)
     tool_by_name = {spec.name: spec for spec in tools}
     tool_defs = [
         {
@@ -618,8 +827,8 @@ async def run_anthropic_http_turn(
         async with make_http_client(
             http_client_factory, timeout=HTTP_TIMEOUT
         ) as client:
+            include_effort = bool(effort)
             for round_idx in range(1, MAX_TOOL_ROUNDS + 1):
-                include_effort = bool(effort)
                 partial_text_chunks = []
                 completed_tool_results = []
                 pending_tool_ids = []
@@ -647,13 +856,18 @@ async def run_anthropic_http_turn(
                     open_text_indices: set[int] = set()
                     round_started = False
                     retry_without_effort = False
+                    saw_message_stop = False
+                    stop_reason: str | None = None
 
                     async with client.stream(
                         "POST", f"{base}/v1/messages", headers=headers, json=body
                     ) as response:
                         if response.status_code != 200:
                             raw_err = await response.aread()
-                            err_msg = http_error_message("Anthropic", response, raw_err)
+                            err_msg = _sanitize_error_text(
+                                http_error_message("Anthropic", response, raw_err),
+                                api_key,
+                            )
                             lowered = err_msg.lower()
                             if (
                                 response.status_code == 400
@@ -669,141 +883,179 @@ async def run_anthropic_http_turn(
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async for event_name, raw_data in iter_sse_events(response):
-                            if not raw_data or raw_data == "[DONE]":
-                                continue
-                            try:
-                                data = json.loads(raw_data)
-                            except json.JSONDecodeError:
-                                continue
-                            if not isinstance(data, dict):
-                                continue
-                            ev_type = data.get("type") or event_name
+                        async with aclosing(iter_sse_events(response)) as sse_events:
+                            async for event_name, raw_data in sse_events:
+                                if not raw_data or raw_data == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(raw_data)
+                                except json.JSONDecodeError:
+                                    continue
+                                if not isinstance(data, dict):
+                                    continue
+                                ev_type = data.get("type") or event_name
 
-                            if ev_type == "error":
-                                err = data.get("error")
-                                detail = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else str(err or "Anthropic stream error.")
-                                )
-                                raise RuntimeError(detail or "Anthropic stream error.")
+                                if ev_type == "error":
+                                    err = data.get("error")
+                                    detail = (
+                                        err.get("message")
+                                        if isinstance(err, dict)
+                                        else str(err or "Anthropic stream error.")
+                                    )
+                                    raise RuntimeError(
+                                        detail or "Anthropic stream error."
+                                    )
 
-                            if ev_type == "message_start":
-                                msg_obj = data.get("message") or {}
-                                if isinstance(msg_obj, dict):
-                                    round_msg_id = msg_obj.get("id") or round_msg_id
-                                    round_model = msg_obj.get("model") or round_model
-                                    _merge_usage(round_usage, msg_obj.get("usage"))
-                                if not round_started:
-                                    round_started = True
-                                    made_progress = True
-                                    yield TurnStarted()
-                            elif ev_type == "content_block_start":
-                                if not round_started:
-                                    round_started = True
-                                    made_progress = True
-                                    yield TurnStarted()
-                                idx = data.get("index")
-                                cb = data.get("content_block")
-                                if isinstance(idx, int) and isinstance(cb, dict):
-                                    cb_type = cb.get("type")
-                                    if cb_type == "text":
-                                        blocks_by_index[idx] = {
-                                            "type": "text",
-                                            "text": str(cb.get("text") or ""),
-                                        }
-                                        open_text_indices.add(idx)
-                                    elif cb_type == "thinking":
-                                        blocks_by_index[idx] = {
-                                            "type": "thinking",
-                                            "thinking": str(cb.get("thinking") or ""),
-                                            "signature": str(cb.get("signature") or ""),
-                                        }
-                                    elif cb_type == "redacted_thinking":
-                                        blocks_by_index[idx] = {
-                                            "type": "redacted_thinking",
-                                            "data": cb.get("data") or "",
-                                        }
-                                    elif cb_type == "tool_use":
-                                        initial_input = cb.get("input")
-                                        blocks_by_index[idx] = {
-                                            "type": "tool_use",
-                                            "id": cb.get("id") or "",
-                                            "name": cb.get("name") or "",
-                                            "input": initial_input
-                                            if isinstance(initial_input, dict)
-                                            else {},
-                                            "_partial_json": [],
-                                        }
-                            elif ev_type == "content_block_delta":
-                                idx = data.get("index")
-                                delta = data.get("delta")
-                                if not isinstance(idx, int) or not isinstance(
-                                    delta, dict
-                                ):
-                                    continue
-                                block = blocks_by_index.get(idx)
-                                if block is None:
-                                    continue
-                                d_type = delta.get("type")
-                                if d_type == "text_delta" and block["type"] == "text":
-                                    chunk = delta.get("text")
-                                    if isinstance(chunk, str) and chunk:
-                                        block["text"] += chunk
-                                        partial_text_chunks.append(chunk)
-                                        yield TextDelta(chunk)
-                                elif (
-                                    d_type == "thinking_delta"
-                                    and block["type"] == "thinking"
-                                ):
-                                    chunk = delta.get("thinking")
-                                    if isinstance(chunk, str):
-                                        block["thinking"] += chunk
-                                elif (
-                                    d_type == "signature_delta"
-                                    and block["type"] == "thinking"
-                                ):
-                                    sig = delta.get("signature")
-                                    if isinstance(sig, str):
-                                        block["signature"] += sig
-                                elif (
-                                    d_type == "input_json_delta"
-                                    and block["type"] == "tool_use"
-                                ):
-                                    part = delta.get("partial_json")
-                                    if isinstance(part, str):
-                                        block["_partial_json"].append(part)
-                            elif ev_type == "content_block_stop":
-                                idx = data.get("index")
-                                if not isinstance(idx, int):
-                                    continue
-                                block = blocks_by_index.get(idx)
-                                if block is None:
-                                    continue
-                                if block["type"] == "text" and idx in open_text_indices:
-                                    open_text_indices.discard(idx)
-                                    if block["text"]:
-                                        yield TextBlockDone(block["text"])
-                                elif block["type"] == "tool_use":
-                                    raw_json = "".join(block.pop("_partial_json", []))
-                                    if raw_json:
-                                        try:
-                                            parsed = json.loads(raw_json)
-                                            if isinstance(parsed, dict):
-                                                block["input"] = parsed
-                                            else:
-                                                block["_json_error"] = (
-                                                    "Tool arguments must decode to a JSON object."
-                                                )
-                                        except json.JSONDecodeError as exc:
-                                            block["_json_error"] = (
-                                                f"Invalid JSON tool arguments: {exc}"
+                                if ev_type == "message_start":
+                                    msg_obj = data.get("message") or {}
+                                    if isinstance(msg_obj, dict):
+                                        round_msg_id = msg_obj.get("id") or round_msg_id
+                                        round_model = (
+                                            msg_obj.get("model") or round_model
+                                        )
+                                        _merge_usage(round_usage, msg_obj.get("usage"))
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                elif ev_type == "content_block_start":
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                    idx = data.get("index")
+                                    cb = data.get("content_block")
+                                    if isinstance(idx, int) and isinstance(cb, dict):
+                                        cb_type = cb.get("type")
+                                        if cb_type == "text":
+                                            initial_text = str(cb.get("text") or "")
+                                            blocks_by_index[idx] = {
+                                                "type": "text",
+                                                "text": initial_text,
+                                            }
+                                            open_text_indices.add(idx)
+                                            if initial_text:
+                                                partial_text_chunks.append(initial_text)
+                                                yield TextDelta(initial_text)
+                                        elif cb_type == "thinking":
+                                            blocks_by_index[idx] = {
+                                                "type": "thinking",
+                                                "thinking": str(
+                                                    cb.get("thinking") or ""
+                                                ),
+                                                "signature": str(
+                                                    cb.get("signature") or ""
+                                                ),
+                                            }
+                                        elif cb_type == "redacted_thinking":
+                                            blocks_by_index[idx] = {
+                                                "type": "redacted_thinking",
+                                                "data": cb.get("data") or "",
+                                            }
+                                        elif cb_type == "tool_use":
+                                            initial_input = cb.get("input")
+                                            blocks_by_index[idx] = {
+                                                "type": "tool_use",
+                                                "id": cb.get("id") or "",
+                                                "name": cb.get("name") or "",
+                                                "input": initial_input
+                                                if isinstance(initial_input, dict)
+                                                else {},
+                                                "_partial_json": [],
+                                            }
+                                elif ev_type == "content_block_delta":
+                                    idx = data.get("index")
+                                    delta = data.get("delta")
+                                    if not isinstance(idx, int) or not isinstance(
+                                        delta, dict
+                                    ):
+                                        continue
+                                    block = blocks_by_index.get(idx)
+                                    if block is None:
+                                        continue
+                                    d_type = delta.get("type")
+                                    if (
+                                        d_type == "text_delta"
+                                        and block["type"] == "text"
+                                    ):
+                                        chunk = delta.get("text")
+                                        if isinstance(chunk, str) and chunk:
+                                            block["text"] += chunk
+                                            partial_text_chunks.append(chunk)
+                                            yield TextDelta(chunk)
+                                    elif (
+                                        d_type == "thinking_delta"
+                                        and block["type"] == "thinking"
+                                    ):
+                                        chunk = delta.get("thinking")
+                                        if isinstance(chunk, str):
+                                            block["thinking"] += chunk
+                                    elif (
+                                        d_type == "signature_delta"
+                                        and block["type"] == "thinking"
+                                    ):
+                                        sig = delta.get("signature")
+                                        if isinstance(sig, str):
+                                            block["signature"] += sig
+                                    elif (
+                                        d_type == "input_json_delta"
+                                        and block["type"] == "tool_use"
+                                    ):
+                                        part = delta.get("partial_json")
+                                        if isinstance(part, str):
+                                            block["_partial_json"].append(part)
+                                elif ev_type == "content_block_stop":
+                                    idx = data.get("index")
+                                    if not isinstance(idx, int):
+                                        continue
+                                    block = blocks_by_index.get(idx)
+                                    if block is None:
+                                        continue
+                                    if (
+                                        block["type"] == "text"
+                                        and idx in open_text_indices
+                                    ):
+                                        open_text_indices.discard(idx)
+                                        if block["text"]:
+                                            yield TextBlockDone(block["text"])
+                                    elif block["type"] == "tool_use":
+                                        raw_json = "".join(
+                                            block.pop("_partial_json", [])
+                                        )
+                                        if raw_json.strip():
+                                            parsed, json_err = _parse_tool_arguments(
+                                                raw_json
                                             )
-                            elif ev_type == "message_delta":
-                                _merge_usage(round_usage, data.get("usage"))
+                                            if json_err is not None:
+                                                block["_json_error"] = json_err
+                                            elif parsed is not None:
+                                                block["input"] = parsed
+                                elif ev_type == "message_delta":
+                                    _merge_usage(round_usage, data.get("usage"))
+                                    delta = data.get("delta")
+                                    if isinstance(delta, Mapping) and isinstance(
+                                        delta.get("stop_reason"), str
+                                    ):
+                                        stop_reason = delta["stop_reason"]
+                                elif ev_type == "message_stop":
+                                    saw_message_stop = True
 
                     if not retry_without_effort:
+                        if not saw_message_stop:
+                            raise RuntimeError(
+                                "Anthropic API stream ended before completing the response."
+                            )
+                        if stop_reason == "refusal":
+                            raise RuntimeError(
+                                "Anthropic refused to complete the response."
+                            )
+                        if stop_reason in (
+                            "max_tokens",
+                            "model_context_window_exceeded",
+                        ):
+                            raise RuntimeError(
+                                f"Anthropic response stopped early ({stop_reason})."
+                            )
                         for idx in sorted(open_text_indices):
                             block = blocks_by_index[idx]
                             if block.get("text"):
@@ -815,19 +1067,12 @@ async def run_anthropic_http_turn(
                                 and "_partial_json" in block
                             ):
                                 raw_json = "".join(block.pop("_partial_json", []))
-                                if raw_json:
-                                    try:
-                                        parsed = json.loads(raw_json)
-                                        if isinstance(parsed, dict):
-                                            block["input"] = parsed
-                                        else:
-                                            block["_json_error"] = (
-                                                "Tool arguments must decode to a JSON object."
-                                            )
-                                    except json.JSONDecodeError as exc:
-                                        block["_json_error"] = (
-                                            f"Invalid JSON tool arguments: {exc}"
-                                        )
+                                if raw_json.strip():
+                                    parsed, json_err = _parse_tool_arguments(raw_json)
+                                    if json_err is not None:
+                                        block["_json_error"] = json_err
+                                    elif parsed is not None:
+                                        block["input"] = parsed
                             assistant_blocks.append(block)
                         break
 
@@ -851,12 +1096,32 @@ async def run_anthropic_http_turn(
                     for block in assistant_blocks
                     if block.get("type") == "tool_use"
                 ]
-                stored_blocks = [
-                    {k: v for k, v in block.items() if not k.startswith("_")}
-                    for block in assistant_blocks
-                ]
+                stored_blocks: list[dict[str, Any]] = []
+                for block in assistant_blocks:
+                    btype = block.get("type")
+                    if btype == "text":
+                        if str(block.get("text") or "").strip():
+                            stored_blocks.append(
+                                {"type": "text", "text": block["text"]}
+                            )
+                    elif btype == "thinking":
+                        if (
+                            isinstance(block.get("signature"), str)
+                            and block["signature"]
+                        ):
+                            stored_blocks.append(
+                                {
+                                    k: v
+                                    for k, v in block.items()
+                                    if not k.startswith("_")
+                                }
+                            )
+                    else:
+                        stored_blocks.append(
+                            {k: v for k, v in block.items() if not k.startswith("_")}
+                        )
                 if not stored_blocks:
-                    stored_blocks = [{"type": "text", "text": ""}]
+                    stored_blocks = [{"type": "text", "text": "(no response)"}]
                 working_messages.append({"role": "assistant", "content": stored_blocks})
 
                 if not tool_blocks:
@@ -874,10 +1139,20 @@ async def run_anthropic_http_turn(
                     return
 
                 pending_tool_ids = [str(block.get("id") or "") for block in tool_blocks]
+                if round_idx >= MAX_TOOL_ROUNDS:
+                    raise RuntimeError(
+                        f"Anthropic turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
+                    )
                 completed_tool_results = []
+                steered_out = False
                 for block in tool_blocks:
                     tc_id = str(block.get("id") or "")
                     tc_name = str(block.get("name") or "")
+                    if steered_out:
+                        completed_tool_results.append(
+                            _anthropic_tool_result_block(tc_id, _SKIPPED_STEER_RESULT)
+                        )
+                        continue
                     if "_json_error" in block:
                         result = {
                             "content": [{"type": "text", "text": block["_json_error"]}],
@@ -887,6 +1162,8 @@ async def run_anthropic_http_turn(
                         result = await execute_tool_call(
                             tool_by_name, tc_name, block.get("input"), tool_timeout_s
                         )
+                    if result.get("steered"):
+                        steered_out = True
                     completed_tool_results.append(
                         _anthropic_tool_result_block(tc_id, result)
                     )
@@ -906,7 +1183,7 @@ async def run_anthropic_http_turn(
         )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
-            _finalize_anthropic_cancel(
+            _finalize_anthropic_interrupted(
                 working_messages,
                 partial_text="".join(partial_text_chunks),
                 completed_tool_results=completed_tool_results,
@@ -919,6 +1196,77 @@ async def run_anthropic_http_turn(
                 context_window=context_window,
             )
         raise
+    except Exception as exc:
+        if made_progress:
+            _finalize_anthropic_interrupted(
+                working_messages,
+                partial_text="".join(partial_text_chunks),
+                completed_tool_results=completed_tool_results,
+                pending_tool_ids=pending_tool_ids,
+                tool_reason="Turn failed before tool execution completed.",
+                assistant_note="(Error before response completed.)",
+            )
+            store.save(
+                session_id,
+                model=model,
+                messages=working_messages,
+                context_window=context_window,
+            )
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
+
+
+def _render_anthropic_history_for_compaction(messages: list[Any]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                lines.append(f"{role}: {content}")
+            continue
+        if not isinstance(content, list):
+            continue
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in ("thinking", "redacted_thinking"):
+                continue
+            if btype == "text":
+                text = str(block.get("text") or "")
+                if text.strip():
+                    parts.append(text)
+            elif btype == "image":
+                parts.append("[image omitted during compaction]")
+            elif btype == "tool_use":
+                args_json = json.dumps(block.get("input") or {}, ensure_ascii=False)
+                parts.append(f"[Tool call {block.get('name') or ''}: {args_json}]")
+            elif btype == "tool_result":
+                inner_parts: list[str] = []
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    for item in inner:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
+                            t = str(item.get("text") or "")
+                            if t:
+                                inner_parts.append(t)
+                        elif item.get("type") == "image":
+                            inner_parts.append("[plot image omitted]")
+                elif isinstance(inner, str) and inner:
+                    inner_parts.append(inner)
+                tag = "Tool result (error)" if block.get("is_error") else "Tool result"
+                parts.append(f"[{tag}: {' '.join(inner_parts)}]")
+        if parts:
+            lines.append(f"{role}: " + "\n".join(parts))
+    return "\n\n".join(lines)
 
 
 async def compact_anthropic_http(
@@ -929,68 +1277,80 @@ async def compact_anthropic_http(
     model: str | None,
     resume_session_id: str,
     model_info: Mapping[str, Any] | None = None,
+    model_info_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> CompactResult:
     """Compact an HTTP Anthropic conversation by summarizing saved messages."""
+    headers = _anthropic_headers(api_key)
     store = HttpThreadStore(workspace_path, "anthropic")
     saved = store.load(resume_session_id)
     target_model = model or saved.get("model")
     if not isinstance(target_model, str) or not target_model:
         raise RuntimeError("No model is available to compact this session.")
+    saved_model = saved.get("model") if isinstance(saved.get("model"), str) else None
+    resolved_info = (model_info_by_id or {}).get(target_model) or model_info
+    info = (
+        dict(resolved_info)
+        if resolved_info is not None
+        else _anthropic_capabilities(target_model, {})
+    )
     context_window = (
-        model_info.get("context_window")
-        if model_info and isinstance(model_info.get("context_window"), int)
-        else saved.get("context_window")
-        if isinstance(saved.get("context_window"), int)
-        else None
+        info["context_window"]
+        if _is_pos_int(info.get("context_window"))
+        else (
+            saved.get("context_window")
+            if saved_model == target_model and _is_pos_int(saved.get("context_window"))
+            else None
+        )
+    )
+    max_tokens = (
+        min(info["max_tokens"], 8192)
+        if _is_pos_int(info.get("max_tokens"))
+        else min(_anthropic_default_max_tokens(target_model), 4096)
     )
 
-    sanitized: list[dict[str, Any]] = []
-    for msg in saved["messages"]:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            sanitized.append(msg)
-            continue
-        clean_blocks: list[Any] = []
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and isinstance(block.get("content"), list)
-            ):
-                new_items = [
-                    (
-                        {
-                            "type": "text",
-                            "text": "[plot image omitted during compaction]",
-                        }
-                        if isinstance(item, dict) and item.get("type") == "image"
-                        else item
-                    )
-                    for item in block["content"]
-                ]
-                clean_blocks.append({**block, "content": new_items})
-            else:
-                clean_blocks.append(block)
-        sanitized.append({**msg, "content": clean_blocks})
+    history = saved["messages"]
+    if isinstance(history, list):
+        history = list(history)
+        _repair_anthropic_messages(history)
+    transcript = _render_anthropic_history_for_compaction(history)
+    compact_prompt = (
+        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
+        if transcript
+        else COMPACTION_PROMPT
+    )
 
     base = _anthropic_base_url()
-    headers = _anthropic_headers(api_key)
     body = {
         "model": target_model,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "system": system_prompt,
-        "messages": [*sanitized, {"role": "user", "content": COMPACTION_PROMPT}],
+        "messages": [{"role": "user", "content": compact_prompt}],
     }
-    async with make_http_client(http_client_factory, timeout=HTTP_TIMEOUT) as client:
-        response = await client.post(f"{base}/v1/messages", headers=headers, json=body)
-        if response.status_code != 200:
-            raise RuntimeError(
-                http_error_message("Anthropic", response, response.content)
+    try:
+        async with make_http_client(
+            http_client_factory, timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{base}/v1/messages", headers=headers, json=body
             )
-        payload = response.json()
+            if response.status_code != 200:
+                raise RuntimeError(
+                    _sanitize_error_text(
+                        http_error_message("Anthropic", response, response.content),
+                        api_key,
+                    )
+                )
+            payload = response.json()
+    except Exception as exc:
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
+
+    stop_reason = payload.get("stop_reason") if isinstance(payload, dict) else None
+    if stop_reason in ("max_tokens", "refusal", "model_context_window_exceeded"):
+        raise RuntimeError(f"Anthropic compaction stopped early ({stop_reason}).")
 
     content = payload.get("content") if isinstance(payload, dict) else None
     summary_parts = [
@@ -1026,7 +1386,7 @@ async def compact_anthropic_http(
             "window_tokens": context_window,
             "model": target_model,
         }
-        if isinstance(output_tokens, int) and output_tokens >= 0
+        if _is_int(output_tokens) and output_tokens >= 0
         else None
     )
     return CompactResult(
@@ -1049,14 +1409,14 @@ def _merge_usage(target: dict[str, Any], update: Any) -> None:
 
 
 def _openai_base_url() -> str:
-    return (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
-        "/"
-    )
+    raw = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    return (raw or "https://api.openai.com/v1").rstrip("/")
 
 
 def _openai_headers(api_key: str) -> dict[str, str]:
+    cleaned = _validate_http_api_key("OpenAI", api_key)
     return {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {cleaned}",
         "Content-Type": "application/json",
     }
 
@@ -1065,11 +1425,11 @@ async def discover_openai_http_models(
     api_key: str,
     *,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
-) -> list[ModelSpec]:
+) -> tuple[list[ModelSpec], str | None]:
     """List chat/reasoning models via ``GET /models``."""
     base = _openai_base_url()
-    headers = _openai_headers(api_key)
     try:
+        headers = _openai_headers(api_key)
         async with (
             asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
             make_http_client(
@@ -1078,19 +1438,20 @@ async def discover_openai_http_models(
         ):
             response = await client.get(f"{base}/models", headers=headers)
             if response.status_code != 200:
-                logger.warning(
-                    "OpenAI HTTP model discovery failed: %s",
-                    http_error_message("OpenAI", response, response.content),
+                err_msg = _sanitize_error_text(
+                    http_error_message("OpenAI", response, response.content), api_key
                 )
-                return []
+                logger.warning("OpenAI HTTP model discovery failed: %s", err_msg)
+                return [], err_msg
             payload = response.json()
     except Exception as exc:
-        logger.warning("OpenAI HTTP model discovery failed: %s", exc)
-        return []
+        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        logger.warning("OpenAI HTTP model discovery failed: %s", err_msg)
+        return [], err_msg
 
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
-        return []
+        return [], None
 
     filtered: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -1108,11 +1469,11 @@ async def discover_openai_http_models(
             filtered.append(item)
 
     if not filtered:
-        return []
+        return [], None
 
     filtered.sort(
         key=lambda item: (
-            -(item.get("created") if isinstance(item.get("created"), int) else 0),
+            -(item.get("created") if _is_int(item.get("created")) else 0),
             item["id"],
         )
     )
@@ -1138,12 +1499,14 @@ async def discover_openai_http_models(
                 is_default=(mid == default_id),
             )
         )
-    return specs
+    return specs, None
 
 
 def _openai_tool_output(call_id: str, result: dict[str, Any]) -> dict[str, Any]:
     is_error = bool(result.get("is_error"))
-    text_out, images = _tool_text_and_images(result, is_error=is_error)
+    text_out, images = _tool_text_and_images(
+        result, is_error=is_error, prefix_error=True
+    )
     if images:
         payload: Any = [{"type": "input_text", "text": text_out}]
         for img in images:
@@ -1205,43 +1568,48 @@ def _store_openai_output_item(
         pending_calls.append(call_item)
 
 
-def _finalize_openai_cancel(
+def _drop_trailing_openai_reasoning(items: list[Any]) -> None:
+    while (
+        items and isinstance(items[-1], dict) and items[-1].get("type") == "reasoning"
+    ):
+        items.pop()
+
+
+def _finalize_openai_interrupted(
     working_items: list[Any],
     *,
     partial_text: str,
     completed_outputs: list[dict[str, Any]],
     pending_calls: list[dict[str, Any]],
+    tool_reason: str = "Error: Cancelled by user.",
+    assistant_note: str = "(Interrupted by user.)",
 ) -> None:
     if pending_calls:
-        done_ids = {
-            item.get("call_id") for item in completed_outputs if isinstance(item, dict)
-        }
         working_items.extend(completed_outputs)
-        for call in pending_calls:
-            cid = call.get("call_id")
-            if cid not in done_ids:
-                working_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": cid,
-                        "output": "Error: Cancelled by user.",
-                    }
-                )
+        for call in pending_calls[len(completed_outputs) :]:
+            working_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.get("call_id"),
+                    "output": tool_reason,
+                }
+            )
         working_items.append(
             {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "(Interrupted by user.)"}],
+                "content": [{"type": "output_text", "text": assistant_note}],
             }
         )
         return
+    _drop_trailing_openai_reasoning(working_items)
     last = working_items[-1] if working_items else None
     needs_reply = not isinstance(last, dict) or last.get("role") != "assistant"
     if needs_reply:
         suffix = (
-            f"{partial_text}\n\n(Interrupted by user.)"
-            if partial_text
-            else "(Interrupted by user.)"
+            f"{partial_text}\n\n{assistant_note}"
+            if partial_text.strip()
+            else assistant_note
         )
         working_items.append(
             {
@@ -1250,6 +1618,69 @@ def _finalize_openai_cancel(
                 "content": [{"type": "output_text", "text": suffix}],
             }
         )
+
+
+def _repair_openai_items(items: list[Any]) -> None:
+    _drop_trailing_openai_reasoning(items)
+    if not items:
+        return
+    seen_outputs = {
+        item.get("call_id")
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    }
+    unanswered_calls = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and item.get("call_id") not in seen_outputs
+    ]
+    if unanswered_calls:
+        _finalize_openai_interrupted(
+            items,
+            partial_text="",
+            completed_outputs=[],
+            pending_calls=unanswered_calls,
+            tool_reason="Error: Previous turn was interrupted.",
+            assistant_note="(Previous turn was interrupted.)",
+        )
+        return
+    last = items[-1]
+    if isinstance(last, dict) and (
+        last.get("role") == "user" or last.get("type") == "function_call_output"
+    ):
+        _finalize_openai_interrupted(
+            items,
+            partial_text="",
+            completed_outputs=[],
+            pending_calls=[],
+            assistant_note="(Previous turn was interrupted.)",
+        )
+
+
+def _sanitize_openai_for_model_switch(items: list[Any]) -> list[Any]:
+    return [
+        item
+        for item in items
+        if not (isinstance(item, dict) and item.get("type") == "reasoning")
+    ]
+
+
+def _safe_content_index(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _openai_refusal_in_item(item: Mapping[str, Any]) -> str | None:
+    if item.get("type") != "message":
+        return None
+    for part in item.get("content") or ():
+        if isinstance(part, dict) and part.get("type") == "refusal":
+            return str(part.get("refusal") or "OpenAI refused the request.")
+    return None
 
 
 async def run_openai_http_turn(
@@ -1266,10 +1697,12 @@ async def run_openai_http_turn(
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> AsyncIterator[TurnEvent]:
     """Run one streaming OpenAI Responses API turn with ``store=False``."""
-    store = HttpThreadStore(workspace_path, "openai")
-    session_id, saved_items, _, _ = _resume_state(store, resume_session_id)
-    base = _openai_base_url()
     headers = _openai_headers(api_key)
+    store = HttpThreadStore(workspace_path, "openai")
+    session_id, saved_items, saved_model, _ = _resume_state(store, resume_session_id)
+    if saved_model and saved_model != model:
+        saved_items = _sanitize_openai_for_model_switch(saved_items)
+    base = _openai_base_url()
     tool_by_name = {spec.name: spec for spec in tools}
     tool_defs = [
         {
@@ -1296,8 +1729,11 @@ async def run_openai_http_turn(
         async with make_http_client(
             http_client_factory, timeout=HTTP_TIMEOUT
         ) as client:
+            include_effort = bool(effort)
+            include_reasoning = bool(
+                _OPENAI_REASONING_RE.match(model) and "chat-latest" not in model
+            )
             for round_idx in range(1, MAX_TOOL_ROUNDS + 1):
-                include_effort = bool(effort)
                 partial_text_chunks = []
                 pending_calls = []
                 completed_outputs = []
@@ -1317,13 +1753,16 @@ async def run_openai_http_turn(
                         body["tools"] = tool_defs
                     if include_effort and effort:
                         body["reasoning"] = {"effort": effort}
+                    if include_reasoning:
                         body["include"] = ["reasoning.encrypted_content"]
 
                     round_started = False
                     retry_without_reasoning = False
+                    saw_completed = False
                     text_buffers: dict[tuple[str, int], list[str]] = {}
                     emitted_parts: set[tuple[str, int]] = set()
-                    emitted_fallback_texts: set[str] = set()
+                    round_output_items: list[Any] = []
+                    round_pending_calls: list[dict[str, Any]] = []
                     saw_done_items = False
 
                     async with client.stream(
@@ -1331,12 +1770,14 @@ async def run_openai_http_turn(
                     ) as response:
                         if response.status_code != 200:
                             raw_err = await response.aread()
-                            err_msg = http_error_message("OpenAI", response, raw_err)
+                            err_msg = _sanitize_error_text(
+                                http_error_message("OpenAI", response, raw_err), api_key
+                            )
                             lowered = err_msg.lower()
                             if (
                                 response.status_code == 400
                                 and effort_attempt == 0
-                                and include_effort
+                                and (include_effort or include_reasoning)
                                 and any(
                                     k in lowered
                                     for k in (
@@ -1348,178 +1789,222 @@ async def run_openai_http_turn(
                                 )
                             ):
                                 include_effort = False
+                                include_reasoning = False
                                 retry_without_reasoning = True
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async for event_name, raw_data in iter_sse_events(response):
-                            if not raw_data or raw_data == "[DONE]":
-                                continue
-                            try:
-                                data = json.loads(raw_data)
-                            except json.JSONDecodeError:
-                                continue
-                            if not isinstance(data, dict):
-                                continue
-                            ev_type = data.get("type") or event_name
+                        async with aclosing(iter_sse_events(response)) as sse_events:
+                            async for event_name, raw_data in sse_events:
+                                if not raw_data or raw_data == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(raw_data)
+                                except json.JSONDecodeError:
+                                    continue
+                                if not isinstance(data, dict):
+                                    continue
+                                ev_type = data.get("type") or event_name
 
-                            if ev_type == "error":
-                                err = data.get("error")
-                                msg_text = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else data.get("message")
-                                )
-                                raise RuntimeError(
-                                    str(msg_text or "OpenAI API stream error.")
-                                )
-                            if ev_type in ("response.failed", "response.incomplete"):
-                                resp = data.get("response") or {}
-                                if ev_type == "response.failed":
-                                    err = (
-                                        resp.get("error")
+                                if ev_type == "error":
+                                    err = data.get("error")
+                                    msg_text = (
+                                        err.get("message")
+                                        if isinstance(err, dict)
+                                        else data.get("message")
+                                    )
+                                    raise RuntimeError(
+                                        str(msg_text or "OpenAI API stream error.")
+                                    )
+                                if ev_type in (
+                                    "response.failed",
+                                    "response.incomplete",
+                                ):
+                                    resp = data.get("response") or {}
+                                    if ev_type == "response.failed":
+                                        err = (
+                                            resp.get("error")
+                                            if isinstance(resp, dict)
+                                            else None
+                                        )
+                                        detail = (
+                                            err.get("message")
+                                            if isinstance(err, dict)
+                                            else None
+                                        )
+                                        raise RuntimeError(
+                                            str(detail or "OpenAI response failed.")
+                                        )
+                                    details = (
+                                        resp.get("incomplete_details")
                                         if isinstance(resp, dict)
                                         else None
                                     )
-                                    detail = (
-                                        err.get("message")
-                                        if isinstance(err, dict)
-                                        else None
+                                    reason = (
+                                        details.get("reason")
+                                        if isinstance(details, dict)
+                                        else "incomplete"
                                     )
                                     raise RuntimeError(
-                                        str(detail or "OpenAI response failed.")
+                                        f"OpenAI response stopped early ({reason})."
                                     )
-                                details = (
-                                    resp.get("incomplete_details")
-                                    if isinstance(resp, dict)
-                                    else None
-                                )
-                                reason = (
-                                    details.get("reason")
-                                    if isinstance(details, dict)
-                                    else "incomplete"
-                                )
-                                raise RuntimeError(
-                                    f"OpenAI response stopped early ({reason})."
-                                )
+                                if ev_type == "response.refusal.done":
+                                    refusal = str(
+                                        data.get("refusal")
+                                        or "OpenAI refused the request."
+                                    )
+                                    raise RuntimeError(
+                                        f"OpenAI refused the request: {refusal}"
+                                    )
 
-                            if ev_type in ("response.created", "response.in_progress"):
-                                resp = data.get("response") or {}
-                                if isinstance(resp, dict):
-                                    round_msg_id = resp.get("id") or round_msg_id
-                                    round_model = resp.get("model") or round_model
-                                if not round_started:
-                                    round_started = True
-                                    made_progress = True
-                                    yield TurnStarted()
-                            elif ev_type == "response.output_text.delta":
-                                if not round_started:
-                                    round_started = True
-                                    made_progress = True
-                                    yield TurnStarted()
-                                delta = data.get("delta")
-                                if isinstance(delta, str) and delta:
+                                if ev_type in (
+                                    "response.created",
+                                    "response.in_progress",
+                                ):
+                                    resp = data.get("response") or {}
+                                    if isinstance(resp, dict):
+                                        round_msg_id = resp.get("id") or round_msg_id
+                                        round_model = resp.get("model") or round_model
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                elif ev_type == "response.output_text.delta":
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                    delta = data.get("delta")
+                                    if isinstance(delta, str) and delta:
+                                        key = (
+                                            str(data.get("item_id") or ""),
+                                            _safe_content_index(
+                                                data.get("content_index")
+                                            ),
+                                        )
+                                        text_buffers.setdefault(key, []).append(delta)
+                                        partial_text_chunks.append(delta)
+                                        yield TextDelta(delta)
+                                elif ev_type == "response.output_text.done":
                                     key = (
                                         str(data.get("item_id") or ""),
-                                        int(data.get("content_index") or 0),
+                                        _safe_content_index(data.get("content_index")),
                                     )
-                                    text_buffers.setdefault(key, []).append(delta)
-                                    partial_text_chunks.append(delta)
-                                    yield TextDelta(delta)
-                            elif ev_type == "response.output_text.done":
-                                key = (
-                                    str(data.get("item_id") or ""),
-                                    int(data.get("content_index") or 0),
-                                )
-                                buf_text = "".join(text_buffers.pop(key, []))
-                                full_text = (
-                                    data.get("text")
-                                    if isinstance(data.get("text"), str)
-                                    and data["text"]
-                                    else buf_text
-                                )
-                                if full_text and key not in emitted_parts:
-                                    emitted_parts.add(key)
-                                    emitted_fallback_texts.add(full_text)
-                                    yield TextBlockDone(full_text)
-                            elif ev_type == "response.output_item.done":
-                                item = data.get("item")
-                                if not isinstance(item, dict):
-                                    continue
-                                saw_done_items = True
-                                item_id = str(item.get("id") or "")
-                                if item.get("type") == "message":
-                                    content = item.get("content") or []
-                                    if isinstance(content, list):
-                                        for c_idx, part in enumerate(content):
-                                            if (
-                                                isinstance(part, dict)
-                                                and part.get("type") == "output_text"
-                                            ):
-                                                key = (item_id, c_idx)
-                                                part_text = str(part.get("text") or "")
+                                    buf_text = "".join(text_buffers.pop(key, []))
+                                    full_text = (
+                                        data.get("text")
+                                        if isinstance(data.get("text"), str)
+                                        and data["text"]
+                                        else buf_text
+                                    )
+                                    if full_text and key not in emitted_parts:
+                                        emitted_parts.add(key)
+                                        yield TextBlockDone(full_text)
+                                elif ev_type == "response.output_item.done":
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                    item = data.get("item")
+                                    if not isinstance(item, dict):
+                                        continue
+                                    refusal = _openai_refusal_in_item(item)
+                                    if refusal is not None:
+                                        raise RuntimeError(
+                                            f"OpenAI refused the request: {refusal}"
+                                        )
+                                    saw_done_items = True
+                                    item_id = str(item.get("id") or "")
+                                    if item.get("type") == "message":
+                                        content = item.get("content") or []
+                                        if isinstance(content, list):
+                                            for c_idx, part in enumerate(content):
                                                 if (
-                                                    part_text
-                                                    and key not in emitted_parts
+                                                    isinstance(part, dict)
+                                                    and part.get("type")
+                                                    == "output_text"
                                                 ):
-                                                    emitted_parts.add(key)
-                                                    emitted_fallback_texts.add(
-                                                        part_text
+                                                    key = (item_id, c_idx)
+                                                    part_text = str(
+                                                        part.get("text") or ""
                                                     )
-                                                    yield TextBlockDone(part_text)
-                                _store_openai_output_item(
-                                    item,
-                                    working_items=working_items,
-                                    pending_calls=pending_calls,
-                                )
-                            elif ev_type == "response.completed":
-                                resp = data.get("response") or {}
-                                if isinstance(resp, dict):
-                                    round_msg_id = resp.get("id") or round_msg_id
-                                    round_model = resp.get("model") or round_model
-                                    if isinstance(resp.get("usage"), dict):
-                                        round_usage = dict(resp["usage"])
-                                    if not saw_done_items and isinstance(
-                                        resp.get("output"), list
-                                    ):
-                                        for out_item in resp["output"]:
-                                            if not isinstance(out_item, dict):
-                                                continue
-                                            if out_item.get("type") == "message":
-                                                for part in (
-                                                    out_item.get("content") or ()
-                                                ):
                                                     if (
-                                                        isinstance(part, dict)
-                                                        and part.get("type")
-                                                        == "output_text"
+                                                        part_text
+                                                        and key not in emitted_parts
                                                     ):
-                                                        part_text = str(
-                                                            part.get("text") or ""
-                                                        )
+                                                        emitted_parts.add(key)
+                                                        yield TextBlockDone(part_text)
+                                    _store_openai_output_item(
+                                        item,
+                                        working_items=round_output_items,
+                                        pending_calls=round_pending_calls,
+                                    )
+                                elif ev_type == "response.completed":
+                                    saw_completed = True
+                                    if not round_started:
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
+                                    resp = data.get("response") or {}
+                                    if isinstance(resp, dict):
+                                        round_msg_id = resp.get("id") or round_msg_id
+                                        round_model = resp.get("model") or round_model
+                                        if isinstance(resp.get("usage"), dict):
+                                            round_usage = dict(resp["usage"])
+                                        if not saw_done_items and isinstance(
+                                            resp.get("output"), list
+                                        ):
+                                            for out_item in resp["output"]:
+                                                if not isinstance(out_item, dict):
+                                                    continue
+                                                refusal = _openai_refusal_in_item(
+                                                    out_item
+                                                )
+                                                if refusal is not None:
+                                                    raise RuntimeError(
+                                                        f"OpenAI refused the request: {refusal}"
+                                                    )
+                                                out_id = str(out_item.get("id") or "")
+                                                if out_item.get("type") == "message":
+                                                    for c_idx, part in enumerate(
+                                                        out_item.get("content") or ()
+                                                    ):
                                                         if (
-                                                            part_text
-                                                            and part_text
-                                                            not in emitted_fallback_texts
+                                                            isinstance(part, dict)
+                                                            and part.get("type")
+                                                            == "output_text"
                                                         ):
-                                                            emitted_fallback_texts.add(
-                                                                part_text
+                                                            key = (out_id, c_idx)
+                                                            part_text = str(
+                                                                part.get("text") or ""
                                                             )
-                                                            yield TextBlockDone(
+                                                            if (
                                                                 part_text
-                                                            )
-                                            _store_openai_output_item(
-                                                out_item,
-                                                working_items=working_items,
-                                                pending_calls=pending_calls,
-                                            )
+                                                                and key
+                                                                not in emitted_parts
+                                                            ):
+                                                                emitted_parts.add(key)
+                                                                yield TextBlockDone(
+                                                                    part_text
+                                                                )
+                                                _store_openai_output_item(
+                                                    out_item,
+                                                    working_items=round_output_items,
+                                                    pending_calls=round_pending_calls,
+                                                )
 
                     if not retry_without_reasoning:
+                        if not saw_completed:
+                            raise RuntimeError(
+                                "OpenAI API stream ended before completing the response."
+                            )
                         for key, chunks in sorted(text_buffers.items()):
                             leftover = "".join(chunks)
                             if leftover and key not in emitted_parts:
                                 emitted_parts.add(key)
                                 yield TextBlockDone(leftover)
+                        working_items.extend(round_output_items)
+                        pending_calls = round_pending_calls
                         break
 
                 if round_usage is not None:
@@ -1530,7 +2015,7 @@ async def run_openai_http_turn(
                     )
                     _add_int_usage(total_usage, round_usage)
                     inp = round_usage.get("input_tokens")
-                    if isinstance(inp, int) and not isinstance(inp, bool) and inp >= 0:
+                    if _is_int(inp) and inp >= 0:
                         last_context_usage = {
                             "used_tokens": inp,
                             "window_tokens": None,
@@ -1538,6 +2023,7 @@ async def run_openai_http_turn(
                         }
 
                 if not pending_calls:
+                    _drop_trailing_openai_reasoning(working_items)
                     store.save(session_id, model=model, messages=working_items)
                     yield TurnResult(
                         usage=total_usage or None,
@@ -1546,29 +2032,33 @@ async def run_openai_http_turn(
                     )
                     return
 
+                if round_idx >= MAX_TOOL_ROUNDS:
+                    raise RuntimeError(
+                        f"OpenAI turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
+                    )
+
                 completed_outputs = []
+                steered_out = False
                 for call in pending_calls:
                     call_id = call["call_id"]
                     call_name = call["name"]
-                    raw_arguments = call["arguments"]
-                    try:
-                        parsed_args = (
-                            json.loads(raw_arguments) if raw_arguments.strip() else {}
+                    if steered_out:
+                        completed_outputs.append(
+                            _openai_tool_output(call_id, _SKIPPED_STEER_RESULT)
                         )
-                    except json.JSONDecodeError as exc:
+                        continue
+                    parsed_args, json_err = _parse_tool_arguments(call["arguments"])
+                    if json_err is not None:
                         result = {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": f"Invalid JSON tool arguments: {exc}",
-                                }
-                            ],
+                            "content": [{"type": "text", "text": json_err}],
                             "is_error": True,
                         }
                     else:
                         result = await execute_tool_call(
                             tool_by_name, call_name, parsed_args, tool_timeout_s
                         )
+                    if result.get("steered"):
+                        steered_out = True
                     completed_outputs.append(_openai_tool_output(call_id, result))
                 working_items.extend(completed_outputs)
                 completed_outputs = []
@@ -1579,7 +2069,7 @@ async def run_openai_http_turn(
         )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
-            _finalize_openai_cancel(
+            _finalize_openai_interrupted(
                 working_items,
                 partial_text="".join(partial_text_chunks),
                 completed_outputs=completed_outputs,
@@ -1587,32 +2077,67 @@ async def run_openai_http_turn(
             )
             store.save(session_id, model=model, messages=working_items)
         raise
+    except Exception as exc:
+        if made_progress:
+            _finalize_openai_interrupted(
+                working_items,
+                partial_text="".join(partial_text_chunks),
+                completed_outputs=completed_outputs,
+                pending_calls=pending_calls,
+                tool_reason="Error: Turn failed before tool execution completed.",
+                assistant_note="(Error before response completed.)",
+            )
+            store.save(session_id, model=model, messages=working_items)
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
 
 
-def _strip_openai_images(items: list[Any]) -> list[Any]:
-    cleaned: list[Any] = []
+def _render_openai_history_for_compaction(items: list[Any]) -> str:
+    lines: list[str] = []
     for item in items:
         if not isinstance(item, dict):
-            cleaned.append(item)
             continue
-        if item.get("type") == "function_call_output" and isinstance(
-            item.get("output"), list
-        ):
-            new_out = [
-                (
-                    {
-                        "type": "input_text",
-                        "text": "[plot image omitted during compaction]",
-                    }
-                    if isinstance(part, dict) and part.get("type") == "input_image"
-                    else part
-                )
-                for part in item["output"]
-            ]
-            cleaned.append({**item, "output": new_out})
-        else:
-            cleaned.append(item)
-    return cleaned
+        itype = item.get("type")
+        if itype == "reasoning":
+            continue
+        if item.get("role") in ("user", "assistant"):
+            role = "User" if item.get("role") == "user" else "Assistant"
+            content = item.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    lines.append(f"{role}: {content}")
+            elif isinstance(content, list):
+                text_parts = [
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text", "output_text")
+                    and str(part.get("text") or "").strip()
+                ]
+                if text_parts:
+                    lines.append(f"{role}: " + "\n".join(text_parts))
+        elif itype == "function_call":
+            lines.append(
+                f"Assistant: [Tool call {item.get('name') or ''}: {item.get('arguments') or '{}'}]"
+            )
+        elif itype == "function_call_output":
+            out = item.get("output")
+            if isinstance(out, list):
+                rendered_parts: list[str] = []
+                for part in out:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "input_text":
+                        rendered_parts.append(str(part.get("text") or ""))
+                    elif part.get("type") == "input_image":
+                        rendered_parts.append("[plot image omitted]")
+                text_val = " ".join(p for p in rendered_parts if p)
+            else:
+                text_val = str(out or "")
+            lines.append(f"User: [Tool result: {text_val}]")
+    return "\n\n".join(lines)
 
 
 async def compact_openai_http(
@@ -1625,27 +2150,63 @@ async def compact_openai_http(
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> CompactResult:
     """Compact an HTTP OpenAI conversation via stateless summary replacement."""
+    headers = _openai_headers(api_key)
     store = HttpThreadStore(workspace_path, "openai")
     saved = store.load(resume_session_id)
     target_model = model or saved.get("model")
     if not isinstance(target_model, str) or not target_model:
         raise RuntimeError("No model is available to compact this session.")
 
-    sanitized = _strip_openai_images(saved["messages"])
+    history = saved["messages"]
+    if isinstance(history, list):
+        history = list(history)
+        _repair_openai_items(history)
+    transcript = _render_openai_history_for_compaction(history)
+    compact_prompt = (
+        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
+        if transcript
+        else COMPACTION_PROMPT
+    )
+
     base = _openai_base_url()
-    headers = _openai_headers(api_key)
     body = {
         "model": target_model,
         "instructions": system_prompt,
-        "input": [*sanitized, {"role": "user", "content": COMPACTION_PROMPT}],
+        "input": [{"role": "user", "content": compact_prompt}],
         "store": False,
         "stream": False,
     }
-    async with make_http_client(http_client_factory, timeout=HTTP_TIMEOUT) as client:
-        response = await client.post(f"{base}/responses", headers=headers, json=body)
-        if response.status_code != 200:
-            raise RuntimeError(http_error_message("OpenAI", response, response.content))
-        payload = response.json()
+    try:
+        async with make_http_client(
+            http_client_factory, timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{base}/responses", headers=headers, json=body
+            )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    _sanitize_error_text(
+                        http_error_message("OpenAI", response, response.content),
+                        api_key,
+                    )
+                )
+            payload = response.json()
+    except Exception as exc:
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
+
+    if isinstance(payload, dict):
+        if payload.get("error"):
+            err = payload["error"]
+            detail = err.get("message") if isinstance(err, dict) else str(err)
+            raise RuntimeError(str(detail or "OpenAI compaction failed."))
+        status = payload.get("status")
+        if status in ("failed", "incomplete"):
+            details = payload.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else status
+            raise RuntimeError(f"OpenAI compaction stopped early ({reason}).")
 
     summary_parts: list[str] = []
     for item in payload.get("output") or ():
@@ -1674,18 +2235,34 @@ async def compact_openai_http(
         },
     ]
     store.save(resume_session_id, model=target_model, messages=compacted_items)
-    output_tokens = (
-        (payload.get("usage") or {}).get("output_tokens")
-        if isinstance(payload, dict)
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    output_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+    reasoning_tokens = (
+        (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+        if isinstance(usage, dict)
+        and isinstance(usage.get("output_tokens_details"), dict)
+        else None
+    )
+    visible_tokens = (
+        max(
+            0,
+            output_tokens
+            - (
+                reasoning_tokens
+                if _is_int(reasoning_tokens) and 0 <= reasoning_tokens <= output_tokens
+                else 0
+            ),
+        )
+        if _is_int(output_tokens) and output_tokens >= 0
         else None
     )
     context_usage = (
         {
-            "used_tokens": output_tokens + 20,
+            "used_tokens": visible_tokens + 20,
             "window_tokens": None,
             "model": target_model,
         }
-        if isinstance(output_tokens, int) and output_tokens >= 0
+        if visible_tokens is not None
         else None
     )
     return CompactResult(
@@ -1701,31 +2278,46 @@ async def compact_openai_http(
 
 
 def _google_base_url() -> str:
-    return (
-        os.environ.get("GEMINI_API_BASE_URL")
-        or "https://generativelanguage.googleapis.com/v1beta"
-    ).rstrip("/")
+    raw = (os.environ.get("GEMINI_API_BASE_URL") or "").strip()
+    return (raw or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 
 
 def _google_headers(api_key: str) -> dict[str, str]:
+    cleaned = _validate_http_api_key("Google", api_key)
     return {
-        "x-goog-api-key": api_key,
+        "x-goog-api-key": cleaned,
         "Content-Type": "application/json",
     }
+
+
+def _google_supports_multimodal_function_response(model: str) -> bool:
+    return bool(_GOOGLE_GEMINI_3_RE.match(model))
+
+
+def _google_default_sort_key(raw_id: str) -> tuple[int, tuple[int, int], int, str]:
+    lowered = raw_id.lower()
+    is_lite = 1 if "lite" in lowered else 0
+    is_preview = 1 if ("preview" in lowered or "exp" in lowered) else 0
+    match = re.match(r"^gemini-(\d+)(?:\.(\d+))?", lowered)
+    if match:
+        version_key = (-int(match.group(1)), -int(match.group(2) or 0))
+    else:
+        version_key = (0, 0)
+    return (is_lite, version_key, is_preview, lowered)
 
 
 async def discover_google_http_models(
     api_key: str,
     *,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
-) -> tuple[list[ModelSpec], dict[str, dict[str, Any]]]:
+) -> tuple[list[ModelSpec], dict[str, dict[str, Any]], str | None]:
     """List Gemini models via ``GET /models``."""
     base = _google_base_url()
-    headers = _google_headers(api_key)
     raw_items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     page_token: str | None = None
     try:
+        headers = _google_headers(api_key)
         async with (
             asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
             make_http_client(
@@ -1740,11 +2332,12 @@ async def discover_google_http_models(
                     f"{base}/models", headers=headers, params=params
                 )
                 if response.status_code != 200:
-                    logger.warning(
-                        "Google HTTP model discovery failed: %s",
+                    err_msg = _sanitize_error_text(
                         http_error_message("Google", response, response.content),
+                        api_key,
                     )
-                    return [], {}
+                    logger.warning("Google HTTP model discovery failed: %s", err_msg)
+                    return [], {}, err_msg
                 payload = response.json()
                 models = payload.get("models") if isinstance(payload, dict) else None
                 if not isinstance(models, list):
@@ -1772,42 +2365,39 @@ async def discover_google_http_models(
                     break
                 page_token = next_token
     except Exception as exc:
-        logger.warning("Google HTTP model discovery failed: %s", exc)
-        return [], {}
+        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        logger.warning("Google HTTP model discovery failed: %s", err_msg)
+        return [], {}, err_msg
 
     if not raw_items:
-        return [], {}
+        return [], {}, None
 
     default_id = next(
-        (item["raw_id"] for item in raw_items if "lite" not in item["raw_id"].lower()),
-        raw_items[0]["raw_id"],
+        (cand for cand in _GOOGLE_DEFAULT_ORDER if cand in seen_ids), None
     )
+    if default_id is None:
+        default_id = min(
+            (item["raw_id"] for item in raw_items), key=_google_default_sort_key
+        )
     specs: list[ModelSpec] = []
     model_info: dict[str, dict[str, Any]] = {}
     for item in raw_items:
         raw_id = item["raw_id"]
         efforts = ["low", "medium", "high"] if _GOOGLE_EFFORT_RE.match(raw_id) else []
         limit = item.get("inputTokenLimit")
-        context_window = (
-            limit
-            if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
-            else None
-        )
+        context_window = limit if _is_pos_int(limit) else None
         model_info[raw_id] = {"context_window": context_window}
-        label = item.get("displayName")
         specs.append(
             ModelSpec(
                 id=raw_id,
                 raw_id=raw_id,
                 provider="google",
-                label=str(label).strip()
-                if isinstance(label, str) and label.strip()
-                else raw_id,
+                label=raw_id,
                 efforts=efforts,
                 is_default=(raw_id == default_id),
             )
         )
-    return specs, model_info
+    return specs, model_info, None
 
 
 def _append_google_model_part(
@@ -1835,8 +2425,8 @@ def _append_google_model_part(
 
 
 def _google_function_response_part(
-    call: dict[str, Any], result: dict[str, Any]
-) -> dict[str, Any]:
+    call: dict[str, Any], result: dict[str, Any], *, multimodal: bool
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     is_error = bool(result.get("is_error"))
     text_out, images = _tool_text_and_images(result, is_error=is_error)
     resp_obj: dict[str, Any] = {
@@ -1845,25 +2435,29 @@ def _google_function_response_part(
     }
     if call.get("id") is not None:
         resp_obj["id"] = call["id"]
-    if images:
-        resp_obj["parts"] = [
-            {
-                "inlineData": {
-                    "mimeType": img.get("mimeType") or "image/png",
-                    "data": img.get("data") or "",
-                }
+    image_parts = [
+        {
+            "inlineData": {
+                "mimeType": img.get("mimeType") or "image/png",
+                "data": img.get("data") or "",
             }
-            for img in images
-        ]
-    return {"functionResponse": resp_obj}
+        }
+        for img in images
+    ]
+    if image_parts and multimodal:
+        resp_obj["parts"] = image_parts
+        return {"functionResponse": resp_obj}, []
+    return {"functionResponse": resp_obj}, image_parts
 
 
-def _finalize_google_cancel(
+def _finalize_google_interrupted(
     working_contents: list[Any],
     *,
     partial_text: str,
     completed_responses: list[dict[str, Any]],
     pending_calls: list[dict[str, Any]],
+    tool_reason: str = "Error: Cancelled by user.",
+    assistant_note: str = "(Interrupted by user.)",
 ) -> None:
     last = working_contents[-1] if working_contents else None
     if isinstance(last, dict) and last.get("role") == "model" and pending_calls:
@@ -1871,23 +2465,115 @@ def _finalize_google_cancel(
         for call in pending_calls[len(completed_responses) :]:
             err_resp: dict[str, Any] = {
                 "name": call["name"],
-                "response": {"error": "Error: Cancelled by user."},
+                "response": {"error": tool_reason},
             }
             if call.get("id") is not None:
                 err_resp["id"] = call["id"]
             responses.append({"functionResponse": err_resp})
         working_contents.append({"role": "user", "parts": responses})
-        working_contents.append(
-            {"role": "model", "parts": [{"text": "(Interrupted by user.)"}]}
-        )
+        working_contents.append({"role": "model", "parts": [{"text": assistant_note}]})
         return
     if isinstance(last, dict) and last.get("role") == "user":
         suffix = (
-            f"{partial_text}\n\n(Interrupted by user.)"
-            if partial_text
-            else "(Interrupted by user.)"
+            f"{partial_text}\n\n{assistant_note}"
+            if partial_text.strip()
+            else assistant_note
         )
         working_contents.append({"role": "model", "parts": [{"text": suffix}]})
+
+
+def _repair_google_contents(contents: list[Any]) -> None:
+    if not contents or not isinstance(contents[-1], dict):
+        return
+    last = contents[-1]
+    if last.get("role") == "model":
+        parts = last.get("parts")
+        pending_calls = (
+            [
+                {
+                    "name": str(part["functionCall"].get("name") or ""),
+                    "id": part["functionCall"].get("id"),
+                }
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("functionCall"), dict)
+            ]
+            if isinstance(parts, list)
+            else []
+        )
+        if pending_calls:
+            _finalize_google_interrupted(
+                contents,
+                partial_text="",
+                completed_responses=[],
+                pending_calls=pending_calls,
+                tool_reason="Error: Previous turn was interrupted.",
+                assistant_note="(Previous turn was interrupted.)",
+            )
+    elif last.get("role") == "user":
+        _finalize_google_interrupted(
+            contents,
+            partial_text="",
+            completed_responses=[],
+            pending_calls=[],
+            assistant_note="(Previous turn was interrupted.)",
+        )
+
+
+def _sanitize_google_for_model_switch(
+    contents: list[Any], target_model: str
+) -> list[Any]:
+    multimodal = _google_supports_multimodal_function_response(target_model)
+    cleaned: list[Any] = []
+    for entry in contents:
+        if not isinstance(entry, dict) or not isinstance(entry.get("parts"), list):
+            cleaned.append(entry)
+            continue
+        role = entry.get("role")
+        new_parts: list[Any] = []
+        extracted_images: list[dict[str, Any]] = []
+        for part in entry["parts"]:
+            if not isinstance(part, dict):
+                new_parts.append(part)
+                continue
+            if role == "model":
+                if part.get("thought") is True:
+                    continue
+                new_part = {
+                    k: v
+                    for k, v in part.items()
+                    if k not in ("thoughtSignature", "thought")
+                }
+                if multimodal and isinstance(new_part.get("functionCall"), dict):
+                    new_part["thoughtSignature"] = "skip_thought_signature_validator"
+                new_parts.append(new_part)
+            elif (
+                role == "user"
+                and not multimodal
+                and isinstance(part.get("functionResponse"), dict)
+            ):
+                fr = dict(part["functionResponse"])
+                sub_parts = fr.pop("parts", None)
+                if isinstance(sub_parts, list):
+                    for sub in sub_parts:
+                        if isinstance(sub, dict) and "inlineData" in sub:
+                            extracted_images.append(sub)
+                new_parts.append({"functionResponse": fr})
+            else:
+                new_parts.append(part)
+        if role == "model" and not new_parts:
+            new_parts = [{"text": "(continued)"}]
+        cleaned.append({**entry, "parts": new_parts})
+        if extracted_images:
+            cleaned.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Plots returned by the tool call(s) above:"},
+                        *extracted_images,
+                    ],
+                }
+            )
+    return cleaned
 
 
 async def run_google_http_turn(
@@ -1905,20 +2591,25 @@ async def run_google_http_turn(
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> AsyncIterator[TurnEvent]:
     """Run one streaming Gemini REST API turn with multi-step tool calls."""
+    headers = _google_headers(api_key)
     store = HttpThreadStore(workspace_path, "google")
-    session_id, saved_contents, _, saved_window = _resume_state(
+    session_id, saved_contents, saved_model, saved_window = _resume_state(
         store, resume_session_id
     )
+    same_model = saved_model is None or saved_model == model
+    if saved_model and saved_model != model:
+        saved_contents = _sanitize_google_for_model_switch(saved_contents, model)
     info_window = (
         model_info.get("context_window") if isinstance(model_info, Mapping) else None
     )
     context_window = (
         info_window
-        if isinstance(info_window, int) and info_window > 0
-        else saved_window
+        if _is_pos_int(info_window)
+        else (saved_window if same_model else None)
     )
     base = _google_base_url()
-    headers = _google_headers(api_key)
+    model_slug = urllib.parse.quote(model.removeprefix("models/"), safe="")
+    multimodal_fr = _google_supports_multimodal_function_response(model)
     tool_by_name = {spec.name: spec for spec in tools}
     tool_defs = (
         [
@@ -1954,8 +2645,8 @@ async def run_google_http_turn(
         async with make_http_client(
             http_client_factory, timeout=HTTP_TIMEOUT
         ) as client:
+            include_thinking = bool(effort)
             for round_idx in range(1, MAX_TOOL_ROUNDS + 1):
-                include_thinking = bool(effort)
                 partial_text_chunks = []
                 pending_calls = []
                 completed_responses = []
@@ -1982,6 +2673,8 @@ async def run_google_http_turn(
 
                     round_started = False
                     retry_without_thinking = False
+                    saw_candidate = False
+                    finish_reason: str | None = None
                     current_text_block: list[str] = []
                     round_model_parts = []
                     pending_calls = []
@@ -1989,13 +2682,15 @@ async def run_google_http_turn(
 
                     async with client.stream(
                         "POST",
-                        f"{base}/models/{model}:streamGenerateContent?alt=sse",
+                        f"{base}/models/{model_slug}:streamGenerateContent?alt=sse",
                         headers=headers,
                         json=body,
                     ) as response:
                         if response.status_code != 200:
                             raw_err = await response.aread()
-                            err_msg = http_error_message("Google", response, raw_err)
+                            err_msg = _sanitize_error_text(
+                                http_error_message("Google", response, raw_err), api_key
+                            )
                             lowered = err_msg.lower()
                             if (
                                 response.status_code == 400
@@ -2004,6 +2699,7 @@ async def run_google_http_turn(
                                 and any(
                                     k in lowered
                                     for k in (
+                                        "thinking",
                                         "thinkingconfig",
                                         "thinkinglevel",
                                         "thinkingbudget",
@@ -2018,36 +2714,27 @@ async def run_google_http_turn(
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async for _, raw_data in iter_sse_events(response):
-                            if not raw_data or raw_data == "[DONE]":
-                                continue
-                            try:
-                                data = json.loads(raw_data)
-                            except json.JSONDecodeError:
-                                continue
-                            if not isinstance(data, dict):
-                                continue
-                            if "error" in data and data["error"] is not None:
-                                err = data["error"]
-                                msg_text = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else str(err)
-                                )
-                                raise RuntimeError(
-                                    str(msg_text or "Google Gemini stream error.")
-                                )
+                        async with aclosing(iter_sse_events(response)) as sse_events:
+                            async for _, raw_data in sse_events:
+                                if not raw_data or raw_data == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(raw_data)
+                                except json.JSONDecodeError:
+                                    continue
+                                if not isinstance(data, dict):
+                                    continue
+                                if "error" in data and data["error"] is not None:
+                                    err = data["error"]
+                                    msg_text = (
+                                        err.get("message")
+                                        if isinstance(err, dict)
+                                        else str(err)
+                                    )
+                                    raise RuntimeError(
+                                        str(msg_text or "Google Gemini stream error.")
+                                    )
 
-                            if not round_started:
-                                round_started = True
-                                made_progress = True
-                                yield TurnStarted()
-
-                            if isinstance(data.get("usageMetadata"), dict):
-                                round_usage = dict(data["usageMetadata"])
-
-                            candidates = data.get("candidates")
-                            if not candidates:
                                 prompt_fb = data.get("promptFeedback")
                                 if isinstance(prompt_fb, dict) and prompt_fb.get(
                                     "blockReason"
@@ -2055,38 +2742,78 @@ async def run_google_http_turn(
                                     raise RuntimeError(
                                         f"Google Gemini blocked the prompt ({prompt_fb['blockReason']})."
                                     )
-                                continue
 
-                            cand = (
-                                candidates[0] if isinstance(candidates[0], dict) else {}
-                            )
-                            content = cand.get("content") or {}
-                            parts = content.get("parts") or []
-                            for part in parts:
-                                if not isinstance(part, dict):
+                                if isinstance(data.get("usageMetadata"), dict):
+                                    round_usage = dict(data["usageMetadata"])
+
+                                candidates = data.get("candidates")
+                                if not candidates:
+                                    if (
+                                        isinstance(data.get("usageMetadata"), dict)
+                                        and not round_started
+                                    ):
+                                        round_started = True
+                                        made_progress = True
+                                        yield TurnStarted()
                                     continue
-                                _append_google_model_part(round_model_parts, part)
-                                if part.get("thought") is True:
-                                    continue
-                                if isinstance(part.get("text"), str) and part["text"]:
-                                    chunk = part["text"]
-                                    current_text_block.append(chunk)
-                                    partial_text_chunks.append(chunk)
-                                    yield TextDelta(chunk)
-                                if isinstance(part.get("functionCall"), dict):
-                                    if current_text_block:
-                                        yield TextBlockDone("".join(current_text_block))
-                                        current_text_block.clear()
-                                    fc = part["functionCall"]
-                                    pending_calls.append(
-                                        {
-                                            "name": str(fc.get("name") or ""),
-                                            "args": fc.get("args"),
-                                            "id": fc.get("id"),
-                                        }
-                                    )
+
+                                saw_candidate = True
+                                if not round_started:
+                                    round_started = True
+                                    made_progress = True
+                                    yield TurnStarted()
+
+                                cand = (
+                                    candidates[0]
+                                    if isinstance(candidates[0], dict)
+                                    else {}
+                                )
+                                cand_finish = cand.get("finishReason")
+                                if isinstance(cand_finish, str) and cand_finish:
+                                    finish_reason = cand_finish
+                                content = cand.get("content") or {}
+                                parts = content.get("parts") or []
+                                for part in parts:
+                                    if not isinstance(part, dict):
+                                        continue
+                                    _append_google_model_part(round_model_parts, part)
+                                    if part.get("thought") is True:
+                                        continue
+                                    if (
+                                        isinstance(part.get("text"), str)
+                                        and part["text"]
+                                    ):
+                                        chunk = part["text"]
+                                        current_text_block.append(chunk)
+                                        partial_text_chunks.append(chunk)
+                                        yield TextDelta(chunk)
+                                    if isinstance(part.get("functionCall"), dict):
+                                        if current_text_block:
+                                            yield TextBlockDone(
+                                                "".join(current_text_block)
+                                            )
+                                            current_text_block.clear()
+                                        fc = part["functionCall"]
+                                        pending_calls.append(
+                                            {
+                                                "name": str(fc.get("name") or ""),
+                                                "args": fc.get("args"),
+                                                "id": fc.get("id"),
+                                            }
+                                        )
 
                     if not retry_without_thinking:
+                        if not saw_candidate:
+                            raise RuntimeError(
+                                "Google Gemini stream ended without a response."
+                            )
+                        if finish_reason and finish_reason not in (
+                            "STOP",
+                            "FINISH_REASON_UNSPECIFIED",
+                        ):
+                            raise RuntimeError(
+                                f"Google Gemini stopped early ({finish_reason})."
+                            )
                         if current_text_block:
                             yield TextBlockDone("".join(current_text_block))
                             current_text_block.clear()
@@ -2098,11 +2825,7 @@ async def run_google_http_turn(
                     )
                     _add_int_usage(total_usage, round_usage)
                     prompt_tokens = round_usage.get("promptTokenCount")
-                    if (
-                        isinstance(prompt_tokens, int)
-                        and not isinstance(prompt_tokens, bool)
-                        and prompt_tokens >= 0
-                    ):
+                    if _is_int(prompt_tokens) and prompt_tokens >= 0:
                         last_context_usage = {
                             "used_tokens": prompt_tokens,
                             "window_tokens": context_window,
@@ -2112,7 +2835,7 @@ async def run_google_http_turn(
                 working_contents.append(
                     {
                         "role": "model",
-                        "parts": round_model_parts or [{"text": ""}],
+                        "parts": round_model_parts or [{"text": "(no response)"}],
                     }
                 )
 
@@ -2130,21 +2853,58 @@ async def run_google_http_turn(
                     )
                     return
 
+                if round_idx >= MAX_TOOL_ROUNDS:
+                    raise RuntimeError(
+                        f"Google Gemini turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
+                    )
+
                 completed_responses = []
+                extra_image_parts: list[dict[str, Any]] = []
+                steered_out = False
                 for call in pending_calls:
+                    if steered_out:
+                        resp_part, _ = _google_function_response_part(
+                            call, _SKIPPED_STEER_RESULT, multimodal=multimodal_fr
+                        )
+                        completed_responses.append(resp_part)
+                        continue
                     raw_args = call.get("args")
                     if raw_args is None:
                         raw_args = {}
                     elif isinstance(raw_args, str):
-                        with suppress(json.JSONDecodeError):
-                            raw_args = json.loads(raw_args)
+                        parsed_args, json_err = _parse_tool_arguments(raw_args)
+                        if json_err is not None:
+                            result = {
+                                "content": [{"type": "text", "text": json_err}],
+                                "is_error": True,
+                            }
+                            resp_part, _ = _google_function_response_part(
+                                call, result, multimodal=multimodal_fr
+                            )
+                            completed_responses.append(resp_part)
+                            continue
+                        raw_args = parsed_args
                     result = await execute_tool_call(
                         tool_by_name, call["name"], raw_args, tool_timeout_s
                     )
-                    completed_responses.append(
-                        _google_function_response_part(call, result)
+                    if result.get("steered"):
+                        steered_out = True
+                    resp_part, img_parts = _google_function_response_part(
+                        call, result, multimodal=multimodal_fr
                     )
+                    completed_responses.append(resp_part)
+                    extra_image_parts.extend(img_parts)
                 working_contents.append({"role": "user", "parts": completed_responses})
+                if extra_image_parts:
+                    working_contents.append(
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": "Plots returned by the tool call(s) above:"},
+                                *extra_image_parts,
+                            ],
+                        }
+                    )
                 completed_responses = []
                 pending_calls = []
                 store.save(
@@ -2158,7 +2918,7 @@ async def run_google_http_turn(
         )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
-            _finalize_google_cancel(
+            _finalize_google_interrupted(
                 working_contents,
                 partial_text="".join(partial_text_chunks),
                 completed_responses=completed_responses,
@@ -2171,40 +2931,59 @@ async def run_google_http_turn(
                 context_window=context_window,
             )
         raise
+    except Exception as exc:
+        if made_progress:
+            _finalize_google_interrupted(
+                working_contents,
+                partial_text="".join(partial_text_chunks),
+                completed_responses=completed_responses,
+                pending_calls=pending_calls,
+                tool_reason="Error: Turn failed before tool execution completed.",
+                assistant_note="(Error before response completed.)",
+            )
+            store.save(
+                session_id,
+                model=model,
+                messages=working_contents,
+                context_window=context_window,
+            )
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
 
 
-def _strip_google_images(contents: list[Any]) -> list[Any]:
-    cleaned: list[Any] = []
+def _render_google_history_for_compaction(contents: list[Any]) -> str:
+    lines: list[str] = []
     for entry in contents:
         if not isinstance(entry, dict) or not isinstance(entry.get("parts"), list):
-            cleaned.append(entry)
             continue
-        new_parts: list[Any] = []
+        role = "User" if entry.get("role") == "user" else "Assistant"
+        parts_text: list[str] = []
         for part in entry["parts"]:
             if not isinstance(part, dict):
-                new_parts.append(part)
                 continue
-            if "inlineData" in part:
-                new_parts.append({"text": "[image omitted during compaction]"})
+            if part.get("thought") is True:
                 continue
-            if isinstance(part.get("functionResponse"), dict):
+            if isinstance(part.get("text"), str) and part["text"].strip():
+                parts_text.append(part["text"])
+            elif "inlineData" in part:
+                parts_text.append("[image omitted during compaction]")
+            elif isinstance(part.get("functionCall"), dict):
+                fc = part["functionCall"]
+                args_json = json.dumps(fc.get("args") or {}, ensure_ascii=False)
+                parts_text.append(f"[Tool call {fc.get('name') or ''}: {args_json}]")
+            elif isinstance(part.get("functionResponse"), dict):
                 fr = part["functionResponse"]
-                if isinstance(fr.get("parts"), list):
-                    stripped_sub = [
-                        (
-                            {"text": "[plot image omitted during compaction]"}
-                            if isinstance(sub, dict) and "inlineData" in sub
-                            else sub
-                        )
-                        for sub in fr["parts"]
-                    ]
-                    new_parts.append(
-                        {"functionResponse": {**fr, "parts": stripped_sub}}
-                    )
-                    continue
-            new_parts.append(part)
-        cleaned.append({**entry, "parts": new_parts})
-    return cleaned
+                resp_val = json.dumps(fr.get("response") or {}, ensure_ascii=False)
+                sub = fr.get("parts") or ()
+                omitted = " [plot image omitted]" if sub else ""
+                parts_text.append(
+                    f"[Tool result {fr.get('name') or ''}: {resp_val}{omitted}]"
+                )
+        if parts_text:
+            lines.append(f"{role}: " + "\n".join(parts_text))
+    return "\n\n".join(lines)
 
 
 async def compact_google_http(
@@ -2215,46 +2994,87 @@ async def compact_google_http(
     model: str | None,
     resume_session_id: str,
     model_info: Mapping[str, Any] | None = None,
+    model_info_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
 ) -> CompactResult:
     """Compact an HTTP Google Gemini conversation by summarizing saved contents."""
+    headers = _google_headers(api_key)
     store = HttpThreadStore(workspace_path, "google")
     saved = store.load(resume_session_id)
     target_model = model or saved.get("model")
     if not isinstance(target_model, str) or not target_model:
         raise RuntimeError("No model is available to compact this session.")
+    saved_model = saved.get("model") if isinstance(saved.get("model"), str) else None
+    resolved_info = (model_info_by_id or {}).get(target_model) or model_info
     context_window = (
-        model_info.get("context_window")
-        if model_info and isinstance(model_info.get("context_window"), int)
-        else saved.get("context_window")
-        if isinstance(saved.get("context_window"), int)
-        else None
+        resolved_info["context_window"]
+        if resolved_info and _is_pos_int(resolved_info.get("context_window"))
+        else (
+            saved.get("context_window")
+            if saved_model == target_model and _is_pos_int(saved.get("context_window"))
+            else None
+        )
     )
 
-    sanitized = _strip_google_images(saved["messages"])
+    history = saved["messages"]
+    if isinstance(history, list):
+        history = list(history)
+        _repair_google_contents(history)
+    transcript = _render_google_history_for_compaction(history)
+    compact_prompt = (
+        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
+        if transcript
+        else COMPACTION_PROMPT
+    )
+
     base = _google_base_url()
-    headers = _google_headers(api_key)
+    model_slug = urllib.parse.quote(target_model.removeprefix("models/"), safe="")
     body = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [
-            *sanitized,
-            {"role": "user", "parts": [{"text": COMPACTION_PROMPT}]},
-        ],
+        "contents": [{"role": "user", "parts": [{"text": compact_prompt}]}],
     }
-    async with make_http_client(http_client_factory, timeout=HTTP_TIMEOUT) as client:
-        response = await client.post(
-            f"{base}/models/{target_model}:generateContent",
-            headers=headers,
-            json=body,
+    try:
+        async with make_http_client(
+            http_client_factory, timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{base}/models/{model_slug}:generateContent",
+                headers=headers,
+                json=body,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    _sanitize_error_text(
+                        http_error_message("Google", response, response.content),
+                        api_key,
+                    )
+                )
+            payload = response.json()
+    except Exception as exc:
+        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        if sanitized_msg != str(exc):
+            raise RuntimeError(sanitized_msg) from None
+        raise
+
+    prompt_fb = payload.get("promptFeedback") if isinstance(payload, dict) else None
+    if isinstance(prompt_fb, dict) and prompt_fb.get("blockReason"):
+        raise RuntimeError(
+            f"Google Gemini blocked compaction ({prompt_fb['blockReason']})."
         )
-        if response.status_code != 200:
-            raise RuntimeError(http_error_message("Google", response, response.content))
-        payload = response.json()
 
     summary_parts: list[str] = []
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if isinstance(candidates, list) and candidates:
-        parts = ((candidates[0] or {}).get("content") or {}).get("parts") or ()
+        cand = candidates[0] if isinstance(candidates[0], dict) else {}
+        finish_reason = cand.get("finishReason")
+        if finish_reason and finish_reason not in (
+            "STOP",
+            "FINISH_REASON_UNSPECIFIED",
+        ):
+            raise RuntimeError(
+                f"Google Gemini compaction stopped early ({finish_reason})."
+            )
+        parts = (cand.get("content") or {}).get("parts") or ()
         for part in parts:
             if (
                 isinstance(part, dict)
@@ -2293,7 +3113,7 @@ async def compact_google_http(
             "window_tokens": context_window,
             "model": target_model,
         }
-        if isinstance(candidates_tokens, int) and candidates_tokens >= 0
+        if _is_int(candidates_tokens) and candidates_tokens >= 0
         else None
     )
     return CompactResult(

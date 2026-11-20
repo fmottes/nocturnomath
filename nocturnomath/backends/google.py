@@ -1,4 +1,4 @@
-"""Google Antigravity CLI backend speaking ACP JSON-RPC over stdio."""
+"""Google backend supporting direct Gemini HTTP API and local ``agy`` CLI."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Any
 
@@ -164,7 +164,7 @@ def _mcp_server_entry(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 class GoogleBackend:
-    """Drive the local ``agy acp`` server over JSON-RPC stdio."""
+    """Drive Google Gemini via direct HTTP REST API or the local ``agy acp`` server."""
 
     provider: ProviderId = "google"
     uses_compact_hook: bool = False
@@ -178,6 +178,7 @@ class GoogleBackend:
         self.cli_path = cli_path
         self._http_client_factory = http_client_factory
         self._http_model_info: dict[str, dict[str, Any]] = {}
+        self.last_discovery_error: str | None = None
         self._slug_map: dict[tuple[str, str], str] = {}
         self._next_rpc_id = 0
 
@@ -187,7 +188,7 @@ class GoogleBackend:
         candidates = agy_cli_candidates()
         if not candidates:
             raise RuntimeError(
-                "Antigravity CLI (`agy`) was not found on PATH. Install agy or sign in."
+                "Antigravity CLI (`agy`) was not found on PATH. Install agy or configure a Google Gemini API key."
             )
         self.cli_path = candidates[0]
         return self.cli_path
@@ -316,20 +317,27 @@ class GoogleBackend:
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            specs, info = await discover_google_http_models(
+            specs, info, err = await discover_google_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
 
             def commit_http(
                 discovered_info: dict[str, dict[str, Any]] = info,
+                discovery_error: str | None = err,
             ) -> None:
                 self._http_model_info = dict(discovered_info)
+                self._slug_map = {}
+                self.last_discovery_error = discovery_error
 
             return specs, commit_http
 
+        def clear_http() -> None:
+            self._http_model_info = {}
+            self.last_discovery_error = None
+
         candidates = agy_cli_candidates()
         if not candidates:
-            return [], lambda: None
+            return [], clear_http
         env, flags = self._prepare_env_and_flags(auth)
         for candidate in candidates:
             with tempfile.TemporaryDirectory(
@@ -377,6 +385,8 @@ class GoogleBackend:
                                 discovered_slugs: dict[tuple[str, str], str] = slug_map,
                             ) -> None:
                                 self._slug_map = dict(discovered_slugs)
+                                self._http_model_info = {}
+                                self.last_discovery_error = None
                                 self.cli_path = chosen
 
                             return specs, commit
@@ -391,7 +401,7 @@ class GoogleBackend:
                         await terminate_process(proc, stderr)
                     elif stderr is not None:
                         await stderr.close()
-        return [], lambda: None
+        return [], clear_http
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -491,20 +501,23 @@ class GoogleBackend:
     ) -> AsyncIterator[TurnEvent]:
         api_key = auth.direct_api_key()
         if api_key is not None:
-            async for event in run_google_http_turn(
-                prompt,
-                api_key=api_key,
-                system_prompt=system_prompt,
-                tools=tools,
-                workspace_path=workspace_path,
-                model=model,
-                effort=effort,
-                resume_session_id=resume_session_id,
-                tool_timeout_s=tool_timeout_s,
-                model_info=self._http_model_info.get(model),
-                http_client_factory=self._http_client_factory,
-            ):
-                yield event
+            async with aclosing(
+                run_google_http_turn(
+                    prompt,
+                    api_key=api_key,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    workspace_path=workspace_path,
+                    model=model,
+                    effort=effort,
+                    resume_session_id=resume_session_id,
+                    tool_timeout_s=tool_timeout_s,
+                    model_info=self._http_model_info.get(model),
+                    http_client_factory=self._http_client_factory,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
             return
         if is_http_session_id(resume_session_id):
             raise SessionResumeError(
@@ -720,7 +733,7 @@ class GoogleBackend:
                 workspace_path=workspace_path,
                 model=model,
                 resume_session_id=resume_session_id,
-                model_info=self._http_model_info.get(model or ""),
+                model_info_by_id=self._http_model_info,
                 http_client_factory=self._http_client_factory,
             )
         if is_http_session_id(resume_session_id):

@@ -52,11 +52,9 @@ _ENV_VARS_TO_CLEAR = (
 def clean_env_and_hide_clis(monkeypatch):
     for var in _ENV_VARS_TO_CLEAR:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(
-        "nocturnomath.backends.anthropic.claude_cli_candidates", lambda: []
-    )
-    monkeypatch.setattr("nocturnomath.backends.openai.codex_cli_candidates", lambda: [])
-    monkeypatch.setattr("nocturnomath.backends.google.agy_cli_candidates", lambda: [])
+    monkeypatch.setattr("nocturnomath.backends.anthropic.claude_cli_candidates", list)
+    monkeypatch.setattr("nocturnomath.backends.openai.codex_cli_candidates", list)
+    monkeypatch.setattr("nocturnomath.backends.google.agy_cli_candidates", list)
 
 
 def _sse_body(events: list[tuple[str | None, dict | str]]) -> bytes:
@@ -1079,6 +1077,7 @@ async def test_google_http_discovery_streaming_thought_signature_compact_and_can
 
     specs = await backend.discover_models(auth)
     assert [s.id for s in specs] == ["gemini-2.5-pro", "gemini-3-pro-preview"]
+    assert [s.label for s in specs] == ["gemini-2.5-pro", "gemini-3-pro-preview"]
     assert specs[0].efforts == ["low", "medium", "high"]
     assert specs[0].is_default is True
 
@@ -1547,4 +1546,914 @@ async def test_session_and_runtime_end_to_end_http_no_clis_compaction_and_resume
                     fresh_session.shutdown()
         finally:
             await runtime.drain()
+            runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "google"])
+async def test_http_turn_aclosing_cancel_saves_synchronously(tmp_path, provider):
+    import gc
+    from contextlib import aclosing
+
+    from nocturnomath.backends.http import HttpThreadStore
+
+    if provider == "anthropic":
+        sse = _sse_body(
+            [
+                (
+                    "message_start",
+                    {
+                        "type": "message_start",
+                        "message": {"id": "m1", "model": "claude-sonnet-4-6"},
+                    },
+                ),
+                (
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text"},
+                    },
+                ),
+                (
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "Halfway"},
+                    },
+                ),
+                ("message_stop", {"type": "message_stop"}),
+            ]
+        )
+        backend = AnthropicBackend(
+            http_client_factory=_client_factory(
+                lambda _r: httpx.Response(200, content=sse)
+            )
+        )
+        auth = ProviderAuth.interactive("anthropic", "api_key", "sk-ant-aclose")
+        model = "claude-sonnet-4-6"
+    elif provider == "openai":
+        sse = _sse_body(
+            [
+                (
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": {"id": "r1", "model": "gpt-5.4"},
+                    },
+                ),
+                (
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "m1",
+                        "content_index": 0,
+                        "delta": "Halfway",
+                    },
+                ),
+            ]
+        )
+        backend = OpenAIBackend(
+            http_client_factory=_client_factory(
+                lambda _r: httpx.Response(200, content=sse)
+            )
+        )
+        auth = ProviderAuth.interactive("openai", "api_key", "sk-oai-aclose")
+        model = "gpt-5.4"
+    else:
+        sse = _sse_body(
+            [
+                (
+                    None,
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "Halfway"}],
+                                }
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+        backend = GoogleBackend(
+            http_client_factory=_client_factory(
+                lambda _r: httpx.Response(200, content=sse)
+            )
+        )
+        auth = ProviderAuth.interactive("google", "api_key", "AIza-aclose")
+        model = "gemini-3-pro-preview"
+
+    sid = None
+    async with aclosing(
+        backend.run_turn(
+            "interrupt during consumer close",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model=model,
+            effort=None,
+            auth=auth,
+        )
+    ) as events:
+        async for ev in events:
+            if isinstance(ev, SessionStarted):
+                sid = ev.session_id
+            elif isinstance(ev, TextDelta):
+                break
+
+    assert sid is not None
+    # Saved immediately upon aclosing() exit before any GC finalization.
+    saved = HttpThreadStore(tmp_path, provider).load(sid)["messages"]
+    assert saved
+    gc.collect()
+    await asyncio.sleep(0)
+    assert "(Interrupted by user.)" in json.dumps(saved[-1])
+
+
+@pytest.mark.asyncio
+async def test_google_round2_error_and_max_tool_rounds_keep_valid_thread(
+    tmp_path, monkeypatch
+):
+    from nocturnomath.backends import http as http_mod
+    from nocturnomath.backends.http import HttpThreadStore
+
+    call_num = 0
+
+    async def google_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_num
+        call_num += 1
+        body = json.loads(request.content.decode("utf-8"))
+        if call_num == 1:
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        (
+                            None,
+                            {
+                                "candidates": [
+                                    {
+                                        "finishReason": "STOP",
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [
+                                                {
+                                                    "functionCall": {
+                                                        "name": "ping",
+                                                        "args": {},
+                                                        "id": "c1",
+                                                    }
+                                                }
+                                            ],
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                ),
+            )
+        if call_num == 2:
+            return httpx.Response(500, json={"error": {"message": "upstream boom"}})
+
+        # Follow-up turn must never have consecutive user turns after failed Round 2.
+        roles = [entry["role"] for entry in body["contents"]]
+        assert all(
+            not (roles[i] == "user" and roles[i + 1] == "user")
+            for i in range(len(roles) - 1)
+        )
+        return httpx.Response(
+            200,
+            content=_sse_body(
+                [
+                    (
+                        None,
+                        {
+                            "candidates": [
+                                {
+                                    "finishReason": "STOP",
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "Recovered cleanly."}],
+                                    },
+                                }
+                            ]
+                        },
+                    )
+                ]
+            ),
+        )
+
+    @tool("ping", "Ping.", {})
+    async def ping_tool(_args):
+        return {"content": [{"type": "text", "text": "pong"}]}
+
+    g_backend = GoogleBackend(http_client_factory=_client_factory(google_handler))
+    g_auth = ProviderAuth.interactive("google", "api_key", "AIza-recover")
+    seen: list[str] = []
+    with pytest.raises(RuntimeError, match="upstream boom"):
+        async for ev in g_backend.run_turn(
+            "round1 ok round2 fails",
+            system_prompt="Sys",
+            tools=[ping_tool],
+            workspace_path=tmp_path,
+            model="gemini-3-pro-preview",
+            effort=None,
+            auth=g_auth,
+        ):
+            if isinstance(ev, SessionStarted):
+                seen.append(ev.session_id)
+
+    saved = HttpThreadStore(tmp_path, "google").load(seen[0])["messages"]
+    assert saved[-1]["role"] == "model"
+
+    events = [
+        e
+        async for e in g_backend.run_turn(
+            "try again",
+            system_prompt="Sys",
+            tools=[ping_tool],
+            workspace_path=tmp_path,
+            model="gemini-3-pro-preview",
+            effort=None,
+            auth=g_auth,
+            resume_session_id=seen[0],
+        )
+    ]
+    assert [e.text for e in events if isinstance(e, TextBlockDone)] == [
+        "Recovered cleanly."
+    ]
+
+    # MAX_TOOL_ROUNDS exceeded refuses to execute final round tools and pairs tool_use.
+    monkeypatch.setattr(http_mod, "MAX_TOOL_ROUNDS", 1)
+    ran_tool = False
+
+    @tool("never", "Should not execute.", {})
+    async def never_tool(_args):
+        nonlocal ran_tool
+        ran_tool = True
+        return {"content": [{"type": "text", "text": "ran"}]}
+
+    ant_sse = _sse_body(
+        [
+            (
+                "message_start",
+                {"type": "message_start", "message": {"id": "m1", "model": "c"}},
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "tu_max",
+                        "name": "never",
+                    },
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "message_delta",
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+    )
+    a_backend = AnthropicBackend(
+        http_client_factory=_client_factory(
+            lambda _r: httpx.Response(200, content=ant_sse)
+        )
+    )
+    a_seen: list[str] = []
+    with pytest.raises(RuntimeError, match="maximum tool rounds"):
+        async for ev in a_backend.run_turn(
+            "loop",
+            system_prompt="Sys",
+            tools=[never_tool],
+            workspace_path=tmp_path,
+            model="claude-sonnet-4-6",
+            effort=None,
+            auth=ProviderAuth.interactive("anthropic", "api_key", "sk-ant-max"),
+        ):
+            if isinstance(ev, SessionStarted):
+                a_seen.append(ev.session_id)
+    assert ran_tool is False
+    a_msgs = HttpThreadStore(tmp_path, "anthropic").load(a_seen[0])["messages"]
+    assert a_msgs[-2]["role"] == "user"
+    assert a_msgs[-2]["content"][0]["tool_use_id"] == "tu_max"
+    assert a_msgs[-2]["content"][0]["is_error"] is True
+    assert a_msgs[-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_http_compaction_truncation_guards_and_openai_reasoning_tokens(tmp_path):
+    from nocturnomath.backends.http import HttpThreadStore
+
+    # Google compaction rejects SAFETY finishReason without overwriting saved thread.
+    g_store = HttpThreadStore(tmp_path, "google")
+    g_sid = g_store.new_session_id()
+    g_orig = [
+        {"role": "user", "parts": [{"text": "plot"}]},
+        {
+            "role": "model",
+            "parts": [
+                {"text": "plan", "thought": True},
+                {
+                    "functionCall": {"name": "p", "args": {}, "id": "1"},
+                    "thoughtSignature": "s",
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "name": "p",
+                        "id": "1",
+                        "response": {"output": "ok"},
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": _TINY_PNG_B64,
+                                }
+                            }
+                        ],
+                    }
+                }
+            ],
+        },
+        {"role": "model", "parts": [{"text": "done"}]},
+    ]
+    g_store.save(g_sid, model="gemini-3-pro-preview", messages=g_orig)
+
+    g_backend = GoogleBackend(
+        http_client_factory=_client_factory(
+            lambda _r: httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "finishReason": "SAFETY",
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "Partial"}],
+                            },
+                        }
+                    ]
+                },
+            )
+        )
+    )
+    with pytest.raises(RuntimeError, match="SAFETY"):
+        await g_backend.compact(
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model=None,
+            effort=None,
+            auth=ProviderAuth.interactive("google", "api_key", "AIza-cmp"),
+            resume_session_id=g_sid,
+        )
+    assert g_store.load(g_sid)["messages"] == g_orig
+
+    # OpenAI compaction strips reasoning_tokens from post-compact usage and keeps no tools.
+    o_store = HttpThreadStore(tmp_path, "openai")
+    o_sid = o_store.new_session_id()
+    o_store.save(
+        o_sid,
+        model="gpt-5.4",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"type": "reasoning", "encrypted_content": "enc"},
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "run",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": "done"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "42"}],
+            },
+        ],
+    )
+    seen_o_body = []
+
+    async def o_handler(req: httpx.Request) -> httpx.Response:
+        seen_o_body.append(json.loads(req.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Compact OAI."}],
+                    }
+                ],
+                "usage": {
+                    "output_tokens": 500,
+                    "output_tokens_details": {"reasoning_tokens": 450},
+                },
+            },
+        )
+
+    o_backend = OpenAIBackend(http_client_factory=_client_factory(o_handler))
+    res = await o_backend.compact(
+        system_prompt="Sys",
+        tools=[],
+        workspace_path=tmp_path,
+        model=None,
+        effort=None,
+        auth=ProviderAuth.interactive("openai", "api_key", "sk-oai-cmp"),
+        resume_session_id=o_sid,
+    )
+    assert "tools" not in seen_o_body[0]
+    assert "reasoning" not in json.dumps(seen_o_body[0]["input"])
+    assert res.context_usage["used_tokens"] == 70  # (500 - 450) + 20
+
+
+@pytest.mark.asyncio
+async def test_gemini_25_plot_images_and_same_provider_model_switching(tmp_path):
+    # Gemini 2.5 sends returned plot images in a separate user turn, and switching to Gemini 3
+    # adds skip_thought_signature_validator on historical functionCalls without carrying window_tokens.
+    seen_bodies: list[dict] = []
+    step = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal step
+        body = json.loads(req.content.decode("utf-8"))
+        seen_bodies.append(body)
+        step += 1
+        if step == 1:
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        (
+                            None,
+                            {
+                                "candidates": [
+                                    {
+                                        "finishReason": "STOP",
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [
+                                                {"text": "secret", "thought": True},
+                                                {
+                                                    "functionCall": {
+                                                        "name": "plot",
+                                                        "args": {},
+                                                        "id": "g25",
+                                                    }
+                                                },
+                                            ],
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                ),
+            )
+        if step == 2:
+            fr_turn = body["contents"][-2]
+            img_turn = body["contents"][-1]
+            assert "parts" not in fr_turn["parts"][0]["functionResponse"]
+            assert img_turn["role"] == "user"
+            assert img_turn["parts"][1]["inlineData"]["data"] == _TINY_PNG_B64
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        (
+                            None,
+                            {
+                                "candidates": [
+                                    {
+                                        "finishReason": "STOP",
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [{"text": "Gemini 2.5 saw plot."}],
+                                        },
+                                    }
+                                ],
+                                "usageMetadata": {"promptTokenCount": 120},
+                            },
+                        )
+                    ]
+                ),
+            )
+        # Step 3: resumed under gemini-3-pro-preview
+        model_hist = body["contents"][1]
+        assert all(not p.get("thought") for p in model_hist["parts"])
+        fc_part = next(p for p in model_hist["parts"] if "functionCall" in p)
+        assert fc_part["thoughtSignature"] == "skip_thought_signature_validator"
+        return httpx.Response(
+            200,
+            content=_sse_body(
+                [
+                    (
+                        None,
+                        {
+                            "candidates": [
+                                {
+                                    "finishReason": "STOP",
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "Switched cleanly."}],
+                                    },
+                                }
+                            ],
+                            "usageMetadata": {"promptTokenCount": 90},
+                        },
+                    )
+                ]
+            ),
+        )
+
+    @tool("plot", "Plot.", {})
+    async def plot_tool(_args):
+        return {
+            "content": [
+                {"type": "text", "text": "plotted"},
+                {"type": "image", "data": _TINY_PNG_B64, "mimeType": "image/png"},
+            ]
+        }
+
+    backend = GoogleBackend(http_client_factory=_client_factory(handler))
+    backend._http_model_info["gemini-2.5-pro"] = {"context_window": 1000000}
+    auth = ProviderAuth.interactive("google", "api_key", "AIza-switch")
+
+    events1 = [
+        e
+        async for e in backend.run_turn(
+            "run on 2.5",
+            system_prompt="Sys",
+            tools=[plot_tool],
+            workspace_path=tmp_path,
+            model="gemini-2.5-pro",
+            effort="low",
+            auth=auth,
+        )
+    ]
+    sid = next(e.session_id for e in events1 if isinstance(e, SessionStarted))
+
+    events2 = [
+        e
+        async for e in backend.run_turn(
+            "switch to 3",
+            system_prompt="Sys",
+            tools=[plot_tool],
+            workspace_path=tmp_path,
+            model="gemini-3-pro-preview",
+            effort="high",
+            auth=auth,
+            resume_session_id=sid,
+        )
+    ]
+    res2 = next(e for e in events2 if isinstance(e, TurnResult))
+    # Does not inherit gemini-2.5-pro's 1M window after switching models.
+    assert res2.context_usage["window_tokens"] is None
+
+
+@pytest.mark.asyncio
+async def test_sse_unicode_separators_bom_and_stream_failure_guards(tmp_path):
+
+    payload_text = "line\u2028sep\u2029nel\x85ok"
+    sse_bytes = (
+        "\ufeff"
+        + "event: message_start\n"
+        + 'data: {"type": "message_start", "message": {"id": "m1", "model": "claude-sonnet-4-6"}}\n\n'
+        + "event: content_block_start\n"
+        + 'data: {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}\n\n'
+        + "event: content_block_delta\n"
+        + f'data: {{"type": "content_block_delta", "index": 0, "delta": {{"type": "text_delta", "text": {json.dumps(payload_text, ensure_ascii=False)}}}}}\n\n'
+        + "event: content_block_stop\n"
+        + 'data: {"type": "content_block_stop", "index": 0}\n\n'
+        + "event: message_delta\n"
+        + 'data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}\n\n'
+        + "event: message_stop\n"
+        + 'data: {"type": "message_stop"}\n\n'
+    ).encode("utf-8")
+
+    # Deliver 5 bytes at a time to test chunked UTF-8 BOM and separator handling.
+    class ChunkedStream(httpx.AsyncByteStream):
+        def __init__(self, raw: bytes):
+            self.raw = raw
+
+        async def __aiter__(self):
+            for i in range(0, len(self.raw), 5):
+                yield self.raw[i : i + 5]
+
+    a_backend = AnthropicBackend(
+        http_client_factory=_client_factory(
+            lambda _r: httpx.Response(200, stream=ChunkedStream(sse_bytes))
+        )
+    )
+    events = [
+        e
+        async for e in a_backend.run_turn(
+            "unicode",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="claude-sonnet-4-6",
+            effort=None,
+            auth=ProviderAuth.interactive("anthropic", "api_key", "sk-ant-u"),
+        )
+    ]
+    assert [e.text for e in events if isinstance(e, TextBlockDone)] == [payload_text]
+
+    # Google chunk-1 promptFeedback blockReason must NOT emit TurnStarted or save session.
+    g_block_sse = _sse_body([(None, {"promptFeedback": {"blockReason": "SAFETY"}})])
+    g_backend = GoogleBackend(
+        http_client_factory=_client_factory(
+            lambda _r: httpx.Response(200, content=g_block_sse)
+        )
+    )
+    seen_before_block: list = []
+    with pytest.raises(RuntimeError, match="blocked the prompt.*SAFETY"):
+        async for ev in g_backend.run_turn(
+            "blocked",
+            system_prompt="Sys",
+            tools=[],
+            workspace_path=tmp_path,
+            model="gemini-3-pro-preview",
+            effort=None,
+            auth=ProviderAuth.interactive("google", "api_key", "AIza-blk"),
+        ):
+            seen_before_block.append(ev)
+    assert not any(isinstance(ev, TurnStarted) for ev in seen_before_block)
+
+
+@pytest.mark.asyncio
+async def test_openai_model_inference_base_url_key_redaction_and_store_errors(
+    tmp_path, monkeypatch
+):
+    from nocturnomath.backends.http import HttpThreadStore, discover_openai_http_models
+
+    # OpenAI HTTP model IDs (o3, o4-mini, codex-*, chatgpt-*) map to provider="openai" even pre-discovery.
+    async def oai_models_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "o3", "created": 300},
+                    {"id": "o4-mini", "created": 250},
+                    {"id": "codex-mini-latest", "created": 200},
+                    {"id": "chatgpt-4o-latest", "created": 100},
+                ]
+            },
+        )
+
+    specs, err = await discover_openai_http_models(
+        "sk-oai-test", http_client_factory=_client_factory(oai_models_handler)
+    )
+    assert err is None
+    assert {s.id for s in specs} == {
+        "o3",
+        "o4-mini",
+        "codex-mini-latest",
+        "chatgpt-4o-latest",
+    }
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        session = ExplorationSession(tmp_path)
+        try:
+            for mid in ("o3", "o4-mini", "codex-mini-latest", "chatgpt-4o-latest"):
+                assert session.provider_for_model(mid) == "openai"
+        finally:
+            session.shutdown()
+
+    # ANTHROPIC_BASE_URL with trailing /v1 normalizes without /v1/v1/.
+    seen_urls: list[str] = []
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example/v1")
+
+    def ant_proxy_handler(req: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(req.url))
+        return httpx.Response(
+            200, json={"data": [{"id": "claude-sonnet-4-6"}], "has_more": False}
+        )
+
+    a_backend = AnthropicBackend(http_client_factory=_client_factory(ant_proxy_handler))
+    await a_backend.discover_models(
+        ProviderAuth.interactive("anthropic", "api_key", "sk-ant-proxy")
+    )
+    assert seen_urls == ["https://proxy.example/v1/models?limit=100"]
+
+    # Control chars in ambient env key never leak secret in discovery error.
+    secret = "sk-ant-secret\r\nleak"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    await a_backend.discover_models(ProviderAuth("anthropic", "cli"))
+    assert a_backend.last_discovery_error is not None
+    assert "sk-ant-secret" not in a_backend.last_discovery_error
+
+    # Invalid UTF-8 in saved thread file yields SessionResumeError.
+    store = HttpThreadStore(tmp_path, "anthropic")
+    bad_sid = store.new_session_id()
+    store._path_for(bad_sid).parent.mkdir(parents=True, exist_ok=True)
+    store._path_for(bad_sid).write_bytes(b"\xff\xfe\xfd")
+    with pytest.raises(SessionResumeError):
+        store.load(bad_sid)
+
+
+@pytest.mark.asyncio
+async def test_http_batched_tools_short_circuit_after_steer_and_discovery_error(
+    tmp_path,
+):
+    tool_runs: list[str] = []
+
+    with (
+        patch("nocturnomath.session.Kernel", FakeKernel),
+        patch("nocturnomath.session.ResearchEnvironment", FakeEnvironment),
+    ):
+        session = ExplorationSession(tmp_path)
+        runtime = Runtime(session)
+
+        async def handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            if len(body["messages"]) == 1:
+                return httpx.Response(
+                    200,
+                    content=_sse_body(
+                        [
+                            (
+                                "message_start",
+                                {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": "m1",
+                                        "model": "claude-sonnet-4-6",
+                                    },
+                                },
+                            ),
+                            (
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": "tu1",
+                                        "name": "probe_a",
+                                        "input": {},
+                                    },
+                                },
+                            ),
+                            (
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": 0},
+                            ),
+                            (
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": 1,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": "tu2",
+                                        "name": "probe_b",
+                                        "input": {},
+                                    },
+                                },
+                            ),
+                            (
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": 1},
+                            ),
+                            (
+                                "message_delta",
+                                {
+                                    "type": "message_delta",
+                                    "delta": {"stop_reason": "tool_use"},
+                                },
+                            ),
+                            ("message_stop", {"type": "message_stop"}),
+                        ]
+                    ),
+                )
+            # Second round receives steered result for tu1 and skipped error for tu2.
+            res_blocks = body["messages"][-1]["content"]
+            assert res_blocks[0]["content"][0]["text"].startswith(
+                "Nothing ran: the user sent a new message"
+            )
+            assert res_blocks[1]["is_error"] is True
+            assert (
+                "Skipped: the user sent a new message"
+                in res_blocks[1]["content"][0]["text"]
+            )
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        (
+                            "message_start",
+                            {
+                                "type": "message_start",
+                                "message": {"id": "m2", "model": "claude-sonnet-4-6"},
+                            },
+                        ),
+                        (
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text"},
+                            },
+                        ),
+                        (
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": "Steer handled.",
+                                },
+                            },
+                        ),
+                        (
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": 0},
+                        ),
+                        (
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "end_turn"},
+                            },
+                        ),
+                        ("message_stop", {"type": "message_stop"}),
+                    ]
+                ),
+            )
+
+        @tool("probe_a", "A", {})
+        async def probe_a(_args):
+            tool_runs.append("a")
+            session.enqueue_prompt("steer now", mode="steer")
+            steered = await session.consume_steer_message()
+            assert steered is not None
+            return steered
+
+        @tool("probe_b", "B", {})
+        async def probe_b(_args):
+            tool_runs.append("b")
+            return {"content": [{"type": "text", "text": "b ran"}]}
+
+        try:
+            backend = AnthropicBackend(http_client_factory=_client_factory(handler))
+            session._turn_selection = ("anthropic", "claude-sonnet-4-6", None)
+            events = [
+                e
+                async for e in backend.run_turn(
+                    "go",
+                    system_prompt="Sys",
+                    tools=[probe_a, probe_b],
+                    workspace_path=tmp_path,
+                    model="claude-sonnet-4-6",
+                    effort=None,
+                    auth=ProviderAuth.interactive(
+                        "anthropic", "api_key", "sk-ant-steer"
+                    ),
+                )
+            ]
+            assert tool_runs == ["a"]
+            assert [e.text for e in events if isinstance(e, TextBlockDone)] == [
+                "Steer handled."
+            ]
+
+            # Discovery 401 surfaces in Runtime.auth_public().
+            bad_google = GoogleBackend(
+                http_client_factory=_client_factory(
+                    lambda _r: httpx.Response(
+                        401, json=[{"error": {"message": "API key expired"}}]
+                    )
+                )
+            )
+            rt = Runtime(
+                session,
+                backends={
+                    "anthropic": AnthropicBackend(),
+                    "openai": OpenAIBackend(),
+                    "google": bad_google,
+                },
+            )
+            pub = await rt.authenticate("google", "api_key", "AIza-expired")
+            assert pub["providers"]["google"]["error"] == "API key expired"
+        finally:
             runtime.shutdown()
