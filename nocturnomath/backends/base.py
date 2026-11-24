@@ -8,8 +8,8 @@ import os
 import signal
 import sys
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -367,6 +367,12 @@ class JsonMessageStream:
         """Discard notifications buffered before the current phase begins."""
         self._buffered.clear()
 
+    def drain_buffered(self) -> list[dict[str, Any]]:
+        """Pop and return all currently buffered notifications in FIFO order."""
+        items = list(self._buffered)
+        self._buffered.clear()
+        return items
+
     def _pop_raw_object(self) -> dict[str, Any] | None:
         while True:
             newline = self._raw.find(b"\n")
@@ -421,3 +427,109 @@ class JsonMessageStream:
         if item is None:
             raise StopAsyncIteration
         return item
+
+
+def resolve_cli_binary(
+    cached: Path | None,
+    candidates_fn: Callable[[], list[Path]],
+    missing_message: str,
+) -> Path:
+    """Return a cached usable CLI binary or resolve the first candidate on PATH."""
+    if cached is not None and is_usable_cli_binary(cached):
+        return cached
+    candidates = candidates_fn()
+    if not candidates:
+        raise RuntimeError(missing_message)
+    return candidates[0]
+
+
+async def write_json_line(
+    proc: asyncio.subprocess.Process, payload: dict[str, Any], label: str
+) -> None:
+    """Write one newline-delimited JSON object to a subprocess's stdin."""
+    if proc.stdin is None:
+        raise RuntimeError(f"{label} stdin is not open.")
+    proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+    await proc.stdin.drain()
+
+
+@asynccontextmanager
+async def managed_subprocess(
+    *cmd: str,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AsyncIterator[tuple[asyncio.subprocess.Process, StderrCollector]]:
+    """Spawn a piped subprocess in its own POSIX session and always terminate it."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
+    stderr = StderrCollector(proc.stderr)
+    try:
+        yield proc, stderr
+    finally:
+        await terminate_process(proc, stderr)
+
+
+class JsonRpcClient:
+    """Minimal newline-delimited JSON-RPC 2.0 client over subprocess stdio."""
+
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        messages: JsonMessageStream,
+        stderr: StderrCollector | None,
+        *,
+        label: str,
+        on_request: Callable[[dict[str, Any]], Awaitable[None]],
+        next_id: Callable[[], int] | None = None,
+    ):
+        self.proc = proc
+        self.messages = messages
+        self.stderr = stderr
+        self.label = label
+        self._on_request = on_request
+        self._counter = 0
+        self._next_id_fn = next_id
+
+    def next_id(self) -> int:
+        if self._next_id_fn is not None:
+            return self._next_id_fn()
+        self._counter += 1
+        return self._counter
+
+    async def send(self, payload: dict[str, Any]) -> None:
+        await write_json_line(self.proc, payload, self.label)
+
+    async def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        req_id = self.next_id()
+        try:
+            await self.send(
+                {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+            )
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            detail = await self.stderr.text() if self.stderr is not None else ""
+            raise RuntimeError(
+                detail or f"{self.label} closed before replying to {method}."
+            ) from exc
+        while (msg := await self.messages.next_wire()) is not None:
+            if msg.get("id") is not None and "method" in msg:
+                await self._on_request(msg)
+                continue
+            if msg.get("id") == req_id:
+                if "error" in msg and msg["error"] is not None:
+                    err = msg["error"]
+                    text = err.get("message") if isinstance(err, dict) else str(err)
+                    raise RuntimeError(text or f"{self.label} {method} failed.")
+                return msg.get("result") or {}
+            if msg.get("id") is None:
+                self.messages.buffer_notification(msg)
+        detail = await self.stderr.text() if self.stderr is not None else ""
+        raise RuntimeError(
+            detail or f"{self.label} closed before replying to {method}."
+        )
