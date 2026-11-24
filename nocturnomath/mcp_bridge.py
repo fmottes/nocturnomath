@@ -16,9 +16,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
-from .tools import ToolSpec, validate_tool_arguments
+if TYPE_CHECKING:
+    from .tools import ToolSpec
 
 logger = logging.getLogger("nocturnomath.mcp_bridge")
 
@@ -44,6 +45,12 @@ def _jsonrpc_error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
         "id": msg_id,
         "error": {"code": code, "message": message},
     }
+
+
+def _tool_error_result(msg_id: Any, message: str) -> dict[str, Any]:
+    return _jsonrpc_result(
+        msg_id, {"content": [{"type": "text", "text": message}], "isError": True}
+    )
 
 
 def _is_rpc_id(value: Any) -> bool:
@@ -228,6 +235,7 @@ class McpToolBridge:
                     if valid_id is not None:
                         in_flight_by_id[valid_id] = req_task
                     req_task.add_done_callback(in_flight.discard)
+                    req_task.add_done_callback(already_cancelled.discard)
                 if in_flight:
                     done, _ = await asyncio.wait(list(in_flight))
                     _drain_done_tasks(done)
@@ -240,16 +248,17 @@ class McpToolBridge:
         except Exception as exc:
             logger.debug("MCP bridge client closed with error: %s", exc)
         finally:
+            if task is not None:
+                self._client_tasks.discard(task)
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
-            if task is not None:
-                self._client_tasks.discard(task)
 
     @staticmethod
     async def _iter_lines(reader: asyncio.StreamReader) -> AsyncIterator[str]:
         """Yield complete lines of any size without a 64 KiB StreamReader limit."""
         buffer = bytearray()
+        search_from = 0
         while True:
             chunk = await reader.read(65536)
             if not chunk:
@@ -257,13 +266,17 @@ class McpToolBridge:
                     yield buffer.decode("utf-8", errors="replace").strip()
                 break
             buffer.extend(chunk)
+            start = 0
             while True:
-                newline = buffer.find(b"\n")
+                newline = buffer.find(b"\n", search_from)
                 if newline == -1:
                     break
-                line = bytes(buffer[:newline])
-                del buffer[: newline + 1]
-                yield line.decode("utf-8", errors="replace").strip()
+                yield buffer[start:newline].decode("utf-8", errors="replace").strip()
+                start = newline + 1
+                search_from = start
+            if start:
+                del buffer[:start]
+            search_from = len(buffer)
 
     async def _dispatch(
         self,
@@ -333,16 +346,12 @@ class McpToolBridge:
                 return _jsonrpc_error(
                     msg_id, -32602, "Tool arguments must be an object"
                 )
+            from .tools import validate_tool_arguments
+
             try:
                 arguments = validate_tool_arguments(spec.input_schema, arguments)
             except ValueError as exc:
-                return _jsonrpc_result(
-                    msg_id,
-                    {
-                        "content": [{"type": "text", "text": str(exc)}],
-                        "isError": True,
-                    },
-                )
+                return _tool_error_result(msg_id, str(exc))
             meta = params.get("_meta")
             progress_token = (
                 meta.get("progressToken") if isinstance(meta, dict) else None
@@ -375,13 +384,7 @@ class McpToolBridge:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return _jsonrpc_result(
-                    msg_id,
-                    {
-                        "content": [{"type": "text", "text": str(exc)}],
-                        "isError": True,
-                    },
-                )
+                return _tool_error_result(msg_id, str(exc))
             finally:
                 if progress_task is not None:
                     progress_task.cancel()
@@ -399,13 +402,11 @@ class McpToolBridge:
 
 def main() -> None:
     """Forward newline-delimited JSON-RPC between stdio and the parent bridge."""
-    if len(sys.argv) > 1:
-        info = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-        port = int(info["port"])
-        token = str(info["token"])
-    else:
-        port = int(os.environ["NOCTURNOMATH_MCP_PORT"])
-        token = os.environ["NOCTURNOMATH_MCP_TOKEN"]
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python -m nocturnomath.mcp_bridge <auth-file>")
+    info = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    port = int(info["port"])
+    token = str(info["token"])
 
     with socket.create_connection(("127.0.0.1", port)) as sock:
         sock.sendall((json.dumps({"auth": token}) + "\n").encode("utf-8"))
@@ -421,22 +422,18 @@ def main() -> None:
             except OSError:
                 pass
             finally:
-                try:
+                with suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
 
         stdin_thread = threading.Thread(target=pump_stdin, daemon=True)
         stdin_thread.start()
-        try:
-            while True:
-                line = reader.readline()
-                if not line:
-                    break
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
-        finally:
-            stdin_thread.join(timeout=1.0)
+        while True:
+            line = reader.readline()
+            if not line:
+                break
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+    stdin_thread.join(timeout=0.05)
 
 
 if __name__ == "__main__":
