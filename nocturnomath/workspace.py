@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,9 @@ class Workspace:
             directory.mkdir(parents=True, exist_ok=True)
 
         self.notes = ResearchNotes(self.kb_path)
+        self._session_summary_cache: dict[
+            Path, tuple[int, int, dict[str, Any] | None]
+        ] = {}
         self.start_new_transcript()
 
     def read_config(self) -> dict[str, Any]:
@@ -56,7 +60,7 @@ class Workspace:
     def update_config(self, **fields):
         data = self.read_config()
         data.update(fields)
-        self.config_path.write_text(json.dumps(data, indent=2) + "\n")
+        write_text(self.config_path, json.dumps(data, indent=2) + "\n")
 
     def start_new_transcript(self):
         numbers = [
@@ -140,6 +144,52 @@ class Workspace:
             + "\n---\n\n"
         )
 
+    def probe_path(self, probe_id: str) -> Path:
+        """Resolve a persisted probe or retry directory such as ``S001/P001``."""
+        match = re.fullmatch(r"(S\d{3,})/(P\d{3,})(?:/(A\d{3,}))?", probe_id)
+        if not match:
+            raise ValueError("probe_id must look like S001/P001 or S001/P001/A002.")
+        session_id, probe_name, attempt = match.groups()
+        path = self.sessions_path / session_id / "probes" / probe_name
+        if attempt:
+            path = path / attempt
+        if not path.resolve().is_relative_to(self.sessions_path.resolve()):
+            raise ValueError("Probe path outside workspace")
+        return path
+
+    @staticmethod
+    def update_probe_meta(path: Path, **fields: Any) -> dict[str, Any]:
+        """Atomically merge ``fields`` into a probe's ``probe.json``."""
+        file = path / "probe.json"
+        metadata = json.loads(file.read_text())
+        metadata.update(fields)
+        write_text(file, json.dumps(metadata, indent=2) + "\n")
+        return metadata
+
+    def _write_probe_start(
+        self,
+        path: Path,
+        code: str,
+        expected: str,
+        model: str,
+        *,
+        retry_of: str | None = None,
+        **context: Any,
+    ) -> None:
+        write_text(path / "code.py", code)
+        metadata: dict[str, Any] = {"id": path.name}
+        if retry_of is not None:
+            metadata["retry_of"] = retry_of
+        metadata.update(
+            expected=expected,
+            **context,
+            model=model,
+            session=self.session_id,
+            started=time.time(),
+            status="started",
+        )
+        write_text(path / "probe.json", json.dumps(metadata, indent=2) + "\n")
+
     def start_probe(self, code: str, expected: str, model: str, **context) -> Path:
         self.ensure_session()
         numbers = [
@@ -155,23 +205,7 @@ class Workspace:
                 break
             except FileExistsError:
                 number += 1
-        write_text(path / "code.py", code)
-        write_text(
-            path / "probe.json",
-            json.dumps(
-                {
-                    "id": path.name,
-                    "expected": expected,
-                    **context,
-                    "model": model,
-                    "session": self.session_id,
-                    "started": time.time(),
-                    "status": "started",
-                },
-                indent=2,
-            )
-            + "\n",
-        )
+        self._write_probe_start(path, code, expected, model, **context)
         return path
 
     def retry_probe(
@@ -186,19 +220,23 @@ class Workspace:
         probe = self.probes_path / match.group(1)
         if not (probe / "probe.json").is_file():
             raise ValueError(f"Probe {probe_id} does not exist.")
-        if json.loads((probe / "probe.json").read_text()).get("backend") == "slurm":
+        probe_meta = json.loads((probe / "probe.json").read_text())
+        if probe_meta.get("backend") == "slurm":
             raise ValueError(
                 "A Slurm probe cannot run in the persistent kernel. "
                 "Correct the script and call submit_slurm for a new probe."
             )
         if not expected:
-            expected = json.loads((probe / "probe.json").read_text())["expected"]
+            expected = probe_meta["expected"]
         attempts = sorted(
             (path for path in probe.iterdir() if re.fullmatch(r"A\d{3,}", path.name)),
             key=lambda path: int(path.name[1:]),
         )
-        latest = attempts[-1] if attempts else probe
-        status = json.loads((latest / "probe.json").read_text())["status"]
+        status = (
+            json.loads((attempts[-1] / "probe.json").read_text())["status"]
+            if attempts
+            else probe_meta["status"]
+        )
         if status not in ("error", "failed"):
             raise ValueError(
                 f"Probe {probe_id} cannot be retried after status {status}."
@@ -206,37 +244,32 @@ class Workspace:
         number = int(attempts[-1].name[1:]) + 1 if attempts else 2
         path = probe / f"A{number:03d}"
         path.mkdir()
-        write_text(path / "code.py", code)
-        write_text(
-            path / "probe.json",
-            json.dumps(
-                {
-                    "id": path.name,
-                    "retry_of": probe_id,
-                    "expected": expected,
-                    **context,
-                    "model": model,
-                    "session": self.session_id,
-                    "started": time.time(),
-                    "status": "started",
-                },
-                indent=2,
-            )
-            + "\n",
+        self._write_probe_start(
+            path, code, expected, model, retry_of=probe_id, **context
         )
         return path
 
-    @staticmethod
+    @classmethod
     def finish_probe(
-        path: Path, output: str, images: list[bytes], status: str, note: str | None
-    ):
+        cls,
+        path: Path,
+        output: str,
+        images: list[bytes],
+        status: str,
+        note: str | None,
+        **extra_meta: Any,
+    ) -> dict[str, Any]:
         # The path is captured before execution; changing UI state cannot redirect a result.
         write_text(path / "output.txt", output)
         for index, image in enumerate(images, 1):
             (path / f"plot-{index}.png").write_bytes(image)
-        metadata = json.loads((path / "probe.json").read_text())
-        metadata.update(status=status, finished=time.time(), execution_note=note)
-        write_text(path / "probe.json", json.dumps(metadata, indent=2) + "\n")
+        return cls.update_probe_meta(
+            path,
+            status=status,
+            finished=time.time(),
+            execution_note=note,
+            **extra_meta,
+        )
 
     def evidence_sources(self, sources: list[str]) -> list[str]:
         """Accept only artifacts belonging to a persisted probe outcome."""
@@ -282,28 +315,35 @@ class Workspace:
     def list_documents_and_folders(self) -> tuple[list[dict[str, Any]], list[str]]:
         """Return Markdown documents and valid subfolders in one directory walk."""
         self.document_folder("")
-        documents = []
-        folders = []
-        for path in self.documents_path.rglob("*"):
-            name = path.relative_to(self.documents_path).as_posix()
-            if path.is_dir():
-                try:
-                    self.document_folder(name)
-                except ValueError:
+        documents: list[dict[str, Any]] = []
+        folders: list[str] = []
+        for root, dirnames, filenames in os.walk(
+            self.documents_path, followlinks=False
+        ):
+            root_path = Path(root)
+            rel_root = root_path.relative_to(self.documents_path).as_posix()
+            prefix = "" if rel_root == "." else f"{rel_root}/"
+            kept_dirs: list[str] = []
+            for dirname in dirnames:
+                dir_path = root_path / dirname
+                if not self._valid_document_part(dirname) or dir_path.is_symlink():
                     continue
-                folders.append(name)
-            elif path.name.endswith(".md"):
-                try:
-                    resolved = self.document_file(name)
-                except ValueError:
+                kept_dirs.append(dirname)
+                folders.append(f"{prefix}{dirname}")
+            dirnames[:] = kept_dirs
+            for filename in filenames:
+                if not filename.endswith(".md") or not self._valid_document_part(
+                    filename
+                ):
                     continue
-                if not resolved.is_file():
+                file_path = root_path / filename
+                if file_path.is_symlink() or not file_path.is_file():
                     continue
-                stat = resolved.stat()
+                stat = file_path.stat()
                 documents.append(
                     {
-                        "name": name,
-                        "path": str(resolved.relative_to(self.path)),
+                        "name": f"{prefix}{filename}",
+                        "path": str(file_path.relative_to(self.path)),
                         "size": stat.st_size,
                         "modified": stat.st_mtime,
                     }
@@ -323,6 +363,16 @@ class Workspace:
         _, folders = self.list_documents_and_folders()
         return folders
 
+    @staticmethod
+    def _valid_document_part(part: str) -> bool:
+        return (
+            bool(part)
+            and part == part.strip()
+            and not part.startswith(".")
+            and "\\" not in part
+            and "\0" not in part
+        )
+
     def document_folder(self, name: str) -> Path:
         if not isinstance(name, str):
             raise TypeError("Use a folder path under documents.")
@@ -331,14 +381,7 @@ class Workspace:
         if not name:
             return self.documents_path
         parts = name.split("/")
-        if any(
-            not part
-            or part != part.strip()
-            or part.startswith(".")
-            or "\\" in part
-            or "\0" in part
-            for part in parts
-        ):
+        if any(not self._valid_document_part(part) for part in parts):
             raise ValueError("Use a folder path under documents.")
         path = self.documents_path
         for part in parts:
@@ -359,13 +402,7 @@ class Workspace:
         ):
             raise ValueError("Use a document name such as report.md.")
         folder, _, filename = name.rpartition("/")
-        if (
-            not filename
-            or filename != filename.strip()
-            or filename.startswith(".")
-            or "\\" in filename
-            or "\0" in filename
-        ):
+        if not self._valid_document_part(filename):
             raise ValueError("Use a document name such as report.md.")
         path = self.document_folder(folder) / filename
         if path.is_symlink():
@@ -429,12 +466,16 @@ class Workspace:
             raise FileNotFoundError(f"Document {name} not found")
         path.unlink()
 
-    def read_file(self, relative_path: str) -> dict[str, Any]:
+    def _workspace_file(self, relative_path: str, label: str) -> Path:
         target = (self.path / relative_path).resolve()
         if not target.is_relative_to(self.path):
-            raise ValueError("File path outside workspace")
-        if not target.exists() or not target.is_file():
-            raise FileNotFoundError(f"File {relative_path} not found")
+            raise ValueError(f"{label} path outside workspace")
+        if not target.is_file():
+            raise FileNotFoundError(f"{label} {relative_path} not found")
+        return target
+
+    def read_file(self, relative_path: str) -> dict[str, Any]:
+        target = self._workspace_file(relative_path, "File")
         content = target.read_text(encoding="utf-8", errors="replace")
         stat = target.stat()
         return {
@@ -446,12 +487,7 @@ class Workspace:
 
     def asset_file(self, relative_path: str) -> Path:
         """Return a workspace-local asset path for a rendered Markdown document."""
-        target = (self.path / relative_path).resolve()
-        if not target.is_relative_to(self.path):
-            raise ValueError("Asset path outside workspace")
-        if not target.is_file():
-            raise FileNotFoundError(f"Asset {relative_path} not found")
-        return target
+        return self._workspace_file(relative_path, "Asset")
 
     def list_plots(self) -> list[dict[str, Any]]:
         plots = []
@@ -499,9 +535,10 @@ class Workspace:
         return records
 
     @staticmethod
-    def _accepted_session_meta(
+    def session_meta(
         records: list[dict[str, Any]],
     ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Return ``(owner_provider, sdk_session_id, model, effort)`` from meta records."""
         owner_provider: str | None = None
         sdk_id: str | None = None
         sdk_id_allowed = True
@@ -525,20 +562,12 @@ class Workspace:
                     sdk_id_allowed = False
                     continue
                 owner_provider = rec_provider
-                if has_rebuilt or not has_sdk_id:
-                    sdk_id_allowed = False
-                elif sdk_id_allowed:
+            elif rec_provider is not None and rec_provider != owner_provider:
+                break
+            if sdk_id is None and sdk_id_allowed:
+                if not has_rebuilt and has_sdk_id:
                     sdk_id = raw_sdk_id
-                    sdk_id_allowed = False
-            else:
-                if rec_provider is not None and rec_provider != owner_provider:
-                    break
-                if sdk_id is None and sdk_id_allowed:
-                    if has_rebuilt or not has_sdk_id:
-                        sdk_id_allowed = False
-                    else:
-                        sdk_id = raw_sdk_id
-                        sdk_id_allowed = False
+                sdk_id_allowed = False
             if model is None:
                 candidate_model = record.get("raw_model") or record.get("model")
                 if isinstance(candidate_model, str) and candidate_model:
@@ -558,7 +587,7 @@ class Workspace:
         cls,
         records: list[dict[str, Any]],
     ) -> tuple[str | None, str | None]:
-        owner_provider, sdk_id, _, _ = cls._accepted_session_meta(records)
+        owner_provider, sdk_id, _, _ = cls.session_meta(records)
         if sdk_id is not None and owner_provider is not None:
             return owner_provider, sdk_id
         return None, None
@@ -572,47 +601,72 @@ class Workspace:
         cls,
         records: list[dict[str, Any]],
     ) -> tuple[str | None, str | None, str | None]:
-        owner_provider, _, model, effort = cls._accepted_session_meta(records)
+        owner_provider, _, model, effort = cls.session_meta(records)
         return owner_provider, model, effort
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        sessions = []
+        sessions: list[dict[str, Any]] = []
         if not self.sessions_path.exists():
+            self._session_summary_cache.clear()
             return sessions
+        seen_paths: set[Path] = set()
         for path in self.sessions_path.glob("S*/transcript.jsonl"):
-            records = self.read_transcript(path)
-            if not records:
+            try:
+                stat = path.stat()
+            except OSError:
                 continue
-            user_texts = [
-                record.get("text", "")
-                for record in records
-                if record.get("kind") == "user"
-            ]
-            if not user_texts:
-                continue
-            title = user_texts[0]
-            if len(title) > 120:
-                title = title[:120] + "…"
-            started = records[0].get("timestamp", path.stat().st_mtime)
-            sessions.append(
-                {
-                    "id": path.parent.name,
-                    "title": title,
-                    "started": started,
-                    "modified": path.stat().st_mtime,
-                    "turns": len(user_texts),
-                    "probes": sum(
-                        1
-                        for r in records
-                        if r.get("kind") == "probe_started" and not r.get("retry_of")
-                    ),
-                    "notes": sum(
-                        1 for r in records if r.get("kind") in ("evidence", "thought")
-                    ),
-                    "context_restorable": self.sdk_id(records) is not None,
-                    "is_current": path == self.transcript_path,
-                }
-            )
+            seen_paths.add(path)
+            cached = self._session_summary_cache.get(path)
+            if (
+                cached is not None
+                and cached[0] == stat.st_mtime_ns
+                and cached[1] == stat.st_size
+            ):
+                summary = cached[2]
+            else:
+                records = self.read_transcript(path)
+                first_user_text: str | None = None
+                turns = 0
+                probes = 0
+                notes = 0
+                for record in records:
+                    kind = record.get("kind")
+                    if kind == "user":
+                        if first_user_text is None:
+                            first_user_text = record.get("text", "")
+                        turns += 1
+                    elif kind == "probe_started" and not record.get("retry_of"):
+                        probes += 1
+                    elif kind in ("evidence", "thought"):
+                        notes += 1
+                if first_user_text is None:
+                    summary = None
+                else:
+                    title = (
+                        first_user_text[:120] + "…"
+                        if len(first_user_text) > 120
+                        else first_user_text
+                    )
+                    summary = {
+                        "id": path.parent.name,
+                        "title": title,
+                        "started": records[0].get("timestamp", stat.st_mtime),
+                        "modified": stat.st_mtime,
+                        "turns": turns,
+                        "probes": probes,
+                        "notes": notes,
+                        "context_restorable": self.sdk_id(records) is not None,
+                    }
+                self._session_summary_cache[path] = (
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                    summary,
+                )
+            if summary is not None:
+                sessions.append({**summary, "is_current": path == self.transcript_path})
+        for stale in list(self._session_summary_cache):
+            if stale not in seen_paths:
+                del self._session_summary_cache[stale]
         sessions.sort(key=lambda item: item["modified"], reverse=True)
         return sessions
 
@@ -654,6 +708,24 @@ class Workspace:
             cells.append(cell)
             return cell
 
+        def code_cell(
+            source: str,
+            *,
+            count: int | None,
+            outputs: list[dict[str, Any]],
+            **metadata: Any,
+        ) -> None:
+            cells.append(
+                {
+                    "cell_type": "code",
+                    "execution_count": count,
+                    "id": f"cell-{len(cells) + 1}",
+                    "metadata": {"nocturnomath": {"kind": "probe_code", **metadata}},
+                    "outputs": outputs,
+                    "source": source,
+                }
+            )
+
         def flush_agent():
             nonlocal idea
             if not pending_agent:
@@ -665,25 +737,14 @@ class Workspace:
 
         def slurm_cells(probe_id: str, code: str, outcome: dict[str, Any]):
             commented = "\n".join(f"# {line}" for line in code.splitlines())
-            cells.append(
-                {
-                    "cell_type": "code",
-                    "execution_count": None,
-                    "id": f"cell-{len(cells) + 1}",
-                    "metadata": {
-                        "nocturnomath": {
-                            "kind": "probe_code",
-                            "backend": "slurm",
-                            "probe_id": probe_id,
-                            "status": outcome.get("status", "no recorded outcome"),
-                        }
-                    },
-                    "outputs": [],
-                    "source": (
-                        "# Slurm probe saved for inspection; Run All does not rerun it.\n"
-                        + commented
-                    ),
-                }
+            code_cell(
+                "# Slurm probe saved for inspection; Run All does not rerun it.\n"
+                + commented,
+                count=None,
+                outputs=[],
+                backend="slurm",
+                probe_id=probe_id,
+                status=outcome.get("status", "no recorded outcome"),
             )
             if not outcome:
                 markdown(
@@ -752,26 +813,17 @@ class Workspace:
                     continue
                 outputs = self._notebook_outputs(outcome)
                 execution_count += 1
-                cells.append(
-                    {
-                        "cell_type": "code",
-                        "execution_count": execution_count,
-                        "id": f"cell-{len(cells) + 1}",
-                        "metadata": {
-                            "nocturnomath": {
-                                "kind": "probe_code",
-                                "probe_id": probe_id,
-                                "status": outcome.get("status")
-                                or (
-                                    "completed"
-                                    if outcome.get("kind") == "run"
-                                    else "no recorded outcome"
-                                ),
-                            }
-                        },
-                        "outputs": outputs,
-                        "source": record.get("code", ""),
-                    }
+                code_cell(
+                    record.get("code", ""),
+                    count=execution_count,
+                    outputs=outputs,
+                    probe_id=probe_id,
+                    status=outcome.get("status")
+                    or (
+                        "completed"
+                        if outcome.get("kind") == "run"
+                        else "no recorded outcome"
+                    ),
                 )
             elif (
                 kind == "run"
