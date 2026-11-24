@@ -105,43 +105,19 @@ class ExplorationSession:
         self._compaction_reserved = False
         self.status = "idle"
         self._current_task: asyncio.Task | None = None
-        self._pending_idle_emit = False
         self._query_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_operation_lock = asyncio.Lock()
-        self._session_initialized = False
-        self._results_since_note = 0
-        self._pending_verdict: str | None = None
-        self._pending_verdict_probe_id: str | None = None
         self._slurm_review_probe_id: str | None = None
-        self._active_provider: ProviderId | None = None
-        self._owner_provider: ProviderId | None = None
-        self._active_model: str | None = None
-        self._active_raw_model: str | None = None
-        self._active_effort: str | None = None
-        self._sdk_session_id: str | None = None
-        self._resume_prefix: str | None = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
         self._kernel_notice = ""
         self._pending_kernel_start: tuple[str, str] | None = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts: list[PendingPrompt] = []
         self._interrupt_epoch = 0
-        self._turn_model: str | None = None
-        self._turn_selection: tuple[ProviderId, str, str | None] | None = None
-        self._bound_turn: BoundTurnConfig | None = None
         self._last_pending_task: asyncio.Task[Any] | None = None
         self._commit_turn_accepted: Callable[[], None] | None = None
         self._draining_queries = False
-        self._pending_user_logs: list[str] | None = None
-        self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
-        self._sent_documents: dict[str, str] = {}
+        self._reset_conversation_state()
 
         self.environment = ResearchEnvironment(workspace_path, python)
         self.kernel = Kernel(cwd=workspace_path, environment=self.environment)
@@ -285,6 +261,33 @@ class ExplorationSession:
             "Treat this current copy as authoritative:\n\n"
         )
 
+    def _reset_conversation_state(self) -> None:
+        self._session_initialized = False
+        self._active_provider: ProviderId | None = None
+        self._owner_provider: ProviderId | None = None
+        self._active_model: str | None = None
+        self._active_raw_model: str | None = None
+        self._active_effort: str | None = None
+        self._sdk_session_id: str | None = None
+        self._resume_prefix: str | None = None
+        self._needs_recap = False
+        self._recap_allow_preserved_kernel = False
+        self._kernel_interrupt_requested = False
+        self._results_since_note = 0
+        self._pending_verdict: str | None = None
+        self._pending_verdict_probe_id: str | None = None
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
+        self._pending_prompts: list[PendingPrompt] = []
+        self._turn_model: str | None = None
+        self._turn_selection: tuple[ProviderId, str, str | None] | None = None
+        self._bound_turn: BoundTurnConfig | None = None
+        self._pending_user_logs: list[str] | None = None
+        self._pending_idle_emit = False
+        self.context_usage: dict[str, Any] | None = None
+        self._sent_documents: dict[str, str] = {}
+
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
         self._owner_provider = None
@@ -310,30 +313,7 @@ class ExplorationSession:
         self.kernel = kernel
         self.kernel.on_start = self.record_kernel_start
         self.record_kernel_start("workspace changed")
-        self._session_initialized = False
-        self._active_provider = None
-        self._owner_provider = None
-        self._active_model = None
-        self._active_raw_model = None
-        self._active_effort = None
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
-        self._results_since_note = 0
-        self._pending_verdict = None
-        self._pending_verdict_probe_id = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
-        self.context_usage = None
+        self._reset_conversation_state()
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
 
@@ -356,14 +336,19 @@ class ExplorationSession:
             else {}
         )
 
-    def list_documents(self) -> list[dict[str, Any]]:
-        """Documents with their inclusion flag; unseen files take the default."""
+    def documents_and_folders(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Documents (with inclusion flags) and subfolders in one directory walk."""
         self.refresh_document_settings()
-        documents = self.workspace.list_documents()
+        documents, folders = self.workspace.list_documents_and_folders()
         for document in documents:
             document["included"] = self.document_choices.get(
                 document["name"], self.documents_default
             )
+        return documents, folders
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        """Documents with their inclusion flag; unseen files take the default."""
+        documents, _ = self.documents_and_folders()
         return documents
 
     def set_document_included(self, name: str, included: bool) -> bool:
@@ -748,36 +733,19 @@ class ExplorationSession:
             and saved_provider in self.backends
             and (resolved_owner is None or saved_provider == resolved_owner)
         )
+        self._reset_conversation_state()
         if can_restore_native:
             self._active_provider = saved_provider
             self._sdk_session_id = sdk_id
-            self._resume_prefix = None
-            self._needs_recap = False
-            self._recap_allow_preserved_kernel = False
         else:
-            self._active_provider = None
-            self._sdk_session_id = None
             self._resume_prefix = self.workspace.recap(records)
             self._needs_recap = True
-            self._recap_allow_preserved_kernel = False
         self._owner_provider = resolved_owner
         self._active_model = saved_model
         self._active_raw_model = (
             self.raw_model_id(saved_model) if saved_model is not None else None
         )
         self._active_effort = saved_effort
-
-        self._sent_documents = {}
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._results_since_note = 0
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
         self._restore_pending_verdict(records)
         latest_ctx_record = (
             next(
@@ -794,7 +762,6 @@ class ExplorationSession:
         self.context_usage = (
             latest_ctx_record if isinstance(latest_ctx_record, dict) else None
         )
-        self._session_initialized = False
 
         if restore_kernel:
             probe_word = "probe" if replayed == 1 else "probes"
@@ -858,6 +825,36 @@ class ExplorationSession:
         self.log_transcript("compaction", record_reloaded=record_reloaded)
         await self.emit("context_compacted", record_reloaded=record_reloaded)
 
+    async def _invalidate_native_session(
+        self,
+        provider: ProviderId,
+        stale_id: str | None,
+        prior_records: list[dict[str, Any]],
+    ) -> None:
+        self._sdk_session_id = None
+        self._active_provider = None
+        self._owner_provider = provider
+        self._sent_documents = {}
+        self.context_usage = None
+        self._session_initialized = False
+        self._needs_recap = True
+        self._recap_allow_preserved_kernel = True
+        self._resume_prefix = (
+            self.workspace.recap(
+                prior_records, kernel_preserved=not self._kernel_notice
+            )
+            if prior_records
+            else None
+        )
+        self.log_transcript(
+            "meta",
+            context_rebuilt=True,
+            provider=provider,
+            stale_sdk_session_id=stale_id,
+            context_usage=None,
+        )
+        await self.emit("context_usage_changed", context_usage=None)
+
     async def compact(self):
         reserved = self._compaction_reserved
         self._compaction_reserved = False
@@ -890,31 +887,9 @@ class ExplorationSession:
                     resume_session_id=self._sdk_session_id,
                 )
             except SessionResumeError as exc:
-                prior_records = self.workspace.current_records()
-                stale_id = self._sdk_session_id
-                self._sdk_session_id = None
-                self._active_provider = None
-                self._owner_provider = provider
-                self._sent_documents = {}
-                self.context_usage = None
-                self._session_initialized = False
-                self._needs_recap = True
-                self._recap_allow_preserved_kernel = True
-                self._resume_prefix = (
-                    self.workspace.recap(
-                        prior_records, kernel_preserved=not self._kernel_notice
-                    )
-                    if prior_records
-                    else None
+                await self._invalidate_native_session(
+                    provider, self._sdk_session_id, self.workspace.current_records()
                 )
-                self.log_transcript(
-                    "meta",
-                    context_rebuilt=True,
-                    provider=provider,
-                    stale_sdk_session_id=stale_id,
-                    context_usage=None,
-                )
-                await self.emit("context_usage_changed", context_usage=None)
                 raise RuntimeError(
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
                 ) from exc
@@ -1335,32 +1310,12 @@ class ExplorationSession:
                             resume_id,
                             exc,
                         )
-                        self._sdk_session_id = None
-                        self._active_provider = None
-                        self._owner_provider = provider
-                        self._sent_documents = {}
-                        self.context_usage = None
-                        self._session_initialized = False
-                        self.log_transcript(
-                            "meta",
-                            context_rebuilt=True,
-                            provider=provider,
-                            stale_sdk_session_id=resume_id,
-                            context_usage=None,
+                        await self._invalidate_native_session(
+                            provider, resume_id, prior_records
                         )
-                        await self.emit("context_usage_changed", context_usage=None)
                         await self.emit(
                             "system_message",
                             text="Original provider session was unavailable; rebuilt context from the saved transcript.",
-                        )
-                        self._needs_recap = True
-                        self._recap_allow_preserved_kernel = True
-                        self._resume_prefix = (
-                            self.workspace.recap(
-                                prior_records, kernel_preserved=not self._kernel_notice
-                            )
-                            if prior_records
-                            else None
                         )
                         turn_resume_prefix = self._resume_prefix
                         base_sent_documents = {}
@@ -1465,31 +1420,7 @@ class ExplorationSession:
         except Exception:
             self.workspace.restore_session_state(previous_state)
             raise
-        self._session_initialized = False
-        self._active_provider = None
-        self._owner_provider = None
-        self._active_model = None
-        self._active_raw_model = None
-        self._active_effort = None
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
-        self._sent_documents = {}
-        self._results_since_note = 0
-        self._pending_verdict = None
-        self._pending_verdict_probe_id = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
-        self.context_usage = None
+        self._reset_conversation_state()
         self.model = self.default_model
         self.effort = self.default_effort
 

@@ -23,6 +23,15 @@ THOUGHTS_PATH = ".nocturnomath/kb/thoughts.md"
 SLURM_POLL_SECONDS = 30
 
 
+async def _run_shielded_thread(operation, *args):
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 class Runtime:
     """Own the optional workspace and publish its events to any interface."""
 
@@ -492,37 +501,18 @@ class Runtime:
             logger.exception("Slurm review failed for %s", probe_id)
             await session.emit("error", message=f"Review of {probe_id} failed: {exc}")
         finally:
-            current = asyncio.current_task()
             session._bound_turn = None
             session._slurm_review_probe_id = None
-            if session._current_task is current:
-                session._current_task = None
-            if session._pending_prompts:
-                if (
-                    self._started
-                    and not review_failed
-                    and not self.changing
-                    and session._current_task is None
-                ):
-                    with self._agents_lock:
-                        agent_id = next(
-                            (
-                                aid
-                                for aid, candidate in self.agents.items()
-                                if candidate is session
-                            ),
-                            None,
-                        )
-                    session._current_task = asyncio.create_task(
-                        self._drain_pending_queries(session, agent_id)
-                    )
-                elif review_failed or not self._started or self.changing:
-                    await session.clear_pending_prompts()
-            need_idle = session._pending_idle_emit or session.status != "idle"
-            if not session._is_busy and session._current_task is None:
-                session._pending_idle_emit = False
-                if need_idle:
-                    await session.emit("status_change", status="idle")
+            with self._agents_lock:
+                agent_id = next(
+                    (
+                        aid
+                        for aid, candidate in self.agents.items()
+                        if candidate is session
+                    ),
+                    None,
+                )
+            await self._finish_session_task(session, agent_id, failed=review_failed)
             if key in self._slurm_review_attempts:
                 self._wake_slurm_monitor()
 
@@ -633,8 +623,7 @@ class Runtime:
                 self.effort = self._select_effort(self.model, self.effort)
                 if self.agents:
                     for session in list(self.agents.values()):
-                        session.model_providers = dict(self.model_providers)
-                        session.model_raw_ids = dict(self.model_raw_ids)
+                        self._sync_session_catalogue(session)
                     if self._workspace_defaults_pending:
                         self._apply_workspace_defaults()
                     else:
@@ -697,6 +686,19 @@ class Runtime:
         finally:
             self._discovering_models = max(0, self._discovering_models - 1)
         self._wake_slurm_monitor()
+
+    def _sync_session_catalogue(self, session: ExplorationSession) -> None:
+        session.model_providers = dict(self.model_providers)
+        session.model_raw_ids = dict(self.model_raw_ids)
+
+    def catalogue_payload(self) -> dict[str, Any]:
+        return {
+            "models": self.models,
+            "model_labels": self.model_labels,
+            "model_providers": self.model_providers,
+            "model_raw_ids": self.model_raw_ids,
+            "model_efforts": self.model_efforts,
+        }
 
     def resolve_model(
         self, preferred: str | None, preferred_provider: ProviderId | None = None
@@ -931,6 +933,12 @@ class Runtime:
             self._unsubscribe_agent(agent_id)
             self.agents[agent_id].shutdown()
 
+    def _clear_slurm_state(self) -> None:
+        self._slurm_seen.clear()
+        self._slurm_review_attempts.clear()
+        self._slurm_waiting_notices.clear()
+        self._closed_session_meta_cache.clear()
+
     def open_workspace(self, path: Path | str, python=None) -> ExplorationSession:
         """Open an existing directory, creating runtime state only after validation."""
         if self.agents:
@@ -945,10 +953,7 @@ class Runtime:
         if len(self.agents) == 1:
             session = self.require_session()
             session.set_workspace(target, python)
-            self._slurm_seen.clear()
-            self._slurm_review_attempts.clear()
-            self._slurm_waiting_notices.clear()
-            self._closed_session_meta_cache.clear()
+            self._clear_slurm_state()
             self._workspace_defaults_pending = True
             if self.models or self._models_discovered:
                 self._apply_workspace_defaults()
@@ -972,12 +977,8 @@ class Runtime:
             for agent_id in list(self.agents):
                 self._unsubscribe_agent(agent_id)
             self.agents.clear()
-            self._slurm_seen.clear()
-            self._slurm_review_attempts.clear()
-            self._slurm_waiting_notices.clear()
-            self._closed_session_meta_cache.clear()
-            new_session.model_providers = dict(self.model_providers)
-            new_session.model_raw_ids = dict(self.model_raw_ids)
+            self._clear_slurm_state()
+            self._sync_session_catalogue(new_session)
             agent_id = self._new_agent_id()
             self.agents[agent_id] = new_session
             self.primary_agent_id = agent_id
@@ -1081,8 +1082,7 @@ class Runtime:
             except Exception:
                 session.shutdown()
                 raise
-        session.model_providers = dict(self.model_providers)
-        session.model_raw_ids = dict(self.model_raw_ids)
+        self._sync_session_catalogue(session)
         agent_id = self._new_agent_id()
         with self._agents_lock:
             self.agents[agent_id] = session
@@ -1142,8 +1142,7 @@ class Runtime:
         with self._agents_lock:
             created_session = self.agents.get(agent_id)
             if created_session is not None:
-                created_session.model_providers = dict(self.model_providers)
-                created_session.model_raw_ids = dict(self.model_raw_ids)
+                self._sync_session_catalogue(created_session)
         return agent_id
 
     def get_agent(self, agent_id: str | None = None) -> ExplorationSession:
@@ -1158,6 +1157,7 @@ class Runtime:
         self, agent_id: str, *, include_changing: bool = True
     ) -> dict[str, Any]:
         session = self.get_agent(agent_id)
+        documents, folders = session.documents_and_folders()
         return {
             "agent_id": agent_id,
             "session_id": None
@@ -1174,8 +1174,8 @@ class Runtime:
             or (include_changing and agent_id in self._changing_agents),
             "status": session.status,
             "pending_prompts": session.pending_prompts_snapshot(),
-            "documents": session.list_documents(),
-            "folders": session.workspace.list_document_folders(),
+            "documents": documents,
+            "folders": folders,
             "documents_default": session.documents_default,
         }
 
@@ -1241,8 +1241,7 @@ class Runtime:
                 replacement.shutdown()
                 raise
             with self._agents_lock:
-                replacement.model_providers = dict(self.model_providers)
-                replacement.model_raw_ids = dict(self.model_raw_ids)
+                self._sync_session_catalogue(replacement)
                 if self.models or self._models_discovered:
                     default_model, default_effort, default_provider = (
                         self._workspace_defaults(replacement)
@@ -1283,17 +1282,14 @@ class Runtime:
         """Describe the current workspace for a client that just connected."""
         session = self.session
         auth_public = self.auth_public()
+        catalogue = self.catalogue_payload()
         if session is None:
             return {
                 "is_open": False,
                 "path": None,
                 "model": self.model,
                 "effort": self.effort,
-                "models": self.models,
-                "model_labels": self.model_labels,
-                "model_providers": self.model_providers,
-                "model_raw_ids": self.model_raw_ids,
-                "model_efforts": self.model_efforts,
+                **catalogue,
                 "session_defaults": None,
                 "prompt_mode": DEFAULT_PROMPT_MODE,
                 "evidence_path": EVIDENCE_PATH,
@@ -1308,6 +1304,7 @@ class Runtime:
             for agent_id in list(self.agents):
                 with suppress(ValueError):
                     agents.append(self.agent_snapshot(agent_id))
+        documents, folders = session.documents_and_folders()
         return {
             "is_open": True,
             "path": str(session.workspace_path),
@@ -1323,11 +1320,7 @@ class Runtime:
             },
             "model": session.model,
             "effort": session.effort,
-            "models": self.models,
-            "model_labels": self.model_labels,
-            "model_providers": self.model_providers,
-            "model_raw_ids": self.model_raw_ids,
-            "model_efforts": self.model_efforts,
+            **catalogue,
             "session_defaults": {
                 "model": session.default_model,
                 "effort": session.default_effort,
@@ -1342,8 +1335,8 @@ class Runtime:
             "kernel_busy": session.kernel.busy,
             "is_busy": session.has_active_query(),
             "context_usage": session.context_usage,
-            "documents": session.list_documents(),
-            "folders": session.workspace.list_document_folders(),
+            "documents": documents,
+            "folders": folders,
             "documents_default": session.documents_default,
             "plots": session.list_plots(),
             "agents": agents,
@@ -1384,12 +1377,8 @@ class Runtime:
             )
         self.require_all_idle("change kernel or workspace")
         self.changing = True
-        task = asyncio.create_task(asyncio.to_thread(operation, *args))
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+            return await _run_shielded_thread(operation, *args)
         finally:
             self.changing = False
             self._wake_slurm_monitor()
@@ -1403,12 +1392,8 @@ class Runtime:
             raise RuntimeError("This explorer is already changing. Please wait.")
         self.get_agent(agent_id).require_idle("change this explorer")
         self._changing_agents.add(agent_id)
-        task = asyncio.create_task(asyncio.to_thread(operation, *args))
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+            return await _run_shielded_thread(operation, *args)
         finally:
             self._changing_agents.discard(agent_id)
             self._wake_slurm_monitor()
@@ -1496,6 +1481,30 @@ class Runtime:
                     pending_prompts=other.pending_prompts_snapshot(),
                 )
         return resolved
+
+    def set_documents_default(
+        self, enabled: bool, agent_id: str | None = None
+    ) -> ExplorationSession:
+        """Persist workspace document default and sync open sibling explorers."""
+        session = self.get_agent(agent_id)
+        session.set_documents_default(enabled)
+        for other in list(self.agents.values()):
+            if other is not session and other.workspace_path == session.workspace_path:
+                other.documents_default = session.documents_default
+                other.document_choices = {}
+        return session
+
+    def delete_document(
+        self, name: str, agent_id: str | None = None
+    ) -> ExplorationSession:
+        """Delete a workspace document and clear it from open sibling explorers."""
+        session = self.get_agent(agent_id)
+        session.delete_document(name)
+        for other in list(self.agents.values()):
+            if other is not session and other.workspace_path == session.workspace_path:
+                other.document_choices.pop(name, None)
+                other._sent_documents.pop(name, None)
+        return session
 
     def _validate_query_model(
         self,
@@ -1773,29 +1782,38 @@ class Runtime:
                 payload["agent_id"] = agent_id
             await self.emit("error", payload)
         finally:
-            current = asyncio.current_task()
             session._bound_turn = None
             session._pending_user_logs = None
             session._draining_queries = False
-            if session._current_task is current:
-                session._current_task = None
-            if session._pending_prompts:
-                if (
-                    self._started
-                    and not failed
-                    and not self.changing
-                    and session._current_task is None
-                ):
-                    session._current_task = asyncio.create_task(
-                        self._drain_pending_queries(session, agent_id)
-                    )
-                else:
-                    await session.clear_pending_prompts()
-            need_idle = session._pending_idle_emit or session.status != "idle"
-            if not session._is_busy and session._current_task is None:
-                session._pending_idle_emit = False
-                if need_idle:
-                    await session.emit("status_change", status="idle")
+            await self._finish_session_task(session, agent_id, failed=failed)
+
+    async def _finish_session_task(
+        self,
+        session: ExplorationSession,
+        agent_id: str | None,
+        *,
+        failed: bool = False,
+    ) -> None:
+        current = asyncio.current_task()
+        if session._current_task is current:
+            session._current_task = None
+        if session._pending_prompts:
+            if (
+                self._started
+                and not failed
+                and not self.changing
+                and session._current_task is None
+            ):
+                session._current_task = asyncio.create_task(
+                    self._drain_pending_queries(session, agent_id)
+                )
+            elif failed or not self._started or self.changing:
+                await session.clear_pending_prompts()
+        need_idle = session._pending_idle_emit or session.status != "idle"
+        if not session._is_busy and session._current_task is None:
+            session._pending_idle_emit = False
+            if need_idle:
+                await session.emit("status_change", status="idle")
 
     async def _run_query(
         self, session: ExplorationSession, text: str, agent_id: str | None
