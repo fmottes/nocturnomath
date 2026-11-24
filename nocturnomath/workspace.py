@@ -279,42 +279,49 @@ class Workspace:
             )
         return links
 
-    def list_documents(self) -> list[dict[str, Any]]:
-        """Markdown documents kept as extra context under .nocturnomath/documents/."""
+    def list_documents_and_folders(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Return Markdown documents and valid subfolders in one directory walk."""
         self.document_folder("")
         documents = []
-        for path in self.documents_path.rglob("*.md"):
-            name = path.relative_to(self.documents_path).as_posix()
-            try:
-                path = self.document_file(name)
-            except ValueError:
-                continue
-            if not path.is_file():
-                continue
-            stat = path.stat()
-            documents.append(
-                {
-                    "name": name,
-                    "path": str(path.relative_to(self.path)),
-                    "size": stat.st_size,
-                    "modified": stat.st_mtime,
-                }
-            )
-        return sorted(documents, key=lambda document: document["name"].lower())
-
-    def list_document_folders(self) -> list[str]:
-        """Return valid subfolders, including empty ones."""
-        self.document_folder("")
         folders = []
         for path in self.documents_path.rglob("*"):
             name = path.relative_to(self.documents_path).as_posix()
-            try:
-                self.document_folder(name)
-            except ValueError:
-                continue
             if path.is_dir():
+                try:
+                    self.document_folder(name)
+                except ValueError:
+                    continue
                 folders.append(name)
-        return sorted(folders, key=str.lower)
+            elif path.name.endswith(".md"):
+                try:
+                    resolved = self.document_file(name)
+                except ValueError:
+                    continue
+                if not resolved.is_file():
+                    continue
+                stat = resolved.stat()
+                documents.append(
+                    {
+                        "name": name,
+                        "path": str(resolved.relative_to(self.path)),
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime,
+                    }
+                )
+        return (
+            sorted(documents, key=lambda document: document["name"].lower()),
+            sorted(folders, key=str.lower),
+        )
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        """Markdown documents kept as extra context under .nocturnomath/documents/."""
+        documents, _ = self.list_documents_and_folders()
+        return documents
+
+    def list_document_folders(self) -> list[str]:
+        """Return valid subfolders, including empty ones."""
+        _, folders = self.list_documents_and_folders()
+        return folders
 
     def document_folder(self, name: str) -> Path:
         if not isinstance(name, str):

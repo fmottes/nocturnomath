@@ -303,14 +303,17 @@ def record_verdict(workspace, probe_id, expected, text, current_transcript):
         return True
 
 
-def has_verdict(workspace, probe_id):
-    records = workspace.read_transcript(
-        workspace.transcript_file(probe_id.split("/")[0])
-    )
-    return any(
-        record.get("kind") == "verdict" and record.get("probe_id") == probe_id
+def _verdicted_probes(workspace, session_id):
+    records = workspace.read_transcript(workspace.transcript_file(session_id))
+    return {
+        record["probe_id"]
         for record in records
-    )
+        if record.get("kind") == "verdict" and record.get("probe_id")
+    }
+
+
+def has_verdict(workspace, probe_id):
+    return probe_id in _verdicted_probes(workspace, probe_id.split("/")[0])
 
 
 def needs_review(workspace, probe_id):
@@ -336,12 +339,17 @@ def set_review_pending(workspace, probe_id, pending):
 def clear_reviewed_pending(workspace, session_id):
     """Clear review_pending on verdicted probes of a session after a manual turn."""
     with _locked_workspace(workspace):
-        for job in list_jobs(workspace):
+        verdicts = None
+        for job, metadata in _list_jobs_with_meta(workspace):
             probe_id = job.get("probe_id", "")
             if not probe_id.startswith(f"{session_id}/"):
                 continue
-            probe, metadata = _probe(workspace, probe_id)
-            if metadata.get("review_pending") and has_verdict(workspace, probe_id):
+            if not metadata.get("review_pending"):
+                continue
+            if verdicts is None:
+                verdicts = _verdicted_probes(workspace, session_id)
+            if probe_id in verdicts:
+                probe, _ = _probe(workspace, probe_id)
                 _save_metadata(probe, review_pending=False)
 
 
@@ -530,29 +538,51 @@ def _check_locked(workspace, probe_id):
     return metadata, True
 
 
-def list_jobs(workspace):
-    """Return saved Slurm jobs, including jobs from earlier sessions."""
-    jobs = []
+def _list_jobs_with_meta(workspace):
+    entries = []
     for file in sorted(workspace.sessions_path.glob("S*/probes/P*/probe.json")):
         metadata = json.loads(file.read_text())
         if metadata.get("backend") == "slurm" and metadata.get("job_id"):
-            jobs.append(
-                {
-                    "probe_id": f"{file.parent.parent.parent.name}/{file.parent.name}",
-                    "job_id": metadata["job_id"],
-                    "status": metadata["status"],
-                    "slurm_state": metadata.get("slurm_state"),
-                    "correction_of": metadata.get("correction_of"),
-                }
+            entries.append(
+                (
+                    {
+                        "probe_id": f"{file.parent.parent.parent.name}/{file.parent.name}",
+                        "job_id": metadata["job_id"],
+                        "status": metadata["status"],
+                        "slurm_state": metadata.get("slurm_state"),
+                        "correction_of": metadata.get("correction_of"),
+                    },
+                    metadata,
+                )
             )
-    return jobs
+    return entries
+
+
+def list_jobs(workspace):
+    """Return saved Slurm jobs, including jobs from earlier sessions."""
+    return [job for job, _ in _list_jobs_with_meta(workspace)]
 
 
 def pending_jobs(workspace):
     """Reconstruct the monitor's work, including collected but unreviewed jobs."""
     with _locked_workspace(workspace):
-        return [
-            job
-            for job in list_jobs(workspace)
-            if needs_review(workspace, job["probe_id"])
-        ]
+        entries = _list_jobs_with_meta(workspace)
+        corrected = {
+            job["correction_of"] for job, _ in entries if job.get("correction_of")
+        }
+        verdicts_by_session: dict[str, set[str]] = {}
+        pending = []
+        for job, metadata in entries:
+            probe_id = job["probe_id"]
+            session_id = probe_id.split("/")[0]
+            verdicts = verdicts_by_session.get(session_id)
+            if verdicts is None:
+                verdicts = _verdicted_probes(workspace, session_id)
+                verdicts_by_session[session_id] = verdicts
+            if probe_id not in verdicts or (
+                metadata.get("status") == "error"
+                and metadata.get("review_pending", False)
+                and probe_id not in corrected
+            ):
+                pending.append(job)
+        return pending
