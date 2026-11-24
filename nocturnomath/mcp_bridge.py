@@ -18,7 +18,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Self
 
-from .tools import ToolSpec
+from .tools import ToolSpec, validate_tool_arguments
 
 logger = logging.getLogger("nocturnomath.mcp_bridge")
 
@@ -46,88 +46,42 @@ def _jsonrpc_error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def _check_json_type(value: Any, expected: str) -> bool:
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    if expected == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "array":
-        return isinstance(value, list)
-    if expected == "object":
-        return isinstance(value, dict)
-    if expected == "null":
-        return value is None
-    return True
-
-
-def _validate_property_value(name: str, value: Any, prop: dict[str, Any]) -> None:
-    expected = prop.get("type")
-    if isinstance(expected, str):
-        if not _check_json_type(value, expected):
-            raise ValueError(f"Argument '{name}' must be of type {expected}.")
-    elif (
-        isinstance(expected, list)
-        and expected
-        and not any(isinstance(t, str) and _check_json_type(value, t) for t in expected)
-    ):
-        joined = " | ".join(str(t) for t in expected)
-        raise ValueError(f"Argument '{name}' must be of type {joined}.")
-    if "enum" in prop and isinstance(prop["enum"], list) and value not in prop["enum"]:
-        raise ValueError(f"Argument '{name}' must be one of {prop['enum']}.")
-    if isinstance(value, list):
-        min_items = prop.get("minItems")
-        if isinstance(min_items, int) and len(value) < min_items:
-            raise ValueError(
-                f"Argument '{name}' must contain at least {min_items} item(s)."
-            )
-        items_schema = prop.get("items")
-        if isinstance(items_schema, dict):
-            for index, item in enumerate(value):
-                _validate_property_value(f"{name}[{index}]", item, items_schema)
-
-
 def _is_rpc_id(value: Any) -> bool:
     return isinstance(value, (str, int)) and not isinstance(value, bool)
 
 
-def _validate_arguments(
-    schema: dict[str, Any], arguments: dict[str, Any]
-) -> dict[str, Any]:
-    properties = (
-        schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-    )
-    required_list = (
-        schema.get("required") if isinstance(schema.get("required"), list) else []
-    )
-    disallow_extra = schema.get("additionalProperties") is False
-    required = {item for item in required_list if isinstance(item, str)}
-    cleaned: dict[str, Any] = {}
-    for key, value in arguments.items():
-        if disallow_extra and key not in properties:
-            raise ValueError(f"Unexpected argument: '{key}'.")
-        prop = properties.get(key)
-        if value is None:
-            prop_type = prop.get("type") if isinstance(prop, dict) else None
-            allows_null = prop_type == "null" or (
-                isinstance(prop_type, list) and "null" in prop_type
-            )
-            if allows_null:
-                cleaned[key] = None
+def _drain_done_tasks(done_tasks: set[asyncio.Task[None]]) -> None:
+    for finished in done_tasks:
+        if not finished.cancelled():
+            with suppress(Exception):
+                finished.exception()
+
+
+async def _cancel_and_drain_tasks(
+    tasks: set[asyncio.Task[None]],
+    *,
+    already_cancelled: set[asyncio.Task[None]] | None = None,
+) -> None:
+    pending = [task for task in list(tasks) if not task.done()]
+    for task in pending:
+        if already_cancelled is not None:
+            if task in already_cancelled:
                 continue
-            if key not in required:
-                continue
-            raise ValueError(f"Argument '{key}' is required and cannot be null.")
-        if isinstance(prop, dict):
-            _validate_property_value(key, value, prop)
-        cleaned[key] = value
-    for key in required_list:
-        if isinstance(key, str) and key not in cleaned:
-            raise ValueError(f"Missing required argument: '{key}'.")
-    return cleaned
+            already_cancelled.add(task)
+        task.cancel()
+    if not tasks:
+        return
+    try:
+        done, _ = await asyncio.wait(list(tasks))
+        _drain_done_tasks(done)
+    except asyncio.CancelledError:
+        remaining = [task for task in list(tasks) if not task.done()]
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            done, _ = await asyncio.wait(remaining, timeout=0.5)
+            _drain_done_tasks(done)
+        raise
 
 
 class McpToolBridge:
@@ -167,33 +121,7 @@ class McpToolBridge:
 
     async def cancel_in_flight(self) -> None:
         """Cancel active client connections and running tool handlers immediately."""
-        tasks = [task for task in self._client_tasks if not task.done()]
-        for task in tasks:
-            task.cancel()
-        if not tasks:
-            return
-        try:
-            done, _ = await asyncio.wait(tasks)
-            for finished in done:
-                if not finished.cancelled():
-                    with suppress(Exception):
-                        finished.exception()
-        except asyncio.CancelledError:
-            for client_task in list(self._client_tasks):
-                if not client_task.done():
-                    client_task.cancel()
-            remaining = [
-                client_task
-                for client_task in self._client_tasks
-                if not client_task.done()
-            ]
-            if remaining:
-                done, _ = await asyncio.wait(remaining, timeout=0.5)
-                for finished in done:
-                    if not finished.cancelled():
-                        with suppress(Exception):
-                            finished.exception()
-            raise
+        await _cancel_and_drain_tasks(self._client_tasks)
 
     async def __aexit__(self, *args: object) -> None:
         try:
@@ -264,12 +192,6 @@ class McpToolBridge:
                     if _is_rpc_id(msg_id) and in_flight_by_id.get(msg_id) is current:
                         in_flight_by_id.pop(msg_id, None)
 
-            def _drain_done(done_tasks: set[asyncio.Task[None]]) -> None:
-                for finished in done_tasks:
-                    if not finished.cancelled():
-                        with suppress(Exception):
-                            finished.exception()
-
             try:
                 async for line in lines:
                     if not line:
@@ -308,24 +230,11 @@ class McpToolBridge:
                     req_task.add_done_callback(in_flight.discard)
                 if in_flight:
                     done, _ = await asyncio.wait(list(in_flight))
-                    _drain_done(done)
+                    _drain_done_tasks(done)
             finally:
-                for req_task in list(in_flight):
-                    if not req_task.done() and req_task not in already_cancelled:
-                        already_cancelled.add(req_task)
-                        req_task.cancel()
-                if in_flight:
-                    try:
-                        done, _ = await asyncio.wait(list(in_flight))
-                        _drain_done(done)
-                    except asyncio.CancelledError:
-                        for req_task in list(in_flight):
-                            if not req_task.done():
-                                req_task.cancel()
-                        if in_flight:
-                            done, _ = await asyncio.wait(list(in_flight), timeout=0.5)
-                            _drain_done(done)
-                        raise
+                await _cancel_and_drain_tasks(
+                    in_flight, already_cancelled=already_cancelled
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -425,7 +334,7 @@ class McpToolBridge:
                     msg_id, -32602, "Tool arguments must be an object"
                 )
             try:
-                arguments = _validate_arguments(spec.input_schema, arguments)
+                arguments = validate_tool_arguments(spec.input_schema, arguments)
             except ValueError as exc:
                 return _jsonrpc_result(
                     msg_id,

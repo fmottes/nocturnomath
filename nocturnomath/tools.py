@@ -68,6 +68,87 @@ def tool(name: str, description: str, schema: dict[str, Any]):
     return decorator
 
 
+def _check_json_type(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _validate_property_value(name: str, value: Any, prop: dict[str, Any]) -> None:
+    expected = prop.get("type")
+    if isinstance(expected, str):
+        if not _check_json_type(value, expected):
+            raise ValueError(f"Argument '{name}' must be of type {expected}.")
+    elif (
+        isinstance(expected, list)
+        and expected
+        and not any(isinstance(t, str) and _check_json_type(value, t) for t in expected)
+    ):
+        joined = " | ".join(str(t) for t in expected)
+        raise ValueError(f"Argument '{name}' must be of type {joined}.")
+    if "enum" in prop and isinstance(prop["enum"], list) and value not in prop["enum"]:
+        raise ValueError(f"Argument '{name}' must be one of {prop['enum']}.")
+    if isinstance(value, list):
+        min_items = prop.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ValueError(
+                f"Argument '{name}' must contain at least {min_items} item(s)."
+            )
+        items_schema = prop.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                _validate_property_value(f"{name}[{index}]", item, items_schema)
+
+
+def validate_tool_arguments(
+    schema: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate and clean tool call arguments against a JSON Schema object."""
+    properties = (
+        schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    )
+    required_list = (
+        schema.get("required") if isinstance(schema.get("required"), list) else []
+    )
+    disallow_extra = schema.get("additionalProperties") is False
+    required = {item for item in required_list if isinstance(item, str)}
+    cleaned: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if disallow_extra and key not in properties:
+            raise ValueError(f"Unexpected argument: '{key}'.")
+        prop = properties.get(key)
+        if value is None:
+            prop_type = prop.get("type") if isinstance(prop, dict) else None
+            allows_null = prop_type == "null" or (
+                isinstance(prop_type, list) and "null" in prop_type
+            )
+            if allows_null:
+                cleaned[key] = None
+                continue
+            if key not in required:
+                continue
+            raise ValueError(f"Argument '{key}' is required and cannot be null.")
+        if isinstance(prop, dict):
+            _validate_property_value(key, value, prop)
+        cleaned[key] = value
+    for key in required_list:
+        if isinstance(key, str) and key not in cleaned:
+            raise ValueError(f"Missing required argument: '{key}'.")
+    return cleaned
+
+
 BACKEND_SWITCH = re.compile(
     r"matplotlib\.use\s*\(|switch_backend\s*\(|%matplotlib\s+(?!inline\b)\S"
 )
@@ -381,7 +462,7 @@ def build_tools(session: "ExplorationSession"):
             return failure(message)
 
         encoded_images = [base64.b64encode(image).decode() for image in images]
-        shown = images[: session.image_cap]
+        shown_encoded = encoded_images[: session.image_cap]
         if len(images) > session.image_cap:
             preface.insert(
                 0,
@@ -442,11 +523,11 @@ def build_tools(session: "ExplorationSession"):
         )
 
         content = [{"type": "text", "text": output}]
-        for image in shown:
+        for encoded in shown_encoded:
             content.append(
                 {
                     "type": "image",
-                    "data": base64.b64encode(image).decode(),
+                    "data": encoded,
                     "mimeType": "image/png",
                 }
             )
