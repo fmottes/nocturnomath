@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import aclosing, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +20,7 @@ from .base import (
     EFFORT_LEVELS,
     CompactResult,
     JsonMessageStream,
+    JsonRpcClient,
     ModelSpec,
     SessionResumeError,
     SessionStarted,
@@ -31,14 +30,18 @@ from .base import (
     TurnEvent,
     TurnResult,
     TurnStarted,
+    context_usage_payload,
     find_cli_executables,
-    is_usable_cli_binary,
-    terminate_process,
+    is_int,
+    managed_subprocess,
+    resolve_cli_binary,
+    rpc_error_message,
+    write_json_line,
 )
 from .http import (
     compact_google_http,
     discover_google_http_models,
-    is_http_session_id,
+    reject_http_session_for_cli,
     run_google_http_turn,
 )
 
@@ -47,7 +50,7 @@ logger = logging.getLogger("nocturnomath.backends.google")
 AGY_CLI_NAME = "agy.exe" if sys.platform == "win32" else "agy"
 DISCOVERY_TIMEOUT_S = 15.0
 COMPACT_TIMEOUT_S = 600.0
-_EFFORT_SUFFIX_RE = re.compile(r"^(gemini-.+)-(low|medium|high|xhigh|max|ultra)$")
+_EFFORT_SUFFIX_RE = re.compile(rf"^(gemini-.+)-({'|'.join(EFFORT_LEVELS)})$")
 _EFFORT_LABEL_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Max|Ultra)\)\s*$")
 _AGY_EXECUTOR_ERROR_PREFIXES = (
     "⚠ agent executor error:",
@@ -85,13 +88,29 @@ def _usage_to_context(usage: Any, model: str | None) -> dict[str, Any] | None:
         return None
     inp = usage.get("inputTokens")
     cached = usage.get("cachedReadTokens", 0)
-    if isinstance(inp, int) and inp >= 0:
-        return {
-            "used_tokens": inp + (cached if isinstance(cached, int) else 0),
-            "window_tokens": None,
-            "model": model,
-        }
+    if is_int(inp) and inp >= 0:
+        total = inp + (cached if is_int(cached) else 0)
+        return context_usage_payload(total, None, model)
     return None
+
+
+def _parse_available_commands(update: dict[str, Any]) -> set[str]:
+    return {
+        str(cmd.get("name"))
+        for cmd in (update.get("availableCommands") or [])
+        if isinstance(cmd, dict) and cmd.get("name")
+    }
+
+
+def _extract_message_chunk(update: dict[str, Any]) -> str | None:
+    content = update.get("content") or {}
+    chunk = content.get("text") if isinstance(content, dict) else None
+    if not isinstance(chunk, str) or not chunk:
+        return None
+    err_text = _extract_agy_executor_error(chunk)
+    if err_text is not None:
+        raise RuntimeError(err_text)
+    return chunk
 
 
 def agy_cli_candidates() -> list[Path]:
@@ -180,39 +199,89 @@ class GoogleBackend:
         self._http_model_info: dict[str, dict[str, Any]] = {}
         self.last_discovery_error: str | None = None
         self._slug_map: dict[tuple[str, str], str] = {}
-        self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
-        if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
-            return self.cli_path
-        candidates = agy_cli_candidates()
-        if not candidates:
-            raise RuntimeError(
-                "Antigravity CLI (`agy`) was not found on PATH. Install agy or configure a Google Gemini API key."
-            )
-        self.cli_path = candidates[0]
+        self.cli_path = resolve_cli_binary(
+            self.cli_path,
+            agy_cli_candidates,
+            "Antigravity CLI (`agy`) was not found on PATH. Install agy or configure a Google Gemini API key.",
+        )
         return self.cli_path
 
     @staticmethod
-    def _prepare_env_and_flags(auth: ProviderAuth) -> tuple[dict[str, str], list[str]]:
-        return auth.process_env(), ["--include-default-customizations=false"]
-
-    def _next_id(self) -> int:
-        self._next_rpc_id += 1
-        return self._next_rpc_id
-
-    @staticmethod
     async def _send(proc: asyncio.subprocess.Process, payload: dict[str, Any]) -> None:
-        if proc.stdin is None:
-            raise RuntimeError("Antigravity ACP stdin is not open.")
-        proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
+        await write_json_line(proc, payload, "Antigravity ACP")
+
+    def _rpc_client(
+        self,
+        proc: asyncio.subprocess.Process,
+        messages: JsonMessageStream,
+        stderr: StderrCollector | None = None,
+        allowed_tools: set[str] | frozenset[str] = frozenset(),
+    ) -> JsonRpcClient:
+        return JsonRpcClient(
+            proc,
+            messages,
+            stderr,
+            label="Antigravity ACP",
+            on_request=lambda msg: self._handle_request(proc, msg, allowed_tools),
+        )
+
+    def _discovery_commit(
+        self,
+        *,
+        cli_path: Path | None = None,
+        http_model_info: dict[str, dict[str, Any]] | None = None,
+        slug_map: dict[tuple[str, str], str] | None = None,
+        error: str | None = None,
+    ) -> Callable[[], None]:
+        info_copy = dict(http_model_info) if http_model_info else {}
+        slugs_copy = dict(slug_map) if slug_map else {}
+
+        def commit() -> None:
+            self._http_model_info = dict(info_copy)
+            self._slug_map = dict(slugs_copy)
+            self.last_discovery_error = error
+            if cli_path is not None:
+                self.cli_path = cli_path
+
+        return commit
+
+    @asynccontextmanager
+    async def _acp_session(
+        self,
+        cli_path: Path,
+        auth: ProviderAuth,
+        *,
+        allowed_tools: set[str] | frozenset[str] = frozenset(),
+    ) -> AsyncIterator[
+        tuple[
+            str,
+            asyncio.subprocess.Process,
+            StderrCollector,
+            JsonMessageStream,
+            JsonRpcClient,
+        ]
+    ]:
+        with tempfile.TemporaryDirectory(
+            prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
+        ) as isolated_cwd:
+            async with managed_subprocess(
+                str(cli_path),
+                "acp",
+                "--include-default-customizations=false",
+                cwd=isolated_cwd,
+                env=auth.process_env(),
+            ) as (proc, stderr):
+                messages = JsonMessageStream(proc.stdout)
+                client = self._rpc_client(proc, messages, stderr, allowed_tools)
+                yield isolated_cwd, proc, stderr, messages, client
 
     async def _handle_request(
         self,
         proc: asyncio.subprocess.Process,
         msg: dict[str, Any],
-        allowed_tools: set[str],
+        allowed_tools: set[str] | frozenset[str],
     ) -> None:
         req_id = msg.get("id")
         method = msg.get("method")
@@ -261,56 +330,42 @@ class GoogleBackend:
             },
         )
 
-    async def _rpc(
-        self,
-        proc: asyncio.subprocess.Process,
-        messages: JsonMessageStream,
-        method: str,
-        params: dict[str, Any],
-        allowed_tools: set[str] = frozenset(),
-        stderr: StderrCollector | None = None,
-    ) -> dict[str, Any]:
-        req_id = self._next_id()
-        try:
-            await self._send(
-                proc,
-                {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
-            )
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            detail = await stderr.text() if stderr is not None else ""
-            raise RuntimeError(
-                detail or f"Antigravity ACP closed before replying to {method}."
-            ) from exc
-        while (msg := await messages.next_wire()) is not None:
-            if msg.get("id") is not None and "method" in msg:
-                await self._handle_request(proc, msg, allowed_tools)
-                continue
-            if msg.get("id") == req_id:
-                if "error" in msg and msg["error"] is not None:
-                    err = msg["error"]
-                    text = err.get("message") if isinstance(err, dict) else str(err)
-                    raise RuntimeError(text or f"Antigravity ACP {method} failed.")
-                return msg.get("result") or {}
-            if msg.get("id") is None:
-                messages.buffer_notification(msg)
-        detail = await stderr.text() if stderr is not None else ""
-        raise RuntimeError(
-            detail or f"Antigravity ACP closed before replying to {method}."
-        )
+    async def _initialize_acp(self, client: JsonRpcClient) -> None:
+        await client.rpc("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
 
-    async def _initialize_acp(
+    async def _open_session(
         self,
-        proc: asyncio.subprocess.Process,
-        messages: JsonMessageStream,
-        stderr: StderrCollector | None = None,
-    ) -> None:
-        await self._rpc(
-            proc,
-            messages,
-            "initialize",
-            {"protocolVersion": 1, "clientCapabilities": {}},
-            stderr=stderr,
-        )
+        client: JsonRpcClient,
+        *,
+        cwd: str,
+        system_prompt: str,
+        mcp_servers: list[dict[str, Any]],
+        resume_session_id: str | None = None,
+    ) -> str:
+        session_params: dict[str, Any] = {
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+            "_meta": {
+                "disableBuiltInTools": True,
+                "antigravity": {"systemPrompt": {"append": system_prompt}},
+            },
+        }
+        if resume_session_id:
+            try:
+                started = await client.rpc(
+                    "session/resume",
+                    {"sessionId": resume_session_id, **session_params},
+                )
+            except RuntimeError as exc:
+                if _is_missing_session_error(str(exc)):
+                    raise SessionResumeError(str(exc)) from exc
+                raise
+        else:
+            started = await client.rpc("session/new", session_params)
+        session_id = started.get("sessionId") or resume_session_id
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("Antigravity ACP did not return a sessionId.")
+        return session_id
 
     async def discover_models_staged(
         self, auth: ProviderAuth
@@ -320,57 +375,29 @@ class GoogleBackend:
             specs, info, err = await discover_google_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
-
-            def commit_http(
-                discovered_info: dict[str, dict[str, Any]] = info,
-                discovery_error: str | None = err,
-            ) -> None:
-                self._http_model_info = dict(discovered_info)
-                self._slug_map = {}
-                self.last_discovery_error = discovery_error
-
-            return specs, commit_http
-
-        def clear_http() -> None:
-            self._http_model_info = {}
-            self.last_discovery_error = None
+            return specs, self._discovery_commit(http_model_info=info, error=err)
 
         candidates = agy_cli_candidates()
         if not candidates:
-            return [], clear_http
-        env, flags = self._prepare_env_and_flags(auth)
+            return [], self._discovery_commit()
         for candidate in candidates:
-            with tempfile.TemporaryDirectory(
-                prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
-            ) as isolated_cwd:
-                proc: asyncio.subprocess.Process | None = None
-                stderr: StderrCollector | None = None
-                try:
+            try:
+                async with self._acp_session(candidate, auth) as (
+                    isolated_cwd,
+                    _proc,
+                    _stderr,
+                    _messages,
+                    client,
+                ):
                     async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                        proc = await asyncio.create_subprocess_exec(
-                            str(candidate),
-                            "acp",
-                            *flags,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            cwd=isolated_cwd,
-                            env=env,
-                            start_new_session=(os.name == "posix"),
-                        )
-                        stderr = StderrCollector(proc.stderr)
-                        messages = JsonMessageStream(proc.stdout)
-                        await self._initialize_acp(proc, messages, stderr)
-                        session_info = await self._rpc(
-                            proc,
-                            messages,
+                        await self._initialize_acp(client)
+                        session_info = await client.rpc(
                             "session/new",
                             {
                                 "cwd": isolated_cwd,
                                 "mcpServers": [],
                                 "_meta": {"disableBuiltInTools": True},
                             },
-                            stderr=stderr,
                         )
                         models_state = session_info.get("models") or {}
                         available = models_state.get("availableModels") or []
@@ -379,29 +406,16 @@ class GoogleBackend:
                             available, current_model_id=current_model_id
                         )
                         if specs:
-
-                            def commit(
-                                chosen: Path = candidate,
-                                discovered_slugs: dict[tuple[str, str], str] = slug_map,
-                            ) -> None:
-                                self._slug_map = dict(discovered_slugs)
-                                self._http_model_info = {}
-                                self.last_discovery_error = None
-                                self.cli_path = chosen
-
-                            return specs, commit
-                except Exception as exc:
-                    logger.warning(
-                        "Google Antigravity model discovery with %s failed: %s",
-                        candidate,
-                        exc,
-                    )
-                finally:
-                    if proc is not None:
-                        await terminate_process(proc, stderr)
-                    elif stderr is not None:
-                        await stderr.close()
-        return [], clear_http
+                            return specs, self._discovery_commit(
+                                cli_path=candidate, slug_map=slug_map
+                            )
+            except Exception as exc:
+                logger.warning(
+                    "Google Antigravity model discovery with %s failed: %s",
+                    candidate,
+                    exc,
+                )
+        return [], self._discovery_commit()
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -410,52 +424,41 @@ class GoogleBackend:
 
     async def _configure_model(
         self,
-        proc: asyncio.subprocess.Process,
-        messages: JsonMessageStream,
+        client: JsonRpcClient,
         session_id: str,
         model: str,
         effort: str | None,
-        stderr: StderrCollector | None = None,
     ) -> None:
         slug = self._slug_map.get((model, effort or "")) or (
             f"{model}-{effort}" if effort else model
         )
         try:
-            await self._rpc(
-                proc,
-                messages,
+            await client.rpc(
                 "session/set_model",
                 {"sessionId": session_id, "modelId": slug},
-                stderr=stderr,
             )
             return
         except RuntimeError:
             pass
-        await self._rpc(
-            proc,
-            messages,
+        await client.rpc(
             "session/set_config_option",
             {"sessionId": session_id, "configId": "model", "value": model},
-            stderr=stderr,
         )
         if effort:
-            await self._rpc(
-                proc,
-                messages,
+            await client.rpc(
                 "session/set_config_option",
                 {
                     "sessionId": session_id,
                     "configId": "thought_level",
                     "value": effort,
                 },
-                stderr=stderr,
             )
 
     async def _drain_setup_updates(
         self,
         proc: asyncio.subprocess.Process,
         messages: JsonMessageStream,
-        allowed_tools: set[str] = frozenset(),
+        allowed_tools: set[str] | frozenset[str] = frozenset(),
     ) -> set[str] | None:
         available_commands: set[str] | None = None
 
@@ -465,14 +468,10 @@ class GoogleBackend:
                 return
             update = (msg.get("params") or {}).get("update") or {}
             if update.get("sessionUpdate") == "available_commands_update":
-                available_commands = {
-                    str(cmd.get("name"))
-                    for cmd in (update.get("availableCommands") or [])
-                    if isinstance(cmd, dict) and cmd.get("name")
-                }
+                available_commands = _parse_available_commands(update)
 
-        while messages._buffered:
-            inspect(messages._buffered.popleft())
+        for buffered in messages.drain_buffered():
+            inspect(buffered)
         while True:
             try:
                 msg = await messages.next_wire(timeout=0.02)
@@ -519,106 +518,47 @@ class GoogleBackend:
                 async for event in events:
                     yield event
             return
-        if is_http_session_id(resume_session_id):
-            raise SessionResumeError(
-                "Session was created in HTTP API mode and cannot be resumed by the CLI."
-            )
+        reject_http_session_for_cli(resume_session_id)
         del tool_timeout_s
         cli_path = self._resolve_cli()
-        env, flags = self._prepare_env_and_flags(auth)
         allowed_tools = {
             name
             for spec in tools
             for name in (spec.name, f"mcp_explore_{spec.name}", f"explore/{spec.name}")
         }
-        with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
-        ) as isolated_cwd:
-            async with McpToolBridge(tools) as bridge:
-                mcp_servers = [_mcp_server_entry(bridge.stdio_server_config())]
-                proc = await asyncio.create_subprocess_exec(
-                    str(cli_path),
-                    "acp",
-                    *flags,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=isolated_cwd,
-                    env=env,
-                    start_new_session=(os.name == "posix"),
-                )
-                stderr = StderrCollector(proc.stderr)
+        async with McpToolBridge(tools) as bridge:
+            mcp_servers = [_mcp_server_entry(bridge.stdio_server_config())]
+            async with self._acp_session(
+                cli_path, auth, allowed_tools=allowed_tools
+            ) as (isolated_cwd, proc, stderr, messages, client):
                 session_id = resume_session_id
                 try:
-                    messages = JsonMessageStream(proc.stdout)
-                    await self._initialize_acp(proc, messages, stderr)
-                    session_params: dict[str, Any] = {
-                        "cwd": isolated_cwd,
-                        "mcpServers": mcp_servers,
-                        "_meta": {
-                            "disableBuiltInTools": True,
-                            "antigravity": {"systemPrompt": {"append": system_prompt}},
-                        },
-                    }
-                    if resume_session_id:
-                        try:
-                            started = await self._rpc(
-                                proc,
-                                messages,
-                                "session/resume",
-                                {"sessionId": resume_session_id, **session_params},
-                                allowed_tools,
-                                stderr,
-                            )
-                        except RuntimeError as exc:
-                            if _is_missing_session_error(str(exc)):
-                                raise SessionResumeError(str(exc)) from exc
-                            raise
-                    else:
-                        started = await self._rpc(
-                            proc,
-                            messages,
-                            "session/new",
-                            session_params,
-                            allowed_tools,
-                            stderr,
-                        )
-                    session_id = started.get("sessionId") or resume_session_id
-                    if not isinstance(session_id, str) or not session_id:
-                        raise RuntimeError(
-                            "Antigravity ACP did not return a sessionId."
-                        )
-
-                    await self._configure_model(
-                        proc, messages, session_id, model, effort, stderr
+                    await self._initialize_acp(client)
+                    session_id = await self._open_session(
+                        client,
+                        cwd=isolated_cwd,
+                        system_prompt=system_prompt,
+                        mcp_servers=mcp_servers,
+                        resume_session_id=resume_session_id,
                     )
+
+                    await self._configure_model(client, session_id, model, effort)
                     await self._drain_setup_updates(proc, messages, allowed_tools)
 
-                    prompt_req_id = self._next_id()
-                    try:
-                        await self._send(
-                            proc,
-                            {
-                                "jsonrpc": "2.0",
-                                "id": prompt_req_id,
-                                "method": "session/prompt",
-                                "params": {
-                                    "sessionId": session_id,
-                                    "prompt": [{"type": "text", "text": prompt}],
-                                },
-                            },
-                        )
-                    except (BrokenPipeError, ConnectionResetError) as exc:
-                        detail = await stderr.text()
-                        raise RuntimeError(
-                            detail
-                            or "Antigravity ACP disconnected before receiving prompt."
-                        ) from exc
+                    prompt_req_id = await client.send_request(
+                        "session/prompt",
+                        {
+                            "sessionId": session_id,
+                            "prompt": [{"type": "text", "text": prompt}],
+                        },
+                        disconnect_message="Antigravity ACP disconnected before receiving prompt.",
+                    )
                     yield SessionStarted(session_id)
 
                     current_block: list[str] = []
                     last_context_usage: dict[str, Any] | None = None
                     prompt_done = False
+                    emitted_turn_started = False
 
                     async for msg in messages:
                         if msg.get("id") is not None and "method" in msg:
@@ -628,48 +568,38 @@ class GoogleBackend:
                             update = (msg.get("params") or {}).get("update") or {}
                             kind = update.get("sessionUpdate")
                             if kind == "agent_thought_chunk":
-                                yield TurnStarted()
+                                if not emitted_turn_started:
+                                    emitted_turn_started = True
+                                    yield TurnStarted()
                             elif kind == "agent_message_chunk":
-                                content = update.get("content") or {}
-                                chunk = (
-                                    content.get("text")
-                                    if isinstance(content, dict)
-                                    else None
-                                )
-                                if isinstance(chunk, str) and chunk:
-                                    err_text = _extract_agy_executor_error(chunk)
-                                    if err_text is not None:
-                                        raise RuntimeError(err_text)
+                                chunk = _extract_message_chunk(update)
+                                if chunk:
                                     current_block.append(chunk)
                                     yield TextDelta(chunk)
                             elif kind == "tool_call":
-                                yield TurnStarted()
+                                if not emitted_turn_started:
+                                    emitted_turn_started = True
+                                    yield TurnStarted()
                                 if current_block:
                                     yield TextBlockDone("".join(current_block))
                                     current_block.clear()
                             elif kind == "usage_update":
-                                used = update.get("used")
-                                size = update.get("size")
-                                if isinstance(used, int) and used > 0:
-                                    last_context_usage = {
-                                        "used_tokens": used,
-                                        "window_tokens": size
-                                        if isinstance(size, int) and size > 0
-                                        else None,
-                                        "model": model,
-                                    }
+                                payload = context_usage_payload(
+                                    update.get("used"),
+                                    update.get("size"),
+                                    model,
+                                    min_used=1,
+                                )
+                                if payload is not None:
+                                    last_context_usage = payload
                         elif msg.get("id") == prompt_req_id:
                             prompt_done = True
                             if "error" in msg and msg["error"] is not None:
-                                err = msg["error"]
-                                text = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else str(err)
-                                )
                                 raise RuntimeError(
-                                    text
-                                    or "Google Antigravity could not finish this turn."
+                                    rpc_error_message(
+                                        msg["error"],
+                                        "Google Antigravity could not finish this turn.",
+                                    )
                                 )
                             if current_block:
                                 yield TextBlockDone("".join(current_block))
@@ -711,8 +641,6 @@ class GoogleBackend:
                             )
                     await bridge.cancel_in_flight()
                     raise
-                finally:
-                    await terminate_process(proc, stderr)
 
     async def compact(
         self,
@@ -736,171 +664,105 @@ class GoogleBackend:
                 model_info_by_id=self._http_model_info,
                 http_client_factory=self._http_client_factory,
             )
-        if is_http_session_id(resume_session_id):
-            raise SessionResumeError(
-                "Session was created in HTTP API mode and cannot be resumed by the CLI."
-            )
+        reject_http_session_for_cli(resume_session_id)
         cli_path = self._resolve_cli()
-        env, flags = self._prepare_env_and_flags(auth)
-        with tempfile.TemporaryDirectory(
-            prefix="nocturnomath-agy-cwd-", ignore_cleanup_errors=True
-        ) as isolated_cwd:
-            proc = await asyncio.create_subprocess_exec(
-                str(cli_path),
-                "acp",
-                *flags,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=isolated_cwd,
-                env=env,
-                start_new_session=(os.name == "posix"),
-            )
-            stderr = StderrCollector(proc.stderr)
+        async with self._acp_session(cli_path, auth) as (
+            isolated_cwd,
+            proc,
+            stderr,
+            messages,
+            client,
+        ):
+            context_usage: dict[str, Any] | None = None
+            done = False
+            unexpected_chunks: list[str] = []
             try:
-                messages = JsonMessageStream(proc.stdout)
-                context_usage: dict[str, Any] | None = None
-                done = False
-                unexpected_chunks: list[str] = []
-                try:
-                    async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                        await self._initialize_acp(proc, messages, stderr)
-                        try:
-                            await self._rpc(
-                                proc,
-                                messages,
-                                "session/resume",
-                                {
-                                    "sessionId": resume_session_id,
-                                    "cwd": isolated_cwd,
-                                    "mcpServers": [],
-                                    "_meta": {
-                                        "disableBuiltInTools": True,
-                                        "antigravity": {
-                                            "systemPrompt": {"append": system_prompt}
-                                        },
-                                    },
-                                },
-                                stderr=stderr,
-                            )
-                        except RuntimeError as exc:
-                            if _is_missing_session_error(str(exc)):
-                                raise SessionResumeError(str(exc)) from exc
-                            raise
-                        if model:
-                            await self._configure_model(
-                                proc, messages, resume_session_id, model, effort, stderr
-                            )
-                        commands = await self._drain_setup_updates(proc, messages)
-                        if commands is not None and "compact" not in commands:
-                            raise RuntimeError(
-                                "Antigravity ACP does not support /compact for this session."
-                            )
-                        req_id = self._next_id()
-                        try:
-                            await self._send(
-                                proc,
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "method": "session/prompt",
-                                    "params": {
-                                        "sessionId": resume_session_id,
-                                        "prompt": [
-                                            {"type": "text", "text": "/compact"}
-                                        ],
-                                    },
-                                },
-                            )
-                        except (BrokenPipeError, ConnectionResetError) as exc:
-                            detail = await stderr.text()
-                            raise RuntimeError(
-                                detail
-                                or "Antigravity ACP disconnected before compacting."
-                            ) from exc
-                        async for msg in messages:
-                            if msg.get("id") is not None and "method" in msg:
-                                await self._handle_request(proc, msg, set())
-                                continue
-                            if msg.get("method") == "session/update":
-                                update = (msg.get("params") or {}).get("update") or {}
-                                kind = update.get("sessionUpdate")
-                                if kind == "available_commands_update":
-                                    commands = {
-                                        str(cmd.get("name"))
-                                        for cmd in (
-                                            update.get("availableCommands") or []
-                                        )
-                                        if isinstance(cmd, dict) and cmd.get("name")
-                                    }
-                                    if "compact" not in commands:
-                                        raise RuntimeError(
-                                            "Antigravity ACP does not support /compact for this session."
-                                        )
-                                elif kind == "agent_message_chunk":
-                                    content = update.get("content") or {}
-                                    chunk = (
-                                        content.get("text")
-                                        if isinstance(content, dict)
-                                        else None
-                                    )
-                                    err_text = _extract_agy_executor_error(chunk)
-                                    if err_text is not None:
-                                        raise RuntimeError(err_text)
-                                    if isinstance(chunk, str) and chunk.strip():
-                                        unexpected_chunks.append(chunk.strip())
-                                elif kind == "usage_update":
-                                    used = update.get("used")
-                                    size = update.get("size")
-                                    if isinstance(used, int) and used >= 0:
-                                        context_usage = {
-                                            "used_tokens": used,
-                                            "window_tokens": size
-                                            if isinstance(size, int) and size > 0
-                                            else None,
-                                            "model": model,
-                                        }
-                            elif msg.get("id") == req_id:
-                                done = True
-                                if "error" in msg and msg["error"] is not None:
-                                    err = msg["error"]
-                                    text = (
-                                        err.get("message")
-                                        if isinstance(err, dict)
-                                        else str(err)
-                                    )
-                                    raise RuntimeError(
-                                        text or "Antigravity compaction failed."
-                                    )
-                                if unexpected_chunks:
-                                    raise RuntimeError(" ".join(unexpected_chunks))
-                                result = msg.get("result") or {}
-                                if result.get("stopReason") == "cancelled":
-                                    raise asyncio.CancelledError(
-                                        "Google Antigravity compaction was cancelled."
-                                    )
-                                raw_usage = result.get("usage")
-                                if context_usage is None:
-                                    context_usage = _usage_to_context(raw_usage, model)
-                                if context_usage is None and not isinstance(
-                                    raw_usage, dict
-                                ):
-                                    raise RuntimeError(
-                                        "Antigravity did not confirm that compaction completed."
-                                    )
-                                break
-                except TimeoutError as exc:
-                    raise RuntimeError(
-                        f"Google Antigravity compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
-                    ) from exc
-                if not done:
-                    detail = await stderr.text()
-                    raise RuntimeError(
-                        detail
-                        or "Antigravity did not confirm that compaction completed."
+                async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                    await self._initialize_acp(client)
+                    await self._open_session(
+                        client,
+                        cwd=isolated_cwd,
+                        system_prompt=system_prompt,
+                        mcp_servers=[],
+                        resume_session_id=resume_session_id,
                     )
-                return CompactResult(
-                    session_id=resume_session_id, context_usage=context_usage
+                    if model:
+                        await self._configure_model(
+                            client, resume_session_id, model, effort
+                        )
+                    commands = await self._drain_setup_updates(proc, messages)
+                    if commands is not None and "compact" not in commands:
+                        raise RuntimeError(
+                            "Antigravity ACP does not support /compact for this session."
+                        )
+                    req_id = await client.send_request(
+                        "session/prompt",
+                        {
+                            "sessionId": resume_session_id,
+                            "prompt": [{"type": "text", "text": "/compact"}],
+                        },
+                        disconnect_message="Antigravity ACP disconnected before compacting.",
+                    )
+                    async for msg in messages:
+                        if msg.get("id") is not None and "method" in msg:
+                            await self._handle_request(proc, msg, frozenset())
+                            continue
+                        if msg.get("method") == "session/update":
+                            update = (msg.get("params") or {}).get("update") or {}
+                            kind = update.get("sessionUpdate")
+                            if kind == "available_commands_update":
+                                commands = _parse_available_commands(update)
+                                if "compact" not in commands:
+                                    raise RuntimeError(
+                                        "Antigravity ACP does not support /compact for this session."
+                                    )
+                            elif kind == "agent_message_chunk":
+                                chunk = _extract_message_chunk(update)
+                                if chunk and chunk.strip():
+                                    unexpected_chunks.append(chunk.strip())
+                            elif kind == "usage_update":
+                                payload = context_usage_payload(
+                                    update.get("used"),
+                                    update.get("size"),
+                                    model,
+                                )
+                                if payload is not None:
+                                    context_usage = payload
+                        elif msg.get("id") == req_id:
+                            done = True
+                            if "error" in msg and msg["error"] is not None:
+                                raise RuntimeError(
+                                    rpc_error_message(
+                                        msg["error"],
+                                        "Antigravity compaction failed.",
+                                    )
+                                )
+                            if unexpected_chunks:
+                                raise RuntimeError(" ".join(unexpected_chunks))
+                            result = msg.get("result") or {}
+                            if result.get("stopReason") == "cancelled":
+                                raise asyncio.CancelledError(
+                                    "Google Antigravity compaction was cancelled."
+                                )
+                            raw_usage = result.get("usage")
+                            if context_usage is None:
+                                context_usage = _usage_to_context(raw_usage, model)
+                            if context_usage is None and not isinstance(
+                                raw_usage, dict
+                            ):
+                                raise RuntimeError(
+                                    "Antigravity did not confirm that compaction completed."
+                                )
+                            break
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Google Antigravity compaction timed out after {int(COMPACT_TIMEOUT_S)}s."
+                ) from exc
+            if not done:
+                detail = await stderr.text()
+                raise RuntimeError(
+                    detail or "Antigravity did not confirm that compaction completed."
                 )
-            finally:
-                await terminate_process(proc, stderr)
+            return CompactResult(
+                session_id=resume_session_id, context_usage=context_usage
+            )

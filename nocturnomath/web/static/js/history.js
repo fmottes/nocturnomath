@@ -1,5 +1,6 @@
-import { elements, state } from "./state.js?v=20261117-2";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261118-1";
+import { elements, state } from "./state.js?v=20261124-2";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261124-2";
+import { apiJson } from "./transport.js?v=20261124-2";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -17,9 +18,7 @@ export function formatSessionDate(epochSeconds) {
 export async function loadSessions() {
   elements.sessionList.innerHTML = `<div class="empty-state">Loading sessions…</div>`;
   try {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJson("/api/sessions");
     renderSessions(data.sessions || []);
   } catch (e) {
     const message = document.createElement("div");
@@ -120,20 +119,14 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
     if (openAgentId && openAgentId !== state.activeAgentId) {
       window.dispatchEvent(new CustomEvent("nocturnomath:focus-explorer", { detail: openAgentId }));
     }
-    const res = await fetch(`/api/agents/${encodeURIComponent(targetAgentId)}/resume`, {
+    await apiJson(`/api/agents/${encodeURIComponent(targetAgentId)}/resume`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: sessionId, restore_kernel: restoreKernel }),
+      body: { id: sessionId, restore_kernel: restoreKernel },
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      alert(`Failed to resume session: ${err.detail || res.status}`);
-      return;
-    }
     // The chat is repainted by the "session_resumed" broadcast.
     elements.historyModal.classList.add("hidden");
   } catch (e) {
-    alert(`Error resuming session: ${e.message}`);
+    alert(`Failed to resume session: ${e.message}`);
   } finally {
     state.historyLoading = false;
     elements.historyLoading.classList.add("hidden");
@@ -146,6 +139,7 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
 const welcomeCard = document.getElementById("system-welcome")?.cloneNode(true);
 
 export function clearChat(showWelcome = true) {
+  cancelAssistantDeltaRender();
   state.followChat = true;
   elements.chatMessages.replaceChildren();
   if (showWelcome && welcomeCard) {

@@ -133,6 +133,7 @@ class TerminalApp:
         self._spinner_message: str | None = None
         self._live: Live | None = None
         self._stream_text = ""
+        self._last_stream_render = 0.0
 
     # ------------------------------------------------------------------ output
 
@@ -192,6 +193,7 @@ class TerminalApp:
         self._stream_text += chunk
         if not self.console.is_terminal:
             return
+        now = time.monotonic()
         if self._live is None:
             self._live = Live(
                 console=self.console,
@@ -201,11 +203,16 @@ class TerminalApp:
                 redirect_stderr=False,
             )
             self._live.start()
-        self._live.update(Tail(Markdown(self._stream_text)), refresh=True)
+            self._live.update(Tail(Markdown(self._stream_text)), refresh=True)
+            self._last_stream_render = now
+        elif now - self._last_stream_render >= 0.04:
+            self._live.update(Tail(Markdown(self._stream_text)), refresh=True)
+            self._last_stream_render = now
 
     def close_stream(self, final: str | None = None):
         """Replace the live tail with the block's final text, or what streamed so far."""
         streamed, self._stream_text = self._stream_text, ""
+        self._last_stream_render = 0.0
         if self._live is not None:
             live, self._live = self._live, None
             live.stop()
@@ -263,14 +270,7 @@ class TerminalApp:
         effort_part = f" · effort {effort}" if effort else ""
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
-        custom_auth = []
-        for provider in PROVIDERS:
-            auth_entry = self.runtime.auth.get(provider)
-            if auth_entry.method != "cli":
-                custom_auth.append(f"{provider}:{auth_entry.method}")
-            elif auth_entry.direct_api_key():
-                custom_auth.append(f"{provider}:api_key(env)")
-        auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
+        auth_summary = self.runtime.auth.short_summary_label()
         return (
             f"kernel {kernel} · model {model}{effort_part} · "
             f"auth {auth_summary} · chat {chat} · {self.status}"
@@ -563,7 +563,24 @@ class TerminalApp:
             )
             if session is None:
                 return False
-        self._interrupt_task = asyncio.create_task(session.interrupt())
+        if self._interrupt_task is not None and not self._interrupt_task.done():
+            current = session._current_task
+            if current is not None and not current.done():
+                current.cancel()
+            return True
+
+        async def run_interrupt(target=session):
+            try:
+                await target.interrupt()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Interrupt failed")
+            finally:
+                if self._interrupt_task is asyncio.current_task():
+                    self._interrupt_task = None
+
+        self._interrupt_task = asyncio.create_task(run_interrupt())
         return True
 
     def on_interrupt(self):
@@ -577,6 +594,10 @@ class TerminalApp:
         self.stopped = True
         self.close_stream()
         self.clear_spinner()
+        if self._interrupt_task is not None and not self._interrupt_task.done():
+            self._interrupt_task.cancel()
+            await asyncio.gather(self._interrupt_task, return_exceptions=True)
+            self._interrupt_task = None
         await self.runtime.drain()
         self.runtime.shutdown()
 
@@ -602,6 +623,31 @@ class TerminalApp:
             self.error(str(exc))
             return True
 
+    def _clear_pending_selection(self) -> None:
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
+
+    def _prune_pending_effort(self, model: str | None) -> None:
+        if (
+            self.pending_effort
+            and self.pending_effort
+            not in self.runtime.model_efforts.get(model or "", [])
+        ):
+            self.pending_effort = None
+
+    async def _open_workspace(
+        self, path: Path | str, python: str | None, *, notice: str | None = None
+    ) -> None:
+        await self.runtime.transition(self.runtime.open_workspace, path, python)
+        self.initial_python = None
+        self._clear_pending_selection()
+        if notice:
+            self.write(notice)
+        await self.runtime.emit(
+            "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
+        )
+
     async def run_query(self, text: str):
         raw_model = (
             self.runtime.model_raw_ids.get(self.pending_model)
@@ -619,9 +665,7 @@ class TerminalApp:
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         if query_state == "pending":
             session = self.runtime.session
             snapshot = session.pending_prompts_snapshot() if session else []
@@ -649,9 +693,7 @@ class TerminalApp:
 
     async def _command_new(self, argument: str) -> bool:
         self.require_idle("start a new session")
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -668,7 +710,9 @@ class TerminalApp:
     async def _command_restart(self, argument: str) -> bool:
         self.require_idle("restart the kernel")
         session = self.runtime.session
-        await self.runtime.transition(session.kernel.restart)
+        await self.runtime.transition_agent(
+            self.runtime.primary_agent_id, session.kernel.restart
+        )
         await self.runtime.emit(
             "kernel_restarted", {"kernel_alive": session.kernel.is_alive()}
         )
@@ -724,9 +768,7 @@ class TerminalApp:
         data = await self.runtime.transition(
             self.runtime.resume_session, ids[0], restore_kernel
         )
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         await self.runtime.emit("session_resumed", data)
         return True
 
@@ -737,15 +779,17 @@ class TerminalApp:
         if target.is_dir():
             target = target / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + "\n")
+        target.write_text(
+            json.dumps(notebook, ensure_ascii=False, indent=1) + "\n",
+            encoding="utf-8",
+        )
         self.write(f"Saved {target}")
         return True
 
     async def _command_model(self, argument: str) -> bool:
         runtime = self.runtime
         if not argument:
-            current = runtime.session.model if runtime.session else runtime.model
-            self.write(f"model: {current or 'No model available'}")
+            self.write(f"model: {runtime.current_model or 'No model available'}")
             if self.pending_model:
                 self.write(
                     f"{self.pending_model} applies from the next message.", style="dim"
@@ -771,20 +815,16 @@ class TerminalApp:
             return True
         self.pending_model = argument
         self.pending_model_provider = runtime.model_providers.get(argument)
-        supported = runtime.model_efforts.get(argument, [])
-        if self.pending_effort and self.pending_effort not in supported:
-            self.pending_effort = None
+        self._prune_pending_effort(argument)
         self.write(f"Using {argument} from the next message.")
         return True
 
     async def _command_effort(self, argument: str) -> bool:
         runtime = self.runtime
-        session = runtime.session
-        target = self.pending_model or (session.model if session else runtime.model)
+        target = self.pending_model or runtime.current_model
         levels = runtime.model_efforts.get(target or "", [])
-        current = session.effort if session else runtime.effort
         if not argument:
-            self.write(f"effort: {current or 'none'}")
+            self.write(f"effort: {runtime.current_effort or 'none'}")
             if self.pending_effort:
                 self.write(
                     f"{self.pending_effort} applies from the next message.",
@@ -880,28 +920,13 @@ class TerminalApp:
                     f"Dropped pending model {self.pending_model}: not in the new catalogue.",
                     style="dim",
                 )
-                self.pending_model = None
-                self.pending_model_provider = None
-                self.pending_effort = None
+                self._clear_pending_selection()
             else:
                 self.pending_model = resolved
                 self.pending_model_provider = self.runtime.model_providers.get(resolved)
-                if (
-                    self.pending_effort
-                    and self.pending_effort
-                    not in self.runtime.model_efforts.get(resolved, [])
-                ):
-                    self.pending_effort = None
-        elif self.pending_effort:
-            active_model = (
-                self.runtime.session.model
-                if self.runtime.session
-                else self.runtime.model
-            )
-            if self.pending_effort not in self.runtime.model_efforts.get(
-                active_model or "", []
-            ):
-                self.pending_effort = None
+                self._prune_pending_effort(resolved)
+        else:
+            self._prune_pending_effort(self.runtime.current_model)
         self.check_model(self.runtime.model)
         return True
 
@@ -910,16 +935,10 @@ class TerminalApp:
             self.error("Name a Python executable, or managed.")
             return True
         session = self.runtime.require_session()
-        await self.runtime.transition(
-            self.runtime.open_workspace, session.workspace_path, argument
-        )
-        self.initial_python = None
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
-        self.write("New research environment; this starts a new chat.")
-        await self.runtime.emit(
-            "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
+        await self._open_workspace(
+            session.workspace_path,
+            argument,
+            notice="New research environment; this starts a new chat.",
         )
         return True
 
@@ -927,16 +946,7 @@ class TerminalApp:
         if not argument:
             self.error("Name the workspace folder to open.")
             return True
-        await self.runtime.transition(
-            self.runtime.open_workspace, argument, self.initial_python
-        )
-        self.initial_python = None
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
-        await self.runtime.emit(
-            "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
-        )
+        await self._open_workspace(argument, self.initial_python)
         return True
 
     async def _command_docs(self, argument: str) -> bool:

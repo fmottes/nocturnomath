@@ -30,6 +30,7 @@ from .backends import (
 )
 from .environment import ResearchEnvironment
 from .kernel import Kernel
+from .notes import write_text
 from .prompt import DEFAULT_EXPLORATION_PROMPT, build_system_prompt
 from .tools import ToolSpec, build_tools
 from .workspace import Workspace
@@ -105,43 +106,19 @@ class ExplorationSession:
         self._compaction_reserved = False
         self.status = "idle"
         self._current_task: asyncio.Task | None = None
-        self._pending_idle_emit = False
         self._query_task: asyncio.Task | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_operation_lock = asyncio.Lock()
-        self._session_initialized = False
-        self._results_since_note = 0
-        self._pending_verdict: str | None = None
-        self._pending_verdict_probe_id: str | None = None
         self._slurm_review_probe_id: str | None = None
-        self._active_provider: ProviderId | None = None
-        self._owner_provider: ProviderId | None = None
-        self._active_model: str | None = None
-        self._active_raw_model: str | None = None
-        self._active_effort: str | None = None
-        self._sdk_session_id: str | None = None
-        self._resume_prefix: str | None = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
         self._kernel_notice = ""
         self._pending_kernel_start: tuple[str, str] | None = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts: list[PendingPrompt] = []
         self._interrupt_epoch = 0
-        self._turn_model: str | None = None
-        self._turn_selection: tuple[ProviderId, str, str | None] | None = None
-        self._bound_turn: BoundTurnConfig | None = None
         self._last_pending_task: asyncio.Task[Any] | None = None
         self._commit_turn_accepted: Callable[[], None] | None = None
         self._draining_queries = False
-        self._pending_user_logs: list[str] | None = None
-        self.context_usage: dict[str, Any] | None = None
         # Documents chosen for the next message, and what this conversation already saw.
         self.document_choices: dict[str, bool] = {}
-        self._sent_documents: dict[str, str] = {}
+        self._reset_conversation_state()
 
         self.environment = ResearchEnvironment(workspace_path, python)
         self.kernel = Kernel(cwd=workspace_path, environment=self.environment)
@@ -285,6 +262,33 @@ class ExplorationSession:
             "Treat this current copy as authoritative:\n\n"
         )
 
+    def _reset_conversation_state(self) -> None:
+        self._session_initialized = False
+        self._active_provider: ProviderId | None = None
+        self._owner_provider: ProviderId | None = None
+        self._active_model: str | None = None
+        self._active_raw_model: str | None = None
+        self._active_effort: str | None = None
+        self._sdk_session_id: str | None = None
+        self._resume_prefix: str | None = None
+        self._needs_recap = False
+        self._recap_allow_preserved_kernel = False
+        self._kernel_interrupt_requested = False
+        self._results_since_note = 0
+        self._pending_verdict: str | None = None
+        self._pending_verdict_probe_id: str | None = None
+        self._record_dirty_seq = 0
+        self._record_acked_seq = 0
+        self._record_reload_reason = "concurrent"
+        self._pending_prompts: list[PendingPrompt] = []
+        self._turn_model: str | None = None
+        self._turn_selection: tuple[ProviderId, str, str | None] | None = None
+        self._bound_turn: BoundTurnConfig | None = None
+        self._pending_user_logs: list[str] | None = None
+        self._pending_idle_emit = False
+        self.context_usage: dict[str, Any] | None = None
+        self._sent_documents: dict[str, str] = {}
+
     def start_new_transcript(self):
         self.workspace.start_new_transcript()
         self._owner_provider = None
@@ -310,30 +314,7 @@ class ExplorationSession:
         self.kernel = kernel
         self.kernel.on_start = self.record_kernel_start
         self.record_kernel_start("workspace changed")
-        self._session_initialized = False
-        self._active_provider = None
-        self._owner_provider = None
-        self._active_model = None
-        self._active_raw_model = None
-        self._active_effort = None
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
-        self._results_since_note = 0
-        self._pending_verdict = None
-        self._pending_verdict_probe_id = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
-        self.context_usage = None
+        self._reset_conversation_state()
         self.load_document_settings()
         logger.info(f"Switched workspace to: {new_path}")
 
@@ -356,14 +337,19 @@ class ExplorationSession:
             else {}
         )
 
-    def list_documents(self) -> list[dict[str, Any]]:
-        """Documents with their inclusion flag; unseen files take the default."""
+    def documents_and_folders(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Documents (with inclusion flags) and subfolders in one directory walk."""
         self.refresh_document_settings()
-        documents = self.workspace.list_documents()
+        documents, folders = self.workspace.list_documents_and_folders()
         for document in documents:
             document["included"] = self.document_choices.get(
                 document["name"], self.documents_default
             )
+        return documents, folders
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        """Documents with their inclusion flag; unseen files take the default."""
+        documents, _ = self.documents_and_folders()
         return documents
 
     def set_document_included(self, name: str, included: bool) -> bool:
@@ -712,9 +698,8 @@ class ExplorationSession:
 
         path = self.workspace.transcript_file(session_id)
         records = self.workspace.read_transcript(path)
-        saved_provider, sdk_id = self.workspace.sdk_session_info(records)
-        owner_provider, saved_model, saved_effort = (
-            self.workspace.session_provider_and_model(records)
+        owner_provider, sdk_id, saved_model, saved_effort = self.workspace.session_meta(
+            records
         )
         changed = (
             self.workspace.session_pending or path != self.workspace.transcript_path
@@ -736,48 +721,21 @@ class ExplorationSession:
         else:
             replayed = 0
 
-        resolved_owner = (
-            owner_provider
-            if owner_provider in self.backends
-            else saved_provider
-            if saved_provider in self.backends
-            else None
-        )
-        can_restore_native = (
-            sdk_id is not None
-            and saved_provider in self.backends
-            and (resolved_owner is None or saved_provider == resolved_owner)
-        )
+        resolved_owner = owner_provider if owner_provider in self.backends else None
+        can_restore_native = sdk_id is not None and resolved_owner is not None
+        self._reset_conversation_state()
         if can_restore_native:
-            self._active_provider = saved_provider
+            self._active_provider = resolved_owner
             self._sdk_session_id = sdk_id
-            self._resume_prefix = None
-            self._needs_recap = False
-            self._recap_allow_preserved_kernel = False
         else:
-            self._active_provider = None
-            self._sdk_session_id = None
             self._resume_prefix = self.workspace.recap(records)
             self._needs_recap = True
-            self._recap_allow_preserved_kernel = False
         self._owner_provider = resolved_owner
         self._active_model = saved_model
         self._active_raw_model = (
             self.raw_model_id(saved_model) if saved_model is not None else None
         )
         self._active_effort = saved_effort
-
-        self._sent_documents = {}
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._results_since_note = 0
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
         self._restore_pending_verdict(records)
         latest_ctx_record = (
             next(
@@ -794,7 +752,6 @@ class ExplorationSession:
         self.context_usage = (
             latest_ctx_record if isinstance(latest_ctx_record, dict) else None
         )
-        self._session_initialized = False
 
         if restore_kernel:
             probe_word = "probe" if replayed == 1 else "probes"
@@ -858,6 +815,36 @@ class ExplorationSession:
         self.log_transcript("compaction", record_reloaded=record_reloaded)
         await self.emit("context_compacted", record_reloaded=record_reloaded)
 
+    async def _invalidate_native_session(
+        self,
+        provider: ProviderId,
+        stale_id: str | None,
+        prior_records: list[dict[str, Any]],
+    ) -> None:
+        self._sdk_session_id = None
+        self._active_provider = None
+        self._owner_provider = provider
+        self._sent_documents = {}
+        self.context_usage = None
+        self._session_initialized = False
+        self._needs_recap = True
+        self._recap_allow_preserved_kernel = True
+        self._resume_prefix = (
+            self.workspace.recap(
+                prior_records, kernel_preserved=not self._kernel_notice
+            )
+            if prior_records
+            else None
+        )
+        self.log_transcript(
+            "meta",
+            context_rebuilt=True,
+            provider=provider,
+            stale_sdk_session_id=stale_id,
+            context_usage=None,
+        )
+        await self.emit("context_usage_changed", context_usage=None)
+
     async def compact(self):
         reserved = self._compaction_reserved
         self._compaction_reserved = False
@@ -890,31 +877,9 @@ class ExplorationSession:
                     resume_session_id=self._sdk_session_id,
                 )
             except SessionResumeError as exc:
-                prior_records = self.workspace.current_records()
-                stale_id = self._sdk_session_id
-                self._sdk_session_id = None
-                self._active_provider = None
-                self._owner_provider = provider
-                self._sent_documents = {}
-                self.context_usage = None
-                self._session_initialized = False
-                self._needs_recap = True
-                self._recap_allow_preserved_kernel = True
-                self._resume_prefix = (
-                    self.workspace.recap(
-                        prior_records, kernel_preserved=not self._kernel_notice
-                    )
-                    if prior_records
-                    else None
+                await self._invalidate_native_session(
+                    provider, self._sdk_session_id, self.workspace.current_records()
                 )
-                self.log_transcript(
-                    "meta",
-                    context_rebuilt=True,
-                    provider=provider,
-                    stale_sdk_session_id=stale_id,
-                    context_usage=None,
-                )
-                await self.emit("context_usage_changed", context_usage=None)
                 raise RuntimeError(
                     "Saved provider session is no longer available; the next message will rebuild context from the transcript."
                 ) from exc
@@ -1013,9 +978,7 @@ class ExplorationSession:
             slurm_probe_id=probe_id,
         )
 
-    async def query(self, user_text: str, *, slurm_probe_id: str | None = None):
-        if self._is_busy:
-            raise RuntimeError("Agent is already running a query.")
+    def _resolve_turn_config(self, slurm_probe_id: str | None) -> BoundTurnConfig:
         owner_provider = (
             self._active_provider or self._owner_provider
             if slurm_probe_id is not None
@@ -1036,7 +999,82 @@ class ExplorationSession:
         elif bound is None:
             bound = self.bind_next_turn()
             self._bound_turn = None
+        return bound
 
+    def _read_transcript_prefix(self, max_bytes: int) -> list[dict[str, Any]]:
+        if max_bytes <= 0 or not self.workspace.transcript_path.is_file():
+            return []
+        records: list[dict[str, Any]] = []
+        try:
+            with self.workspace.transcript_path.open("rb") as handle:
+                raw = handle.read(max_bytes)
+            for line in raw.decode("utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except Exception as exc:
+            logger.warning("Failed to read transcript prefix: %s", exc)
+        return records
+
+    async def _handle_turn_event(
+        self,
+        event: Any,
+        backend: AgentBackend,
+        accumulated_text: list[str],
+    ) -> None:
+        if isinstance(event, TextDelta):
+            await self.emit("assistant_delta", text=event.text)
+        elif isinstance(event, CompactionNotice):
+            await self._record_compaction(record_reloaded=backend.uses_compact_hook)
+            if not backend.uses_compact_hook:
+                self.mark_record_dirty(reason="compaction")
+        elif isinstance(event, MessageUsage):
+            self.log_transcript(
+                "message_usage",
+                message_id=event.message_id,
+                model=event.model,
+                usage=event.usage,
+            )
+        elif isinstance(event, TextBlockDone):
+            accumulated_text.append(event.text)
+            self.log_transcript("agent", text=event.text)
+            await self.emit("assistant_text", text=event.text)
+        elif isinstance(event, TurnResult):
+            if any(
+                value is not None
+                for value in (
+                    event.usage,
+                    event.model_usage,
+                    event.total_cost_usd,
+                    event.duration_ms,
+                    event.duration_api_ms,
+                    event.num_turns,
+                )
+            ):
+                self.log_transcript(
+                    "usage",
+                    usage=event.usage,
+                    model_usage=event.model_usage,
+                    total_cost_usd=event.total_cost_usd,
+                    duration_ms=event.duration_ms,
+                    duration_api_ms=event.duration_api_ms,
+                    num_turns=event.num_turns,
+                )
+            if event.context_usage is not None:
+                self.context_usage = event.context_usage
+                self.log_transcript("meta", context_usage=self.context_usage)
+                await self.emit(
+                    "context_usage_changed", context_usage=self.context_usage
+                )
+
+    async def query(self, user_text: str, *, slurm_probe_id: str | None = None):
+        if self._is_busy:
+            raise RuntimeError("Agent is already running a query.")
+        bound = self._resolve_turn_config(slurm_probe_id)
         turn_catalogue_model = bound.catalogue_model
         provider = bound.provider
         turn_raw_model = bound.raw_model
@@ -1049,7 +1087,6 @@ class ExplorationSession:
         self._turn_selection = (provider, turn_raw_model, turn_effort)
         turn_epoch = self._interrupt_epoch
         try:
-            prior_records = self.workspace.current_records()
             switching_provider = (
                 self._active_provider is not None and provider != self._active_provider
             )
@@ -1059,16 +1096,33 @@ class ExplorationSession:
                 and self._session_initialized
             )
             resetting_context = switching_provider or rebuilding_threadless
-            turn_resume_prefix = (
-                (
+            prior_records: list[dict[str, Any]] | None = None
+            pre_turn_offset = 0
+            if resetting_context or self._needs_recap:
+                prior_records = self.workspace.current_records()
+            elif (
+                not self.workspace.session_pending
+                and self.workspace.transcript_path.is_file()
+            ):
+                with suppress(OSError):
+                    pre_turn_offset = self.workspace.transcript_path.stat().st_size
+
+            def load_prior_records() -> list[dict[str, Any]]:
+                nonlocal prior_records
+                if prior_records is None:
+                    prior_records = self._read_transcript_prefix(pre_turn_offset)
+                return prior_records
+
+            if resetting_context:
+                turn_resume_prefix = (
                     self.workspace.recap(
                         prior_records, kernel_preserved=not self._kernel_notice
                     )
                     if prior_records
                     else None
                 )
-                if resetting_context
-                else (
+            elif self._needs_recap:
+                turn_resume_prefix = (
                     self.workspace.recap(
                         prior_records,
                         kernel_preserved=self._recap_allow_preserved_kernel
@@ -1077,9 +1131,8 @@ class ExplorationSession:
                     if prior_records
                     else None
                 )
-                if self._needs_recap
-                else self._resume_prefix
-            )
+            else:
+                turn_resume_prefix = self._resume_prefix
             base_sent_documents: Mapping[str, str] = (
                 {} if resetting_context else self._sent_documents
             )
@@ -1267,61 +1320,13 @@ class ExplorationSession:
                                     else:
                                         pending_session_id = event.session_id
                                     continue
-                                if isinstance(event, TurnStarted):
-                                    commit_progress()
-                                    await emit_context_reset_if_needed()
-                                    continue
                                 commit_progress()
                                 await emit_context_reset_if_needed()
-                                if isinstance(event, TextDelta):
-                                    await self.emit("assistant_delta", text=event.text)
-                                elif isinstance(event, CompactionNotice):
-                                    await self._record_compaction(
-                                        record_reloaded=backend.uses_compact_hook
-                                    )
-                                    if not backend.uses_compact_hook:
-                                        self.mark_record_dirty(reason="compaction")
-                                elif isinstance(event, MessageUsage):
-                                    self.log_transcript(
-                                        "message_usage",
-                                        message_id=event.message_id,
-                                        model=event.model,
-                                        usage=event.usage,
-                                    )
-                                elif isinstance(event, TextBlockDone):
-                                    accumulated_text.append(event.text)
-                                    self.log_transcript("agent", text=event.text)
-                                    await self.emit("assistant_text", text=event.text)
-                                elif isinstance(event, TurnResult):
-                                    if any(
-                                        value is not None
-                                        for value in (
-                                            event.usage,
-                                            event.model_usage,
-                                            event.total_cost_usd,
-                                            event.duration_ms,
-                                            event.duration_api_ms,
-                                            event.num_turns,
-                                        )
-                                    ):
-                                        self.log_transcript(
-                                            "usage",
-                                            usage=event.usage,
-                                            model_usage=event.model_usage,
-                                            total_cost_usd=event.total_cost_usd,
-                                            duration_ms=event.duration_ms,
-                                            duration_api_ms=event.duration_api_ms,
-                                            num_turns=event.num_turns,
-                                        )
-                                    if event.context_usage is not None:
-                                        self.context_usage = event.context_usage
-                                        self.log_transcript(
-                                            "meta", context_usage=self.context_usage
-                                        )
-                                        await self.emit(
-                                            "context_usage_changed",
-                                            context_usage=self.context_usage,
-                                        )
+                                if isinstance(event, TurnStarted):
+                                    continue
+                                await self._handle_turn_event(
+                                    event, backend, accumulated_text
+                                )
                         commit_progress()
                         await emit_context_reset_if_needed()
                         break
@@ -1335,32 +1340,12 @@ class ExplorationSession:
                             resume_id,
                             exc,
                         )
-                        self._sdk_session_id = None
-                        self._active_provider = None
-                        self._owner_provider = provider
-                        self._sent_documents = {}
-                        self.context_usage = None
-                        self._session_initialized = False
-                        self.log_transcript(
-                            "meta",
-                            context_rebuilt=True,
-                            provider=provider,
-                            stale_sdk_session_id=resume_id,
-                            context_usage=None,
+                        await self._invalidate_native_session(
+                            provider, resume_id, load_prior_records()
                         )
-                        await self.emit("context_usage_changed", context_usage=None)
                         await self.emit(
                             "system_message",
                             text="Original provider session was unavailable; rebuilt context from the saved transcript.",
-                        )
-                        self._needs_recap = True
-                        self._recap_allow_preserved_kernel = True
-                        self._resume_prefix = (
-                            self.workspace.recap(
-                                prior_records, kernel_preserved=not self._kernel_notice
-                            )
-                            if prior_records
-                            else None
                         )
                         turn_resume_prefix = self._resume_prefix
                         base_sent_documents = {}
@@ -1465,31 +1450,7 @@ class ExplorationSession:
         except Exception:
             self.workspace.restore_session_state(previous_state)
             raise
-        self._session_initialized = False
-        self._active_provider = None
-        self._owner_provider = None
-        self._active_model = None
-        self._active_raw_model = None
-        self._active_effort = None
-        self._sdk_session_id = None
-        self._resume_prefix = None
-        self._needs_recap = False
-        self._recap_allow_preserved_kernel = False
-        self._kernel_interrupt_requested = False
-        self._sent_documents = {}
-        self._results_since_note = 0
-        self._pending_verdict = None
-        self._pending_verdict_probe_id = None
-        self._record_dirty_seq = 0
-        self._record_acked_seq = 0
-        self._record_reload_reason = "concurrent"
-        self._pending_prompts = []
-        self._turn_model = None
-        self._turn_selection = None
-        self._bound_turn = None
-        self._pending_user_logs = None
-        self._pending_idle_emit = False
-        self.context_usage = None
+        self._reset_conversation_state()
         self.model = self.default_model
         self.effort = self.default_effort
 
@@ -1497,7 +1458,7 @@ class ExplorationSession:
         directory = self.transcript_path.parent / "environments"
         directory.mkdir(exist_ok=True)
         path = directory / f"{uuid.uuid4().hex}.json"
-        path.write_text(json.dumps(self.environment.snapshot(), indent=2) + "\n")
+        write_text(path, json.dumps(self.environment.snapshot(), indent=2) + "\n")
         self.environment_record = str(path.relative_to(self.workspace.path))
 
     def record_kernel_start(self, reason):
@@ -1554,7 +1515,7 @@ class ExplorationSession:
             "status": "started",
         }
         path = directory / "install.json"
-        path.write_text(json.dumps(metadata, indent=2) + "\n")
+        write_text(path, json.dumps(metadata, indent=2) + "\n")
         try:
             with (directory / "output.txt").open("w") as output:
                 result = subprocess.run(
@@ -1581,7 +1542,7 @@ class ExplorationSession:
                 self.record_environment()
                 metadata["after"] = self.environment_record
             finally:
-                path.write_text(json.dumps(metadata, indent=2) + "\n")
+                write_text(path, json.dumps(metadata, indent=2) + "\n")
         self.log_transcript(
             "packages_installed",
             **metadata,

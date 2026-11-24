@@ -7,6 +7,7 @@ import json
 import re
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any
@@ -68,6 +69,87 @@ def tool(name: str, description: str, schema: dict[str, Any]):
     return decorator
 
 
+def _check_json_type(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _validate_property_value(name: str, value: Any, prop: dict[str, Any]) -> None:
+    expected = prop.get("type")
+    if isinstance(expected, str):
+        if not _check_json_type(value, expected):
+            raise ValueError(f"Argument '{name}' must be of type {expected}.")
+    elif (
+        isinstance(expected, list)
+        and expected
+        and not any(isinstance(t, str) and _check_json_type(value, t) for t in expected)
+    ):
+        joined = " | ".join(str(t) for t in expected)
+        raise ValueError(f"Argument '{name}' must be of type {joined}.")
+    if "enum" in prop and isinstance(prop["enum"], list) and value not in prop["enum"]:
+        raise ValueError(f"Argument '{name}' must be one of {prop['enum']}.")
+    if isinstance(value, list):
+        min_items = prop.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ValueError(
+                f"Argument '{name}' must contain at least {min_items} item(s)."
+            )
+        items_schema = prop.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                _validate_property_value(f"{name}[{index}]", item, items_schema)
+
+
+def validate_tool_arguments(
+    schema: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate and clean tool call arguments against a JSON Schema object."""
+    properties = (
+        schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    )
+    required_list = (
+        schema.get("required") if isinstance(schema.get("required"), list) else []
+    )
+    disallow_extra = schema.get("additionalProperties") is False
+    required = {item for item in required_list if isinstance(item, str)}
+    cleaned: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if disallow_extra and key not in properties:
+            raise ValueError(f"Unexpected argument: '{key}'.")
+        prop = properties.get(key)
+        if value is None:
+            prop_type = prop.get("type") if isinstance(prop, dict) else None
+            allows_null = prop_type == "null" or (
+                isinstance(prop_type, list) and "null" in prop_type
+            )
+            if allows_null:
+                cleaned[key] = None
+                continue
+            if key not in required:
+                continue
+            raise ValueError(f"Argument '{key}' is required and cannot be null.")
+        if isinstance(prop, dict):
+            _validate_property_value(key, value, prop)
+        cleaned[key] = value
+    for key in required_list:
+        if isinstance(key, str) and key not in cleaned:
+            raise ValueError(f"Missing required argument: '{key}'.")
+    return cleaned
+
+
 BACKEND_SWITCH = re.compile(
     r"matplotlib\.use\s*\(|switch_backend\s*\(|%matplotlib\s+(?!inline\b)\S"
 )
@@ -94,6 +176,55 @@ def builds_machinery(code: str) -> bool:
     return bool(classes) or len(functions) > 2
 
 
+def _text_result(text: str, *, is_error: bool | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+    if is_error is not None:
+        result["is_error"] = is_error
+    return result
+
+
+def _failure(message: str) -> dict[str, Any]:
+    return _text_result(message, is_error=True)
+
+
+def _image_blocks(encoded_images: list[str]) -> list[dict[str, Any]]:
+    return [
+        {"type": "image", "data": encoded, "mimeType": "image/png"}
+        for encoded in encoded_images
+    ]
+
+
+def _probe_payload(
+    *,
+    probe_id: str,
+    expected: str,
+    code: str,
+    code_path: str,
+    output: str,
+    text: str,
+    status: str,
+    execution_note: str | None = None,
+    plot_paths: list[str] | None = None,
+    plot_images: list[str] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    paths = list(plot_paths) if plot_paths else []
+    return {
+        "probe_id": probe_id,
+        **extra,
+        "expected": expected,
+        "code": code,
+        "code_path": code_path,
+        "output": output,
+        "text": text,
+        "status": status,
+        "execution_note": execution_note,
+        "plot_paths": paths,
+        "plot_urls": [f"/api/asset?path={path}" for path in paths],
+        "plot_images": list(plot_images) if plot_images else [],
+    }
+
+
 def build_tools(session: "ExplorationSession"):
     """Create the exploration and scientific record tools for a session."""
 
@@ -107,11 +238,36 @@ def build_tools(session: "ExplorationSession"):
         task.add_done_callback(clear)
         return task
 
+    def probe_busy() -> bool:
+        return session.kernel.busy or (
+            session._probe_task is not None and not session._probe_task.done()
+        )
+
+    async def run_probe_task(
+        fn: Callable[..., Any],
+        *args: Any,
+        wait_on_cancel: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        task = track_probe_task(
+            asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if wait_on_cancel:
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(task)
+            raise
+        finally:
+            if session._probe_task is task and task.done():
+                session._probe_task = None
+
     def serialize_probe_operation(handler):
         @wraps(handler)
         async def guarded(args):
             if session._probe_operation_lock.locked():
-                return failure("Another probe operation is still running.")
+                return _failure("Another probe operation is still running.")
             async with session._probe_operation_lock:
                 return await handler(args)
 
@@ -142,57 +298,39 @@ def build_tools(session: "ExplorationSession"):
         retry_of = args.get("retry_of") or None
 
         if session._pending_verdict is not None:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Nothing ran. The last probe has no verdict yet; it "
-                        f"expected: {session._pending_verdict}. Call `verdict` with "
-                        "what the result actually showed against that, then run this "
-                        "again. A probe that only loaded or inspected data still needs "
-                        "one, and there a single line is enough.",
-                    }
-                ],
-                "is_error": True,
-            }
+            return _failure(
+                "Nothing ran. The last probe has no verdict yet; it "
+                f"expected: {session._pending_verdict}. Call `verdict` with "
+                "what the result actually showed against that, then run this "
+                "again. A probe that only loaded or inspected data still needs "
+                "one, and there a single line is enough."
+            )
 
         steered = await session.consume_steer_message()
         if steered is not None:
             return steered
 
         if not expected and not retry_of:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Nothing ran. `expected` is required: state in one line what you "
-                        "predict this code will show, then call run again.",
-                    }
-                ],
-                "is_error": True,
-            }
+            return _failure(
+                "Nothing ran. `expected` is required: state in one line what you "
+                "predict this code will show, then call run again."
+            )
 
         if switches_backend(code):
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Nothing ran. This changes the matplotlib backend, which stops "
-                        "plots from being captured for the rest of the session — the kernel is "
-                        "persistent, so it would not recover on its own. Plots are captured and "
-                        "saved automatically; just build the figure. Remove the backend switch "
-                        "and call run again.",
-                    }
-                ],
-                "is_error": True,
-            }
+            return _failure(
+                "Nothing ran. This changes the matplotlib backend, which stops "
+                "plots from being captured for the rest of the session — the kernel is "
+                "persistent, so it would not recover on its own. Plots are captured and "
+                "saved automatically; just build the figure. Remove the backend switch "
+                "and call run again."
+            )
+
+        if probe_busy():
+            return _failure("A probe is still executing or saving its artifacts.")
 
         preface = []
         if not session.kernel.is_alive():
-            restart_task = track_probe_task(
-                asyncio.create_task(asyncio.to_thread(session.kernel.restart))
-            )
-            await asyncio.shield(restart_task)
+            await run_probe_task(session.kernel.restart)
             preface.append(
                 "Note: the kernel was dead and has been restarted. Everything in memory is gone; "
                 "reload what you need."
@@ -202,10 +340,8 @@ def build_tools(session: "ExplorationSession"):
                 "Note: this is building machinery. Is there a flatter version that answers the question?"
             )
 
-        if session.kernel.busy or (
-            session._probe_task and not session._probe_task.done()
-        ):
-            return failure("A probe is still executing or saving its artifacts.")
+        if probe_busy():
+            return _failure("A probe is still executing or saving its artifacts.")
         session.activate_session()
         workspace = session.workspace
         transcript_path = session.transcript_path
@@ -230,8 +366,8 @@ def build_tools(session: "ExplorationSession"):
                 )
             )
         except ValueError as exc:
-            return failure(str(exc))
-        if retry_of:
+            return _failure(str(exc))
+        if retry_of and not expected:
             expected = json.loads((probe_path / "probe.json").read_text())["expected"]
         source_id = f"{workspace.session_id}/{probe_path.relative_to(workspace.probes_path).as_posix()}"
         probe_dir = probe_path.relative_to(workspace.path).as_posix()
@@ -338,17 +474,20 @@ def build_tools(session: "ExplorationSession"):
                     session._pending_verdict_probe_id = source_id
                 await session.emit(
                     "probe_finish",
-                    probe_id=source_id,
-                    expected=expected,
-                    code=code,
-                    code_path=code_path,
-                    output=f"Probe {source_id}\nSource: {source_id}/output.txt\n{text}",
-                    text=text,
-                    status=status,
-                    execution_note=kernel_note,
-                    plot_paths=plot_paths,
-                    plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
-                    plot_images=[base64.b64encode(image).decode() for image in images],
+                    **_probe_payload(
+                        probe_id=source_id,
+                        expected=expected,
+                        code=code,
+                        code_path=code_path,
+                        output=f"Probe {source_id}\nSource: {source_id}/output.txt\n{text}",
+                        text=text,
+                        status=status,
+                        execution_note=kernel_note,
+                        plot_paths=plot_paths,
+                        plot_images=[
+                            base64.b64encode(image).decode() for image in images
+                        ],
+                    ),
                 )
 
             finish_task = asyncio.create_task(finish_cancelled_probe())
@@ -366,22 +505,20 @@ def build_tools(session: "ExplorationSession"):
             )
             await session.emit(
                 "probe_finish",
-                probe_id=source_id,
-                expected=expected,
-                code=code,
-                code_path=code_path,
-                output=message,
-                text=str(exc),
-                status="failed",
-                execution_note=None,
-                plot_paths=[],
-                plot_urls=[],
-                plot_images=[],
+                **_probe_payload(
+                    probe_id=source_id,
+                    expected=expected,
+                    code=code,
+                    code_path=code_path,
+                    output=message,
+                    text=str(exc),
+                    status="failed",
+                ),
             )
-            return failure(message)
+            return _failure(message)
 
         encoded_images = [base64.b64encode(image).decode() for image in images]
-        shown = images[: session.image_cap]
+        shown_encoded = encoded_images[: session.image_cap]
         if len(images) > session.image_cap:
             preface.insert(
                 0,
@@ -428,39 +565,30 @@ def build_tools(session: "ExplorationSession"):
 
         await session.emit(
             "probe_finish",
-            probe_id=source_id,
-            expected=expected,
-            code=code,
-            code_path=code_path,
-            output=output,
-            text=text,
-            status=status,
-            execution_note=kernel_note,
-            plot_paths=plot_paths,
-            plot_urls=[f"/api/asset?path={path}" for path in plot_paths],
-            plot_images=encoded_images,
+            **_probe_payload(
+                probe_id=source_id,
+                expected=expected,
+                code=code,
+                code_path=code_path,
+                output=output,
+                text=text,
+                status=status,
+                execution_note=kernel_note,
+                plot_paths=plot_paths,
+                plot_images=encoded_images,
+            ),
         )
 
-        content = [{"type": "text", "text": output}]
-        for image in shown:
-            content.append(
-                {
-                    "type": "image",
-                    "data": base64.b64encode(image).decode(),
-                    "mimeType": "image/png",
-                }
-            )
-        return {"content": content}
-
-    def failure(message):
-        return {"content": [{"type": "text", "text": message}], "is_error": True}
+        return {
+            "content": [{"type": "text", "text": output}, *_image_blocks(shown_encoded)]
+        }
 
     async def record_changed(kind, entry_id, text, **fields):
         session.log_transcript(kind, entry_id=entry_id, text=text, **fields)
         await session.emit(
             "record_changed", kind=kind, entry_id=entry_id, text=text, **fields
         )
-        return {"content": [{"type": "text", "text": f"Recorded {entry_id}."}]}
+        return _text_result(f"Recorded {entry_id}.")
 
     @tool(
         "evidence",
@@ -482,7 +610,7 @@ def build_tools(session: "ExplorationSession"):
             links = session.workspace.evidence_sources(args["sources"])
             entry_id = session.workspace.notes.add_evidence(args["text"], links)
         except (ValueError, FileNotFoundError) as exc:
-            return failure(str(exc))
+            return _failure(str(exc))
         session._results_since_note = 0
         return await record_changed(
             "evidence", entry_id, args["text"], sources=args["sources"]
@@ -510,7 +638,7 @@ def build_tools(session: "ExplorationSession"):
                 args["text"], args["replaces"]
             )
         except ValueError as exc:
-            return failure(str(exc))
+            return _failure(str(exc))
         return await record_changed(
             "thought", entry_id, args["text"], replaces=args["replaces"]
         )
@@ -526,7 +654,7 @@ def build_tools(session: "ExplorationSession"):
         try:
             session.workspace.notes.strike_evidence(args["entry_id"])
         except ValueError as exc:
-            return failure(str(exc))
+            return _failure(str(exc))
         return await record_changed(
             "evidence_struck", args["entry_id"], "Evidence struck as invalid."
         )
@@ -542,31 +670,22 @@ def build_tools(session: "ExplorationSession"):
     async def verdict(args):
         text = (args.get("text") or "").strip()
         if not text:
-            return {
-                "content": [{"type": "text", "text": "text must be non-empty."}],
-                "is_error": True,
-            }
+            return _failure("text must be non-empty.")
         if session._pending_verdict is None:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "No probe is waiting for a verdict. Run one first.",
-                    }
-                ],
-                "is_error": True,
-            }
+            return _failure("No probe is waiting for a verdict. Run one first.")
 
         expected = session._pending_verdict
         probe_id = session._pending_verdict_probe_id
-        probe_path = (
-            session.workspace.sessions_path
-            / probe_id.split("/")[0]
-            / "probes"
-            / probe_id.split("/")[1]
-            / "probe.json"
-        )
-        is_slurm = json.loads(probe_path.read_text()).get("backend") == "slurm"
+        is_slurm = False
+        if probe_id:
+            try:
+                probe_meta = session.workspace.probe_path(probe_id) / "probe.json"
+                if probe_meta.is_file():
+                    is_slurm = (
+                        json.loads(probe_meta.read_text()).get("backend") == "slurm"
+                    )
+            except (ValueError, OSError, json.JSONDecodeError):
+                is_slurm = False
         recorded = True
         if is_slurm:
             session.activate_session()
@@ -588,7 +707,7 @@ def build_tools(session: "ExplorationSession"):
             session.workspace.current_records(), include_slurm=False
         )
         if not recorded:
-            return failure(f"Probe {probe_id} already has a verdict.")
+            return _failure(f"Probe {probe_id} already has a verdict.")
         await session.emit(
             "probe_verdict", probe_id=probe_id, expected=expected, text=text
         )
@@ -600,7 +719,7 @@ def build_tools(session: "ExplorationSession"):
                 f"{session._pending_verdict}. Inspect {pending_id}/output.txt "
                 "before giving its verdict or starting another probe."
             )
-        return {"content": [{"type": "text", "text": message}]}
+        return _text_result(message)
 
     @tool(
         "restart_kernel",
@@ -609,28 +728,12 @@ def build_tools(session: "ExplorationSession"):
     )
     @serialize_probe_operation
     async def restart_kernel(args):
-        if session.kernel.busy or (
-            session._probe_task and not session._probe_task.done()
-        ):
-            return failure("An operation is still running.")
-        task = track_probe_task(
-            asyncio.create_task(asyncio.to_thread(session.kernel.restart))
-        )
-        try:
-            await asyncio.shield(task)
-            session._kernel_notice = ""
-        finally:
-            if task.done():
-                session._probe_task = None
+        if probe_busy():
+            return _failure("An operation is still running.")
+        await run_probe_task(session.kernel.restart)
+        session._kernel_notice = ""
         await session.emit("kernel_restarted")
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Kernel restarted. In-memory state is gone.",
-                }
-            ]
-        }
+        return _text_result("Kernel restarted. In-memory state is gone.")
 
     @tool(
         "install_packages",
@@ -651,35 +754,21 @@ def build_tools(session: "ExplorationSession"):
     )
     @serialize_probe_operation
     async def install_packages(args):
-        if session.kernel.busy or (
-            session._probe_task and not session._probe_task.done()
-        ):
-            return failure("An operation is still running.")
-        task = track_probe_task(
-            asyncio.create_task(
-                asyncio.to_thread(session.install_packages, args["packages"])
-            )
-        )
+        if probe_busy():
+            return _failure("An operation is still running.")
         try:
-            status, output, message = await asyncio.shield(task)
+            status, output, message = await run_probe_task(
+                session.install_packages, args["packages"]
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return failure(str(exc))
-        finally:
-            if task.done():
-                session._probe_task = None
+            return _failure(str(exc))
         await session.emit("system_message", text=message)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": output
-                    + "\nLoaded modules are unchanged; restart if needed.",
-                }
-            ],
-            "is_error": status != "completed",
-        }
+        return _text_result(
+            output + "\nLoaded modules are unchanged; restart if needed.",
+            is_error=status != "completed",
+        )
 
     @tool(
         "submit_slurm",
@@ -715,110 +804,90 @@ def build_tools(session: "ExplorationSession"):
     @serialize_probe_operation
     async def submit_slurm(args):
         if session._pending_verdict is not None:
-            return failure("Give the last probe its verdict before submitting another.")
+            return _failure(
+                "Give the last probe its verdict before submitting another."
+            )
         steered = await session.consume_steer_message()
         if steered is not None:
             return steered
-        if session.kernel.busy or (
-            session._probe_task and not session._probe_task.done()
-        ):
-            return failure("An operation is still running.")
+        if probe_busy():
+            return _failure("An operation is still running.")
         session.activate_session()
-        task = track_probe_task(
-            asyncio.create_task(
-                asyncio.to_thread(
-                    slurm.submit,
-                    session,
-                    args["code"],
-                    args["expected"],
-                    args["time_minutes"],
-                    args["cpus"],
-                    args["memory_gb"],
-                    args.get("partition") or "",
-                    args.get("gpus") if args.get("gpus") is not None else 0,
-                    args.get("account") or "",
-                    args.get("qos") or "",
-                    args.get("result_files") or [],
-                    correction_of=args.get("correction_of")
-                    or session._slurm_review_probe_id,
-                )
-            )
-        )
         try:
-            probe_id, job_id = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(task)
-            except (asyncio.CancelledError, ValueError):
-                pass
-            raise
+            probe_id, job_id = await run_probe_task(
+                slurm.submit,
+                session,
+                args["code"],
+                args["expected"],
+                args["time_minutes"],
+                args["cpus"],
+                args["memory_gb"],
+                args.get("partition") or "",
+                args.get("gpus") if args.get("gpus") is not None else 0,
+                args.get("account") or "",
+                args.get("qos") or "",
+                args.get("result_files") or [],
+                wait_on_cancel=True,
+                correction_of=args.get("correction_of")
+                or session._slurm_review_probe_id,
+            )
         except slurm.SubmissionError as exc:
             probe_id = exc.probe_id
             probe_dir = f".nocturnomath/sessions/{probe_id.split('/')[0]}/probes/{probe_id.split('/')[1]}"
+            code_path = f"{probe_dir}/code.py"
             await session.emit(
                 "probe_start",
                 probe_id=probe_id,
                 expected=args["expected"],
                 code=args["code"],
-                code_path=f"{probe_dir}/code.py",
+                code_path=code_path,
             )
             await session.emit(
                 "probe_finish",
-                probe_id=probe_id,
-                expected=args["expected"],
-                code=args["code"],
-                code_path=f"{probe_dir}/code.py",
-                output=str(exc),
-                text=str(exc),
-                status="slurm-error",
-                execution_note=None,
-                plot_paths=[],
-                plot_urls=[],
-                plot_images=[],
+                **_probe_payload(
+                    probe_id=probe_id,
+                    expected=args["expected"],
+                    code=args["code"],
+                    code_path=code_path,
+                    output=str(exc),
+                    text=str(exc),
+                    status="slurm-error",
+                ),
             )
-            return failure(str(exc))
+            return _failure(str(exc))
         except ValueError as exc:
-            return failure(str(exc))
-        finally:
-            if task.done():
-                session._probe_task = None
+            return _failure(str(exc))
         probe_dir = f".nocturnomath/sessions/{probe_id.split('/')[0]}/probes/{probe_id.split('/')[1]}"
+        code_path = f"{probe_dir}/code.py"
         await session.emit(
             "probe_start",
             probe_id=probe_id,
             backend="slurm",
             expected=args["expected"],
             code=args["code"],
-            code_path=f"{probe_dir}/code.py",
+            code_path=code_path,
         )
         await session.emit(
             "probe_update",
-            probe_id=probe_id,
-            backend="slurm",
-            job_id=job_id,
-            expected=args["expected"],
-            code=args["code"],
-            code_path=f"{probe_dir}/code.py",
-            output=f"Slurm job {job_id} submitted. Monitoring automatically; verdict pending.",
-            text=f"Slurm job {job_id} submitted.",
-            status="submitted",
-            execution_note=None,
-            plot_paths=[],
-            plot_urls=[],
-            plot_images=[],
+            **_probe_payload(
+                probe_id=probe_id,
+                backend="slurm",
+                job_id=job_id,
+                expected=args["expected"],
+                code=args["code"],
+                code_path=code_path,
+                output=f"Slurm job {job_id} submitted. Monitoring automatically; verdict pending.",
+                text=f"Slurm job {job_id} submitted.",
+                status="submitted",
+            ),
         )
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Probe {probe_id}: Slurm job {job_id} submitted. "
-                    f"Script: {probe_id}/code.py. Monitoring is armed; this chat will "
-                    "automatically resume to inspect the output and plots when ready. "
-                    "You may continue other work while this probe remains unresolved. "
-                    "Do not give a verdict until its output is collected.",
-                }
-            ]
-        }
+        return _text_result(
+            f"Probe {probe_id}: Slurm job {job_id} submitted. "
+            f"Script: {probe_id}/code.py. Monitoring is armed; this chat will "
+            "automatically resume to inspect the output and plots when ready. "
+            "You may continue other work while this probe remains unresolved. "
+            "Do not give a verdict until its output is collected."
+        )
 
     @tool(
         "check_slurm_job",
@@ -835,111 +904,68 @@ def build_tools(session: "ExplorationSession"):
     async def check_slurm_job(args):
         probe_id = args.get("probe_id")
         if not probe_id:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(slurm.list_jobs(session.workspace)),
-                    }
-                ]
-            }
+            return _text_result(json.dumps(slurm.list_jobs(session.workspace)))
         if (
             session._pending_verdict is not None
             and session._pending_verdict_probe_id != probe_id
         ):
-            return failure(
+            return _failure(
                 "Give the pending probe "
                 f"{session._pending_verdict_probe_id} its verdict before checking "
                 f"{probe_id}."
             )
         session.activate_session()
-        task = track_probe_task(
-            asyncio.create_task(
-                asyncio.to_thread(
-                    slurm.check, session.workspace, probe_id, session.transcript_path
-                )
-            )
-        )
         try:
-            metadata, _ = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(task)
-            except (asyncio.CancelledError, ValueError):
-                pass
-            raise
+            metadata, _ = await run_probe_task(
+                slurm.check,
+                session.workspace,
+                probe_id,
+                session.transcript_path,
+                wait_on_cancel=True,
+            )
         except ValueError as exc:
-            return failure(str(exc))
-        finally:
-            if task.done():
-                session._probe_task = None
+            return _failure(str(exc))
         status = metadata["status"]
         state = metadata.get("slurm_state", "UNKNOWN")
-        probe = (
-            session.workspace.sessions_path
-            / probe_id.split("/")[0]
-            / "probes"
-            / probe_id.split("/")[1]
+        if status not in ("completed", "error"):
+            return _text_result(
+                f"Probe {probe_id}: {state} ({status}), Slurm job {metadata['job_id']}."
+            )
+        payload = slurm.result_payload(
+            session.workspace, probe_id, metadata, session.image_cap
         )
-        plot_files = sorted(probe.glob("plot-*.png"))
-        plot_paths = [
-            str(path.relative_to(session.workspace.path)) for path in plot_files
-        ]
-        terminal = status in ("completed", "error")
-        if terminal and session._slurm_review_probe_id != probe_id:
-            await session.emit(
-                "probe_finish",
-                **slurm.result_payload(
-                    session.workspace, probe_id, metadata, session.image_cap
-                ),
+        if session._slurm_review_probe_id != probe_id:
+            await session.emit("probe_finish", **payload)
+        records = session.workspace.read_transcript(
+            session.workspace.transcript_file(probe_id.split("/")[0])
+        )
+        existing_verdict = next(
+            (
+                record
+                for record in records
+                if record.get("kind") == "verdict"
+                and record.get("probe_id") == probe_id
+            ),
+            None,
+        )
+        reviewed = existing_verdict is not None
+        if not reviewed and session._pending_verdict is None:
+            session._pending_verdict = metadata["expected"]
+            session._pending_verdict_probe_id = probe_id
+        message = f"Probe {probe_id}: {status}\nSource: {probe_id}/output.txt\n{payload['text']}"
+        plot_paths = payload["plot_paths"]
+        if plot_paths:
+            message += "\n" + "\n".join(
+                f"Source: {probe_id}/{path.rsplit('/', 1)[-1]}" for path in plot_paths
             )
-        if terminal:
-            records = session.workspace.read_transcript(
-                session.workspace.transcript_file(probe_id.split("/")[0])
-            )
-            existing_verdict = next(
-                (
-                    record
-                    for record in records
-                    if record.get("kind") == "verdict"
-                    and record.get("probe_id") == probe_id
-                ),
-                None,
-            )
-            reviewed = existing_verdict is not None
-            if not reviewed and session._pending_verdict is None:
-                session._pending_verdict = metadata["expected"]
-                session._pending_verdict_probe_id = probe_id
-            output = (probe / "output.txt").read_text()
-            message = (
-                f"Probe {probe_id}: {status}\nSource: {probe_id}/output.txt\n{output}"
-            )
-            if plot_paths:
-                message += "\n" + "\n".join(
-                    f"Source: {probe_id}/{path.name}" for path in plot_files
-                )
-            if not reviewed:
-                message += f"\nGive a verdict against: {metadata['expected']}"
-            else:
-                message += (
-                    f"\nExisting verdict (preserve it): {existing_verdict['text']}"
-                )
-            content = [{"type": "text", "text": message}]
-            for path in plot_files[: session.image_cap]:
-                content.append(
-                    {
-                        "type": "image",
-                        "data": base64.b64encode(path.read_bytes()).decode(),
-                        "mimeType": "image/png",
-                    }
-                )
-            return {"content": content}
+        if not reviewed:
+            message += f"\nGive a verdict against: {metadata['expected']}"
+        else:
+            message += f"\nExisting verdict (preserve it): {existing_verdict['text']}"
         return {
             "content": [
-                {
-                    "type": "text",
-                    "text": f"Probe {probe_id}: {state} ({status}), Slurm job {metadata['job_id']}.",
-                }
+                {"type": "text", "text": message},
+                *_image_blocks(payload["plot_images"]),
             ]
         }
 
@@ -955,23 +981,16 @@ def build_tools(session: "ExplorationSession"):
         path = args["path"]
         replace_existing = args["replace_existing"]
         if not isinstance(replace_existing, bool):
-            return failure("replace_existing must be a boolean.")
+            return _failure("replace_existing must be a boolean.")
         try:
             session.workspace.save_document(path, args["text"], replace_existing)
         except (ValueError, OSError) as exc:
-            return failure(str(exc))
+            return _failure(str(exc))
         action = "revised" if replace_existing else "created"
         if not session.workspace.session_pending:
             session.log_transcript("document_saved", name=path, action=action)
             await session.emit("document_saved", name=path, action=action)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"{action.capitalize()} .nocturnomath/documents/{path}.",
-                }
-            ]
-        }
+        return _text_result(f"{action.capitalize()} .nocturnomath/documents/{path}.")
 
     @tool(
         "list_documents",
@@ -981,26 +1000,14 @@ def build_tools(session: "ExplorationSession"):
     )
     async def list_documents(args):
         try:
+            raw_documents, folders = session.documents_and_folders()
             documents = [
                 {"name": document["name"], "included": document["included"]}
-                for document in session.list_documents()
+                for document in raw_documents
             ]
-            folders = session.workspace.list_document_folders()
         except (ValueError, OSError) as exc:
-            return failure(str(exc))
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(
-                        {
-                            "documents": documents,
-                            "folders": folders,
-                        }
-                    ),
-                }
-            ]
-        }
+            return _failure(str(exc))
+        return _text_result(json.dumps({"documents": documents, "folders": folders}))
 
     @tool(
         "read_document",
@@ -1012,15 +1019,8 @@ def build_tools(session: "ExplorationSession"):
         try:
             document = session.workspace.read_document(args["path"])
         except (ValueError, OSError) as exc:
-            return failure(str(exc))
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"{document['path']}\n\n{document['content']}",
-                }
-            ]
-        }
+            return _failure(str(exc))
+        return _text_result(f"{document['path']}\n\n{document['content']}")
 
     return [
         run,

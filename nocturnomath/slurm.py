@@ -54,14 +54,6 @@ def _command(argv, workspace, env=None):
         raise ValueError(f"Slurm command could not run: {exc}") from exc
 
 
-def _save_metadata(path, **fields):
-    file = path / "probe.json"
-    metadata = json.loads(file.read_text())
-    metadata.update(fields)
-    write_text(file, json.dumps(metadata, indent=2) + "\n")
-    return metadata
-
-
 def _probe_file(probe, name):
     path = probe / name
     return path.is_file() and path.resolve().is_relative_to(probe.resolve())
@@ -159,7 +151,8 @@ def submit(
         backend="slurm",
     )
     batch = probe / "job.sh"
-    batch.write_text(
+    write_text(
+        batch,
         "#!/bin/sh\n"
         + "export NOCTURNOMATH_PROBE_DIR="
         + shlex.quote(str(probe))
@@ -168,7 +161,7 @@ def submit(
         + shlex.quote(str(session.environment.python))
         + " "
         + shlex.quote(str(probe / "code.py"))
-        + "\n"
+        + "\n",
     )
     argv = [
         "sbatch",
@@ -211,7 +204,9 @@ def submit(
         workspace.finish_probe(probe, str(exc), [], "failed", str(exc))
         session.log_transcript("probe_failed", probe_id=probe_id, text=str(exc))
         raise SubmissionError(probe_id, str(exc)) from exc
-    _save_metadata(probe, job_id=job_id, status="submitted", submitted=time.time())
+    workspace.update_probe_meta(
+        probe, job_id=job_id, status="submitted", submitted=time.time()
+    )
     session.log_transcript("slurm_submitted", probe_id=probe_id, job_id=job_id)
     return probe_id, job_id
 
@@ -232,7 +227,7 @@ def _probe(workspace, probe_id):
 def check(workspace, probe_id, current_transcript=None):
     """Collect one job under a workspace lock shared by all explorers."""
     with _locked_workspace(workspace):
-        metadata, collected = _check_locked(workspace, probe_id)
+        probe, metadata, collected = _check_locked(workspace, probe_id)
         original = workspace.transcript_file(probe_id.split("/")[0])
         if metadata["status"] not in ("completed", "error", "failed"):
             previous = next(
@@ -260,7 +255,6 @@ def check(workspace, probe_id, current_transcript=None):
             transcripts = [original]
             if current_transcript is not None and current_transcript != original:
                 transcripts.append(current_transcript)
-            probe, _ = _probe(workspace, probe_id)
             fields = {
                 "probe_id": probe_id,
                 "expected": metadata["expected"],
@@ -303,14 +297,17 @@ def record_verdict(workspace, probe_id, expected, text, current_transcript):
         return True
 
 
-def has_verdict(workspace, probe_id):
-    records = workspace.read_transcript(
-        workspace.transcript_file(probe_id.split("/")[0])
-    )
-    return any(
-        record.get("kind") == "verdict" and record.get("probe_id") == probe_id
+def _verdicted_probes(workspace, session_id):
+    records = workspace.read_transcript(workspace.transcript_file(session_id))
+    return {
+        record["probe_id"]
         for record in records
-    )
+        if record.get("kind") == "verdict" and record.get("probe_id")
+    }
+
+
+def has_verdict(workspace, probe_id):
+    return probe_id in _verdicted_probes(workspace, probe_id.split("/")[0])
 
 
 def needs_review(workspace, probe_id):
@@ -330,19 +327,40 @@ def needs_review(workspace, probe_id):
 def set_review_pending(workspace, probe_id, pending):
     with _locked_workspace(workspace):
         probe, _ = _probe(workspace, probe_id)
-        _save_metadata(probe, review_pending=pending)
+        workspace.update_probe_meta(probe, review_pending=pending)
 
 
 def clear_reviewed_pending(workspace, session_id):
     """Clear review_pending on verdicted probes of a session after a manual turn."""
+    probes_dir = workspace.sessions_path / session_id / "probes"
+    if not probes_dir.is_dir():
+        return
+    candidates = []
+    for file in sorted(probes_dir.glob("P*/probe.json")):
+        try:
+            metadata = json.loads(file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            metadata.get("backend") == "slurm"
+            and metadata.get("job_id")
+            and metadata.get("review_pending")
+        ):
+            candidates.append(file.parent)
+    if not candidates:
+        return
     with _locked_workspace(workspace):
-        for job in list_jobs(workspace):
-            probe_id = job.get("probe_id", "")
-            if not probe_id.startswith(f"{session_id}/"):
+        verdicts = _verdicted_probes(workspace, session_id)
+        for probe in candidates:
+            probe_id = f"{session_id}/{probe.name}"
+            if probe_id not in verdicts:
                 continue
-            probe, metadata = _probe(workspace, probe_id)
-            if metadata.get("review_pending") and has_verdict(workspace, probe_id):
-                _save_metadata(probe, review_pending=False)
+            try:
+                metadata = json.loads((probe / "probe.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if metadata.get("review_pending"):
+                workspace.update_probe_meta(probe, review_pending=False)
 
 
 @contextmanager
@@ -394,7 +412,18 @@ def _check_locked(workspace, probe_id):
     """Refresh job state; save output after terminal files become visible."""
     probe, metadata = _probe(workspace, probe_id)
     if metadata["status"] in ("completed", "error", "failed"):
-        return metadata, False
+        return probe, metadata, False
+
+    def save_poll(status, state, *, terminal_seen=None):
+        updated = workspace.update_probe_meta(
+            probe,
+            status=status,
+            slurm_state=state,
+            terminal_seen=terminal_seen,
+            checked=time.time(),
+        )
+        return probe, updated, False
+
     job_id = metadata["job_id"]
     queue = _command(
         ["squeue", "--noheader", "--jobs", job_id, "--format", "%T"], workspace.path
@@ -402,13 +431,7 @@ def _check_locked(workspace, probe_id):
     if queue.returncode == 0 and queue.stdout.strip():
         state = queue.stdout.strip().splitlines()[0].strip().upper()
         if state in ACTIVE_STATES:
-            return _save_metadata(
-                probe,
-                status="queued" if state == "PENDING" else "running",
-                slurm_state=state,
-                terminal_seen=None,
-                checked=time.time(),
-            ), False
+            return save_poll("queued" if state == "PENDING" else "running", state)
 
     account = _command(
         [
@@ -435,33 +458,15 @@ def _check_locked(workspace, probe_id):
         None,
     )
     if row is None:
-        return _save_metadata(
-            probe,
-            status="submitted",
-            slurm_state="UNKNOWN",
-            terminal_seen=None,
-            checked=time.time(),
-        ), False
+        return save_poll("submitted", "UNKNOWN")
     _, raw_state, exit_code = (row.split("|") + ["", ""])[:3]
     state = (
         raw_state.split()[0].split("+")[0].upper() if raw_state.split() else "UNKNOWN"
     )
     if state == "UNKNOWN":
-        return _save_metadata(
-            probe,
-            status="submitted",
-            slurm_state=state,
-            terminal_seen=None,
-            checked=time.time(),
-        ), False
+        return save_poll("submitted", state)
     if state in ACTIVE_STATES:
-        return _save_metadata(
-            probe,
-            status="queued" if state == "PENDING" else "running",
-            slurm_state=state,
-            terminal_seen=None,
-            checked=time.time(),
-        ), False
+        return save_poll("queued" if state == "PENDING" else "running", state)
 
     required = ["stdout.txt", "stderr.txt"]
     if state == "COMPLETED":
@@ -469,13 +474,7 @@ def _check_locked(workspace, probe_id):
     missing_required = [name for name in required if not _probe_file(probe, name)]
     terminal_seen = metadata.get("terminal_seen") or time.time()
     if missing_required and time.time() - terminal_seen < FILE_SETTLE_SECONDS:
-        return _save_metadata(
-            probe,
-            status="finishing",
-            slurm_state=state,
-            terminal_seen=terminal_seen,
-            checked=time.time(),
-        ), False
+        return save_poll("finishing", state, terminal_seen=terminal_seen)
 
     stdout = (
         (probe / "stdout.txt").read_text(errors="replace")
@@ -519,40 +518,71 @@ def _check_locked(workspace, probe_id):
         problems.append(
             "Missing Slurm output files: " + ", ".join(missing_output) + "."
         )
-    workspace.finish_probe(probe, output, [], status, " ".join(problems) or None)
-    metadata = _save_metadata(
+    metadata = workspace.finish_probe(
         probe,
+        output,
+        [],
+        status,
+        " ".join(problems) or None,
         slurm_state=state,
         exit_code=exit_code,
         terminal_seen=terminal_seen,
         checked=time.time(),
     )
-    return metadata, True
+    return probe, metadata, True
+
+
+def _list_jobs_with_meta(workspace):
+    entries = []
+    for file in sorted(workspace.sessions_path.glob("S*/probes/P*/probe.json")):
+        try:
+            metadata = json.loads(file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if metadata.get("backend") == "slurm" and metadata.get("job_id"):
+            entries.append(
+                (
+                    {
+                        "probe_id": f"{file.parent.parent.parent.name}/{file.parent.name}",
+                        "job_id": metadata["job_id"],
+                        "status": metadata.get("status", "unknown"),
+                        "slurm_state": metadata.get("slurm_state"),
+                        "correction_of": metadata.get("correction_of"),
+                    },
+                    metadata,
+                )
+            )
+    return entries
 
 
 def list_jobs(workspace):
     """Return saved Slurm jobs, including jobs from earlier sessions."""
-    jobs = []
-    for file in sorted(workspace.sessions_path.glob("S*/probes/P*/probe.json")):
-        metadata = json.loads(file.read_text())
-        if metadata.get("backend") == "slurm" and metadata.get("job_id"):
-            jobs.append(
-                {
-                    "probe_id": f"{file.parent.parent.parent.name}/{file.parent.name}",
-                    "job_id": metadata["job_id"],
-                    "status": metadata["status"],
-                    "slurm_state": metadata.get("slurm_state"),
-                    "correction_of": metadata.get("correction_of"),
-                }
-            )
-    return jobs
+    return [job for job, _ in _list_jobs_with_meta(workspace)]
 
 
 def pending_jobs(workspace):
     """Reconstruct the monitor's work, including collected but unreviewed jobs."""
     with _locked_workspace(workspace):
-        return [
-            job
-            for job in list_jobs(workspace)
-            if needs_review(workspace, job["probe_id"])
-        ]
+        entries = _list_jobs_with_meta(workspace)
+        corrected = {
+            job["correction_of"] for job, _ in entries if job.get("correction_of")
+        }
+        verdicts_by_session: dict[str, set[str]] = {}
+        pending = []
+        for job, metadata in entries:
+            probe_id = job["probe_id"]
+            session_id = probe_id.split("/")[0]
+            verdicts = verdicts_by_session.get(session_id)
+            if verdicts is None:
+                try:
+                    verdicts = _verdicted_probes(workspace, session_id)
+                except (FileNotFoundError, ValueError):
+                    verdicts = set()
+                verdicts_by_session[session_id] = verdicts
+            if probe_id not in verdicts or (
+                metadata.get("status") == "error"
+                and metadata.get("review_pending", False)
+                and probe_id not in corrected
+            ):
+                pending.append(job)
+        return pending

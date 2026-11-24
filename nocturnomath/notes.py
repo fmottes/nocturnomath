@@ -48,9 +48,18 @@ class ResearchNotes:
             raise ValueError("Use an entry ID such as E001 or T001.")
         return self.evidence_path if entry_id.startswith("E") else self.thoughts_path
 
-    def entries(self, path: Path) -> dict[str, str]:
-        pieces = ENTRY.split(path.read_text(encoding="utf-8"))
+    @staticmethod
+    def _parse_entries(text: str) -> dict[str, str]:
+        pieces = ENTRY.split(text)
         return dict(zip(pieces[1::2], pieces[2::2]))
+
+    @staticmethod
+    def _next_entry_id(entries: dict[str, str], prefix: str) -> str:
+        numbers = [int(key[1:]) for key in entries]
+        return f"{prefix}{max(numbers, default=0) + 1:03d}"
+
+    def entries(self, path: Path) -> dict[str, str]:
+        return self._parse_entries(path.read_text(encoding="utf-8"))
 
     def entry(self, entry_id: str) -> str:
         entries = self.entries(self.path_for(entry_id))
@@ -59,8 +68,7 @@ class ResearchNotes:
         return entries[entry_id]
 
     def next_id(self, path: Path, prefix: str) -> str:
-        numbers = [int(key[1:]) for key in self.entries(path)]
-        return f"{prefix}{max(numbers, default=0) + 1:03d}"
+        return self._next_entry_id(self.entries(path), prefix)
 
     @staticmethod
     def block(entry_id: str, body: str) -> str:
@@ -89,12 +97,10 @@ class ResearchNotes:
                 raise ValueError(
                     "Evidence needs at least one saved probe output or plot."
                 )
-            entry_id = self.next_id(self.evidence_path, "E")
+            document = self.evidence_path.read_text(encoding="utf-8")
+            entry_id = self._next_entry_id(self._parse_entries(document), "E")
             body = text + "\n\nSources: " + " · ".join(sources)
-            write_text(
-                self.evidence_path,
-                self.evidence_path.read_text() + self.block(entry_id, body),
-            )
+            write_text(self.evidence_path, document + self.block(entry_id, body))
             return entry_id
 
     def add_thought(self, text: str, replaces: list[str]) -> str:
@@ -112,8 +118,19 @@ class ResearchNotes:
             raise ValueError(
                 "Cite supporting evidence or thoughts using [E001] or [T001]."
             )
+        document = self.thoughts_path.read_text(encoding="utf-8")
+        thoughts_entries = self._parse_entries(document)
+        evidence_entries: dict[str, str] | None = None
         for reference in references:
-            self.entry(reference)
+            path = self.path_for(reference)
+            if path == self.evidence_path:
+                if evidence_entries is None:
+                    evidence_entries = self.entries(self.evidence_path)
+                pool = evidence_entries
+            else:
+                pool = thoughts_entries
+            if reference not in pool:
+                raise ValueError(f"Unknown entry: {reference}.")
         # Validate every replacement before changing either entry.
         replaces = list(dict.fromkeys(replaces))
         for old_id in replaces:
@@ -121,15 +138,17 @@ class ResearchNotes:
                 raise ValueError(
                     "A replacement thought can only supersede thoughts. Use strike_evidence for evidence."
                 )
-            if "<del>" in self.entry(old_id):
+            self.path_for(old_id)
+            if old_id not in thoughts_entries:
+                raise ValueError(f"Unknown entry: {old_id}.")
+            if "<del>" in thoughts_entries[old_id]:
                 raise ValueError(f"{old_id} is already struck.")
-        entry_id = self.next_id(self.thoughts_path, "T")
+        entry_id = self._next_entry_id(thoughts_entries, "T")
         text = CITATION.sub(lambda match: self.link(match[1]), text)
         if replaces:
             text += "\n\nReplaces: " + " · ".join(self.link(key) for key in replaces)
-        document = self.thoughts_path.read_text()
         for old_id in replaces:
-            old_body = self.entry(old_id)
+            old_body = thoughts_entries[old_id]
             struck = self.strike(old_body) + f"Replaced by {self.link(entry_id)}.\n\n"
             document = document.replace(
                 f"## {old_id}\n{old_body}", f"## {old_id}\n{struck}", 1
@@ -143,10 +162,14 @@ class ResearchNotes:
                 raise ValueError(
                     "Only evidence can be struck without a replacement thought."
                 )
-            body = self.entry(entry_id)
+            self.path_for(entry_id)
+            document = self.evidence_path.read_text(encoding="utf-8")
+            entries = self._parse_entries(document)
+            if entry_id not in entries:
+                raise ValueError(f"Unknown entry: {entry_id}.")
+            body = entries[entry_id]
             if "<del>" in body:
                 raise ValueError(f"{entry_id} is already struck.")
-            document = self.evidence_path.read_text()
             write_text(
                 self.evidence_path,
                 document.replace(

@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20261117-2";
-import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261120-1";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
-import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-2";
+import { elements, state } from "./state.js?v=20261124-2";
+import { agentQuery, apiJson, initWebSocket, sendWs } from "./transport.js?v=20261124-2";
+import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js?v=20261124-2";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261124-2";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261124-2";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261124-2";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261124-2";
+import { cancelCreateFolder, cancelEdit, fetchDocuments, openDocument, saveEdit, saveFolder, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261124-2";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -88,6 +88,7 @@ function saveExplorerView() {
 }
 
 function restoreExplorerView(agent) {
+  if (!agent) return;
   elements.promptInput.value = agent.draftText || "";
   elements.promptInput.style.height = "44px";
   elements.promptInput.style.height = Math.min(elements.promptInput.scrollHeight, 160) + "px";
@@ -138,23 +139,7 @@ function applyExplorer(agent, repaint = false) {
       ? (state.modelProviders[agent.model] || agent.modelProvider || prior.modelProvider || null)
       : (prior.modelProvider || null),
   };
-  let resolvedDraft = null;
-  if (merged.draftModel || merged.draftRawModel) {
-    resolvedDraft = resolveCatalogueModel(
-      merged.draftRawModel || merged.draftModel,
-      merged.draftProvider,
-    );
-    if (resolvedDraft) {
-      merged.draftModel = resolvedDraft;
-      merged.draftProvider = state.modelProviders[resolvedDraft] || merged.draftProvider || null;
-      merged.draftRawModel = rawModelId(resolvedDraft, merged.draftProvider);
-    } else {
-      merged.draftModel = null;
-      merged.draftProvider = null;
-      merged.draftRawModel = null;
-      merged.draftEffort = null;
-    }
-  }
+  const resolvedDraft = syncDraftSelection(merged);
   state.agents.set(agent.agent_id, merged);
   if (agent.agent_id === state.activeAgentId) {
     setSessionId(merged.session_id);
@@ -167,9 +152,9 @@ function applyExplorer(agent, repaint = false) {
     updateAgentStatus(merged.is_busy && (!merged.status || merged.status === "idle")
       ? "thinking" : (merged.status || "idle"));
     renderPendingPrompts(merged.pending_prompts || []);
-    if (agent.documents) refreshDocuments();
+    if (agent.documents) setDocuments(agent.documents, agent.documents_default, agent.folders);
     if (repaint) {
-      restoreChat(merged.records || [], merged.kernel_busy);
+      restoreChat(merged.records || [], Boolean(merged.is_busy || merged.kernel_busy));
       restoreExplorerView(merged);
     }
   }
@@ -184,14 +169,19 @@ async function selectExplorer(agentId) {
   saveExplorerView();
   state.activeAgentId = agentId;
   const cached = state.agents.get(agentId);
+  const cachedRecordsKey = JSON.stringify(cached?.records || []);
+  const cachedBusy = Boolean(cached?.is_busy || cached?.kernel_busy);
   applyExplorer(cached, true);
   try {
-    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`);
-    if (!response.ok) throw new Error("Explorer no longer exists");
-    const snapshot = await response.json();
+    const snapshot = await apiJson(`/api/agents/${encodeURIComponent(agentId)}`, {
+      fallbackError: "Explorer no longer exists",
+    });
     if (state.activeAgentId === agentId && seq === explorerSelectSeq) {
       saveExplorerView();
-      applyExplorer(snapshot, true);
+      const snapshotBusy = Boolean(snapshot.is_busy || snapshot.kernel_busy);
+      const recordsChanged = JSON.stringify(snapshot.records || []) !== cachedRecordsKey
+        || snapshotBusy !== cachedBusy;
+      applyExplorer(snapshot, recordsChanged);
     }
     loadPlots();
   } catch (error) {
@@ -241,9 +231,10 @@ async function refreshContextUsage(agentId) {
 async function createExplorer() {
   elements.btnNewExplorer.disabled = true;
   try {
-    const response = await fetch("/api/agents", { method: "POST" });
-    const agent = await response.json();
-    if (!response.ok) throw new Error(agent.detail || "Unable to start explorer");
+    const agent = await apiJson("/api/agents", {
+      method: "POST",
+      fallbackError: "Unable to start explorer",
+    });
     applyExplorer(agent);
     await selectExplorer(agent.agent_id);
   } catch (error) {
@@ -255,14 +246,15 @@ async function createExplorer() {
 
 async function closeExplorer(agentId) {
   try {
-    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
-    if (response.status === 404 && state.agents.size > 1) {
+    await apiJson(`/api/agents/${encodeURIComponent(agentId)}`, {
+      method: "DELETE",
+      fallbackError: "Unable to close explorer",
+    });
+  } catch (error) {
+    if (error.status === 404 && state.agents.size > 1) {
       handleServerEvent({ type: "agent_removed", agent_id: agentId });
       return;
     }
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to close explorer");
-  } catch (error) {
     appendErrorMessage(error.message);
   }
 }
@@ -272,9 +264,10 @@ async function compactExplorer() {
   if (!agentId || elements.btnCompact.disabled) return;
   elements.btnCompact.disabled = true;
   try {
-    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}/compact`, { method: "POST" });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to compact explorer");
+    await apiJson(`/api/agents/${encodeURIComponent(agentId)}/compact`, {
+      method: "POST",
+      fallbackError: "Unable to compact explorer",
+    });
     await refreshContextUsage(agentId);
   } catch (error) {
     await refreshContextUsage(agentId);
@@ -304,8 +297,11 @@ function handleServerEvent(event) {
       else if (event.type === "system_message") appendSystemMessage(event.text);
       if (!["session_resumed", "session_reset"].includes(event.type)) return;
     } else {
+      let tabsChanged = false;
       if (event.type === "status_change") {
-        current.is_busy = !["idle", "cancelled"].includes(event.status);
+        const nextBusy = !["idle", "cancelled"].includes(event.status);
+        if (current.is_busy !== nextBusy) tabsChanged = true;
+        current.is_busy = nextBusy;
         current.status = event.status;
         current.stateSeq = (current.stateSeq || 0) + 1;
       }
@@ -328,7 +324,10 @@ function handleServerEvent(event) {
       if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
       if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
       if (event.type === "user_message") {
-        if (event.session_id) current.session_id = event.session_id;
+        if (event.session_id && current.session_id !== event.session_id) {
+          current.session_id = event.session_id;
+          tabsChanged = true;
+        }
         if (event.model) {
           current.model = event.model;
           current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
@@ -336,13 +335,22 @@ function handleServerEvent(event) {
         if (event.effort !== undefined) current.effort = event.effort;
       }
       state.agents.set(event.agent_id, current);
-      renderExplorerTabs();
+      if (tabsChanged) renderExplorerTabs();
       if (
         event.agent_id !== state.activeAgentId
         && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
       ) {
-        if (event.type === "record_changed" && state.activeTab !== "plots") {
+        if (
+          event.type === "record_changed"
+          && !["plots", "documents"].includes(state.activeTab)
+          && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)
+        ) {
           loadDocument(state.activeDoc, "", true);
+        }
+        if (event.type === "probe_finish") loadPlots();
+        if (event.type === "document_saved") {
+          if (state.activeTab === "documents") refreshDocuments();
+          else fetchDocuments();
         }
         if (event.type === "status_change" && event.status === "idle") {
           refreshContextUsage(event.agent_id);
@@ -401,9 +409,7 @@ function handleServerEvent(event) {
         setActiveModelAndEffort(agent.model, agent.effort);
       }
       if (event.session_id && agent) {
-        agent.session_id = event.session_id;
         setSessionId(event.session_id);
-        renderExplorerTabs();
       }
       appendUserMessage(event.text);
       break;
@@ -434,14 +440,18 @@ function handleServerEvent(event) {
 
     case "record_changed":
       appendNoteNotification(event.kind, `${event.entry_id}: ${event.text}`);
-      if (state.activeTab !== "plots" && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)) {
+      if (
+        !["plots", "documents"].includes(state.activeTab)
+        && [state.workspace?.evidence_path, state.workspace?.thoughts_path].includes(state.activeDoc)
+      ) {
         loadDocument(state.activeDoc, "", true);
       }
       break;
 
     case "document_saved":
       appendDocumentNotification(event.name, event.action);
-      refreshDocuments();
+      if (state.activeTab === "documents") refreshDocuments();
+      else fetchDocuments();
       break;
 
     case "probe_verdict":
@@ -467,18 +477,15 @@ function handleServerEvent(event) {
 
     case "status_change": {
       const agent = state.agents.get(event.agent_id);
-      if (agent) {
-        agent.is_busy = !["idle", "cancelled"].includes(event.status);
-        if (
-          ["cancelled", "idle"].includes(event.status) &&
-          !agent.draftModel &&
-          !agent.draftRawModel
-        ) {
-          setActiveModelAndEffort(agent.model, agent.effort);
-        }
+      if (
+        agent &&
+        ["cancelled", "idle"].includes(event.status) &&
+        !agent.draftModel &&
+        !agent.draftRawModel
+      ) {
+        setActiveModelAndEffort(agent.model, agent.effort);
       }
       updateAgentStatus(event.status);
-      renderExplorerTabs();
       if (event.status === "idle") {
         refreshContextUsage(event.agent_id);
       }
@@ -509,8 +516,9 @@ function handleServerEvent(event) {
 
     case "session_reset": {
       const targetId = event.agent_id || state.activeAgentId;
-      if (state.agents.has(targetId)) {
-        Object.assign(state.agents.get(targetId), {
+      const target = state.agents.get(targetId);
+      if (target) {
+        Object.assign(target, {
           context_usage: null,
           session_id: event.session_id ?? null,
           records: [],
@@ -519,11 +527,8 @@ function handleServerEvent(event) {
           model: event.model,
           modelProvider: state.modelProviders[event.model] || null,
           effort: event.effort,
-          draftModel: null,
-          draftProvider: null,
-          draftRawModel: null,
-          draftEffort: null,
         });
+        clearDraftSelection(target);
       }
       renderExplorerTabs();
       if (!event.agent_id || event.agent_id === state.activeAgentId) {
@@ -557,29 +562,29 @@ function handleServerEvent(event) {
     case "session_resumed": {
       ++explorerSelectSeq;
       const resumedId = event.session_id || event.id || null;
-      if (state.agents.has(event.agent_id)) {
-        Object.assign(state.agents.get(event.agent_id), {
+      const targetAgentId = event.agent_id || state.activeAgentId;
+      const target = targetAgentId ? state.agents.get(targetAgentId) : null;
+      if (target) {
+        Object.assign(target, {
           session_id: resumedId,
           can_compact: event.can_compact ?? Boolean(event.context_restored),
           draftText: "",
           scrollTop: 0,
           followChat: true,
-          draftModel: null,
-          draftProvider: null,
-          draftRawModel: null,
-          draftEffort: null,
         });
+        clearDraftSelection(target);
       }
       applyExplorer({
         is_busy: false,
         status: "idle",
         kernel_busy: false,
         ...event,
+        agent_id: targetAgentId,
         session_id: resumedId,
         can_compact: event.can_compact ?? Boolean(event.context_restored),
       });
       if (!event.agent_id || event.agent_id === state.activeAgentId) {
-        restoreExplorerView(state.agents.get(event.agent_id));
+        restoreExplorerView(targetAgentId ? state.agents.get(targetAgentId) : null);
         setSessionId(resumedId);
         replaySession(
           event.records || [],
@@ -603,6 +608,13 @@ function handleServerEvent(event) {
     default:
       console.log("Unhandled event:", event);
   }
+}
+
+function bindModalClose(modal, onClose, ...buttons) {
+  buttons.forEach((button) => button?.addEventListener("click", onClose));
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) onClose();
+  });
 }
 
 // ============================================================================
@@ -638,21 +650,13 @@ function setupEventListeners() {
     elements.authError.classList.add("hidden");
     updateAuthForm(false);
   });
-  elements.authModalClose.addEventListener("click", closeAuthModal);
-  elements.authModalCancel.addEventListener("click", closeAuthModal);
-  elements.authModal.addEventListener("click", (event) => {
-    if (event.target === elements.authModal) closeAuthModal();
-  });
+  bindModalClose(elements.authModal, closeAuthModal, elements.authModalClose, elements.authModalCancel);
   elements.authForm.addEventListener("submit", submitAuth);
-  elements.settingsClose.addEventListener("click", () => elements.settingsModal.classList.add("hidden"));
-  elements.settingsModal.addEventListener("click", (event) => {
-    if (event.target === elements.settingsModal) elements.settingsModal.classList.add("hidden");
-  });
+  bindModalClose(elements.settingsModal, () => elements.settingsModal.classList.add("hidden"), elements.settingsClose);
   const exitService = async (button, reportError) => {
     button.disabled = true;
     try {
-      const response = await fetch("/api/exit", { method: "POST" });
-      if (!response.ok) throw new Error((await response.json()).detail || "Unable to stop service");
+      await apiJson("/api/exit", { method: "POST", fallbackError: "Unable to stop service" });
       state.exiting = true;
       state.ws?.close();
       window.close();
@@ -705,10 +709,7 @@ function setupEventListeners() {
     const agent = state.agents.get(state.activeAgentId);
     if (agent) {
       agent.draftText = "";
-      agent.draftModel = null;
-      agent.draftProvider = null;
-      agent.draftRawModel = null;
-      agent.draftEffort = null;
+      clearDraftSelection(agent);
     }
   });
 
@@ -782,8 +783,7 @@ function setupEventListeners() {
   elements.btnDownloadNotebook.addEventListener("click", async () => {
     elements.btnDownloadNotebook.disabled = true;
     try {
-      const query = state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
-      const response = await fetch(`/api/session/notebook${query}`);
+      const response = await fetch(`/api/session/notebook${agentQuery()}`);
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
         throw new Error(error.detail || `Download failed (${response.status})`);
@@ -805,15 +805,12 @@ function setupEventListeners() {
       elements.btnDownloadNotebook.disabled = false;
     }
   });
-  elements.historyModalClose.addEventListener("click", () => {
-    if (!state.historyLoading) elements.historyModal.classList.add("hidden");
-  });
-  elements.historyModalCancel.addEventListener("click", () => {
-    if (!state.historyLoading) elements.historyModal.classList.add("hidden");
-  });
-  elements.historyModal.addEventListener("click", (e) => {
-    if (e.target === elements.historyModal && !state.historyLoading) elements.historyModal.classList.add("hidden");
-  });
+  bindModalClose(
+    elements.historyModal,
+    () => { if (!state.historyLoading) elements.historyModal.classList.add("hidden"); },
+    elements.historyModalClose,
+    elements.historyModalCancel,
+  );
   elements.btnInterrupt.addEventListener("click", () => sendWs("interrupt", { agent_id: state.activeAgentId }));
 
   // Workspace Switcher Modal
@@ -826,11 +823,7 @@ function setupEventListeners() {
   elements.btnAboutToggle.addEventListener("click", () => setAboutOpen(elements.aboutPanel.hidden));
   elements.btnAboutClose.addEventListener("click", () => setAboutOpen(false));
   elements.workspacePill.addEventListener("click", () => openFolderPicker("change"));
-  elements.modalClose.addEventListener("click", closeFolderPicker);
-  elements.modalCancel.addEventListener("click", closeFolderPicker);
-  elements.folderModal.addEventListener("click", (e) => {
-    if (e.target === elements.folderModal) closeFolderPicker();
-  });
+  bindModalClose(elements.folderModal, closeFolderPicker, elements.modalClose, elements.modalCancel);
   elements.btnFolderGo.addEventListener("click", () => {
     browseFolders(elements.newFolderInput.value.trim());
   });
@@ -858,9 +851,17 @@ function setupEventListeners() {
       elements.folderPickerError.classList.remove("hidden");
     } finally {
       elements.modalSubmit.disabled = false;
-      elements.modalSubmit.textContent = "Open folder";
+      elements.modalSubmit.textContent = state.folderPickerMode === "open" ? "Open folder" : "Switch workspace";
     }
   });
+
+  // Research environment form
+  document.getElementById("environment-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const python = document.getElementById("environment-python").value.trim();
+    if (python) changeEnvironment(python);
+  });
+  document.getElementById("environment-managed").addEventListener("click", () => changeEnvironment("managed"));
 
   // Documents tab: list, reader, and editor
   elements.documentsBack.addEventListener("click", () => showDocumentsView("list"));
@@ -895,10 +896,7 @@ function setupEventListeners() {
   });
 
   // Lightbox
-  elements.lightboxClose.addEventListener("click", closeLightbox);
-  elements.lightboxModal.addEventListener("click", (e) => {
-    if (e.target === elements.lightboxModal) closeLightbox();
-  });
+  bindModalClose(elements.lightboxModal, closeLightbox, elements.lightboxClose);
   document.addEventListener("keydown", (e) => {
     if (!isLightboxOpen()) return;
     if (e.key === "Escape") {
@@ -938,18 +936,16 @@ async function saveSessionDefaults(event) {
   try {
     const selectedModel = elements.defaultModelSelect.value;
     const selectedProvider = state.modelProviders[selectedModel] || null;
-    const response = await fetch("/api/session/defaults", {
+    const data = await apiJson("/api/session/defaults", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: {
         model: selectedModel,
         provider: selectedProvider,
         raw_model: rawModelId(selectedModel, selectedProvider),
         effort: elements.defaultEffortSelect.value || null,
-      }),
+      },
+      fallbackError: "Unable to save session defaults",
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to save session defaults");
     setSessionDefaults(data.session_defaults);
     elements.sessionDefaultsStatus.textContent = "Saved for this workspace.";
   } catch (error) {
@@ -964,13 +960,11 @@ async function saveExplorationPrompt(prompt) {
   elements.explorationPromptReset.disabled = true;
   elements.explorationPromptStatus.textContent = "Saving…";
   try {
-    const response = await fetch("/api/settings/exploration-prompt", {
+    const data = await apiJson("/api/settings/exploration-prompt", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: { prompt },
+      fallbackError: "Unable to save prompt",
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to save prompt");
     setExplorationPrompt(data.exploration_prompt, data.exploration_prompt_is_custom);
     elements.explorationPromptStatus.textContent = "Saved for this project.";
   } catch (error) {
@@ -986,13 +980,11 @@ async function savePromptMode(mode) {
   elements.promptModeSelect.disabled = true;
   elements.promptModeStatus.textContent = "Saving…";
   try {
-    const response = await fetch("/api/settings/prompt-mode", {
+    const data = await apiJson("/api/settings/prompt-mode", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode }),
+      body: { mode },
+      fallbackError: "Unable to save prompt mode",
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Unable to save prompt mode");
     setPromptMode(data.prompt_mode);
     elements.promptModeStatus.textContent = "Saved for this workspace.";
   } catch (error) {
@@ -1117,18 +1109,11 @@ async function submitAuth(event) {
   const body = { provider, method };
   if (method !== "cli") body.credential = elements.authCredential.value;
   try {
-    const response = await fetch("/api/auth", {
+    const data = await apiJson("/api/auth", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body,
+      fallbackError: "Unable to update authentication",
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const detail = Array.isArray(data.detail)
-        ? data.detail.map((item) => item?.msg || JSON.stringify(item)).join("; ")
-        : data.detail;
-      throw new Error(detail || "Unable to update authentication");
-    }
     applyAuthChange(data);
     elements.authCredential.value = "";
     const providerError = data.auth?.providers?.[provider]?.error;
@@ -1180,6 +1165,21 @@ function setupGutterResize() {
   });
 }
 
+async function changeEnvironment(python) {
+  const form = document.getElementById("environment-form");
+  const message = document.getElementById("environment-error");
+  form.querySelectorAll("button").forEach(button => button.disabled = true);
+  message.textContent = "Preparing environment…";
+  try {
+    await openWorkspace(state.workspace.path, python);
+    message.textContent = "Environment selected; a fresh session is ready.";
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    form.querySelectorAll("button").forEach(button => button.disabled = false);
+  }
+}
+
 // Initial Boot
 document.addEventListener("DOMContentLoaded", () => {
   setupEventListeners();
@@ -1197,25 +1197,3 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   );
 });
-
-async function changeEnvironment(python) {
-  const form = document.getElementById("environment-form");
-  const message = document.getElementById("environment-error");
-  form.querySelectorAll("button").forEach(button => button.disabled = true);
-  message.textContent = "Preparing environment…";
-  try {
-    await openWorkspace(state.workspace.path, python);
-    message.textContent = "Environment selected; a fresh session is ready.";
-  } catch (error) {
-    message.textContent = error.message;
-  } finally {
-    form.querySelectorAll("button").forEach(button => button.disabled = false);
-  }
-}
-
-document.getElementById("environment-form").addEventListener("submit", event => {
-  event.preventDefault();
-  const python = document.getElementById("environment-python").value.trim();
-  if (python) changeEnvironment(python);
-});
-document.getElementById("environment-managed").addEventListener("click", () => changeEnvironment("managed"));

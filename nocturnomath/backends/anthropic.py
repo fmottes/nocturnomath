@@ -6,17 +6,17 @@ import asyncio
 import importlib.util
 import json
 import logging
-import os
 import shlex
 import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..auth import ProviderAuth, ProviderId, env_flag_enabled
+from ..auth import ProviderAuth, ProviderId, inherited_credential
 from ..mcp_bridge import McpToolBridge
 from ..tools import ToolSpec
 from .base import (
@@ -34,15 +34,18 @@ from .base import (
     TurnEvent,
     TurnResult,
     TurnStarted,
+    context_usage_payload,
     find_cli_executables,
-    is_usable_cli_binary,
+    is_int,
+    managed_subprocess,
     read_jsonl,
-    terminate_process,
+    resolve_cli_binary,
+    write_json_line,
 )
 from .http import (
     compact_anthropic_http,
     discover_anthropic_http_models,
-    is_http_session_id,
+    reject_http_session_for_cli,
     run_anthropic_http_turn,
 )
 
@@ -54,27 +57,11 @@ DISCOVERY_TIMEOUT_S = 15.0
 COMPACT_TIMEOUT_S = 600.0
 CONTEXT_USAGE_TIMEOUT_S = 10.0
 
-_CLAUDE_CREDENTIAL_VARS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-)
-_CLAUDE_TOGGLE_VARS = (
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-)
-
 
 def _has_claude_credentials(
     resp: dict[str, Any], auth: ProviderAuth, env: Mapping[str, str]
 ) -> bool:
-    if auth.method != "cli":
-        return True
-    if any((env.get(name) or "").strip() for name in _CLAUDE_CREDENTIAL_VARS) or any(
-        env_flag_enabled(name, env) for name in _CLAUDE_TOGGLE_VARS
-    ):
+    if auth.method != "cli" or inherited_credential("anthropic", env) is not None:
         return True
     account = resp.get("account")
     if isinstance(account, dict):
@@ -153,11 +140,7 @@ def _context_usage_from_turn(
         if isinstance(only, dict):
             model_usage = only
     window = (model_usage or {}).get("contextWindow")
-    return {
-        "used_tokens": last_prompt_tokens,
-        "window_tokens": window if isinstance(window, int) and window > 0 else None,
-        "model": last_prompt_model,
-    }
+    return context_usage_payload(last_prompt_tokens, window, last_prompt_model)
 
 
 def _parse_models(entries: list[Any]) -> list[ModelSpec]:
@@ -200,15 +183,7 @@ def _parse_models(entries: list[Any]) -> list[ModelSpec]:
             or (existing.is_default if existing else False),
         )
     if default_id and default_id in specs:
-        target = specs[default_id]
-        specs[default_id] = ModelSpec(
-            id=target.id,
-            raw_id=target.raw_id,
-            provider="anthropic",
-            label=target.label,
-            efforts=target.efforts,
-            is_default=True,
-        )
+        specs[default_id] = replace(specs[default_id], is_default=True)
     return list(specs.values())
 
 
@@ -230,22 +205,58 @@ class AnthropicBackend:
         self.last_discovery_error: str | None = None
 
     def _resolve_cli(self) -> Path:
-        if self.cli_path is not None and is_usable_cli_binary(self.cli_path):
-            return self.cli_path
-        candidates = claude_cli_candidates()
-        if not candidates:
-            raise RuntimeError(
-                "Claude CLI (`claude`) was not found on PATH. Install Claude Code or configure an Anthropic API key."
-            )
-        self.cli_path = candidates[0]
+        self.cli_path = resolve_cli_binary(
+            self.cli_path,
+            claude_cli_candidates,
+            "Claude CLI (`claude`) was not found on PATH. Install Claude Code or configure an Anthropic API key.",
+        )
         return self.cli_path
 
     @staticmethod
     async def _write_json(proc: asyncio.subprocess.Process, payload: dict[str, Any]):
-        if proc.stdin is None:
-            raise RuntimeError("Claude CLI stdin is not open.")
-        proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
+        await write_json_line(proc, payload, "Claude CLI")
+
+    async def _send_user_message(
+        self,
+        proc: asyncio.subprocess.Process,
+        content: str,
+        *,
+        session_id: str,
+        stderr: StderrCollector,
+        resume_session_id: str | None = None,
+    ) -> None:
+        try:
+            await self._write_json(
+                proc,
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": content},
+                    "parent_tool_use_id": None,
+                    "session_id": session_id,
+                },
+            )
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            detail = await stderr.text()
+            if resume_session_id and _is_missing_session_error(detail):
+                raise SessionResumeError(detail) from exc
+            raise RuntimeError(detail or str(exc)) from exc
+
+    def _discovery_commit(
+        self,
+        *,
+        cli_path: Path | None = None,
+        http_model_info: Mapping[str, dict[str, Any]] = (),
+        error: str | None = None,
+    ) -> Callable[[], None]:
+        info_copy = dict(http_model_info)
+
+        def commit() -> None:
+            if cli_path is not None:
+                self.cli_path = cli_path
+            self._http_model_info = dict(info_copy)
+            self.last_discovery_error = error
+
+        return commit
 
     async def _await_initialize(
         self,
@@ -285,6 +296,31 @@ class AnthropicBackend:
             or f"Claude CLI exited before completing initialization (status {rc})."
         )
 
+    async def _initialize_cli(
+        self,
+        proc: asyncio.subprocess.Process,
+        messages: AsyncIterator[dict[str, Any]],
+        stderr: StderrCollector,
+        *,
+        resume_session_id: str | None = None,
+        allowed_tools: set[str] = frozenset(),
+    ) -> dict[str, Any]:
+        try:
+            init_id = await self._send_control(proc, "initialize", {"skills": []})
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            detail = await stderr.text()
+            if resume_session_id and _is_missing_session_error(detail):
+                raise SessionResumeError(detail) from exc
+            raise RuntimeError(detail or str(exc)) from exc
+        return await self._await_initialize(
+            proc,
+            messages,
+            init_id,
+            stderr,
+            resume_session_id=resume_session_id,
+            allowed_tools=allowed_tools,
+        )
+
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
@@ -293,66 +329,36 @@ class AnthropicBackend:
             specs, info, err = await discover_anthropic_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
-
-            def commit_http(
-                discovered_info: dict[str, dict[str, Any]] = info,
-                discovery_error: str | None = err,
-            ) -> None:
-                self._http_model_info = dict(discovered_info)
-                self.last_discovery_error = discovery_error
-
-            return specs, commit_http
+            return specs, self._discovery_commit(http_model_info=info, error=err)
 
         env = auth.process_env()
         for candidate in claude_cli_candidates():
-            proc: asyncio.subprocess.Process | None = None
-            stderr: StderrCollector | None = None
             try:
-                async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
-                    proc = await asyncio.create_subprocess_exec(
-                        str(candidate),
-                        "--output-format",
-                        "stream-json",
-                        "--input-format",
-                        "stream-json",
-                        "--verbose",
-                        "--tools",
-                        "",
-                        "--strict-mcp-config",
-                        "--setting-sources",
-                        "user",
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=env,
-                        start_new_session=(os.name == "posix"),
-                    )
-                    stderr = StderrCollector(proc.stderr)
-                    req_id = await self._send_control(
-                        proc, "initialize", {"skills": []}
-                    )
-                    resp = await self._await_initialize(
-                        proc, read_jsonl(proc.stdout), req_id, stderr
-                    )
+                async with managed_subprocess(
+                    str(candidate),
+                    "--output-format",
+                    "stream-json",
+                    "--input-format",
+                    "stream-json",
+                    "--verbose",
+                    "--tools",
+                    "",
+                    "--strict-mcp-config",
+                    "--setting-sources",
+                    "user",
+                    env=env,
+                ) as (proc, stderr):
+                    async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
+                        resp = await self._initialize_cli(
+                            proc, read_jsonl(proc.stdout), stderr
+                        )
                     if not _has_claude_credentials(resp, auth, env):
-
-                        def commit(chosen: Path = candidate) -> None:
-                            self.cli_path = chosen
-                            self._http_model_info = {}
-                            self.last_discovery_error = None
-
-                        return [], commit
+                        return [], self._discovery_commit(cli_path=candidate)
                     raw_models = resp.get("models")
                     entries = raw_models if isinstance(raw_models, list) else []
                     models = _parse_models(entries)
                     if models:
-
-                        def commit(chosen: Path = candidate) -> None:
-                            self.cli_path = chosen
-                            self._http_model_info = {}
-                            self.last_discovery_error = None
-
-                        return models, commit
+                        return models, self._discovery_commit(cli_path=candidate)
                     logger.warning(
                         "Claude CLI at %s reported no usable models", candidate
                     )
@@ -360,17 +366,8 @@ class AnthropicBackend:
                 logger.warning(
                     "Claude model discovery with %s failed: %s", candidate, exc
                 )
-            finally:
-                if proc is not None:
-                    await terminate_process(proc, stderr)
-                elif stderr is not None:
-                    await stderr.close()
 
-        def clear_http() -> None:
-            self._http_model_info = {}
-            self.last_discovery_error = None
-
-        return [], clear_http
+        return [], self._discovery_commit()
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         models, commit = await self.discover_models_staged(auth)
@@ -535,10 +532,7 @@ class AnthropicBackend:
                 async for event in events:
                     yield event
             return
-        if is_http_session_id(resume_session_id):
-            raise SessionResumeError(
-                "Session was created in HTTP API mode and cannot be resumed by the CLI."
-            )
+        reject_http_session_for_cli(resume_session_id)
         cli_path = self._resolve_cli()
         env = {
             **auth.process_env(),
@@ -568,176 +562,168 @@ class AnthropicBackend:
                 effort=effort,
                 resume_session_id=resume_session_id,
             )
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_path,
-                env=env,
-                start_new_session=(os.name == "posix"),
-            )
-            stderr = StderrCollector(proc.stderr)
-            try:
-                messages = read_jsonl(proc.stdout)
+            async with managed_subprocess(*cmd, cwd=workspace_path, env=env) as (
+                proc,
+                stderr,
+            ):
                 try:
-                    init_id = await self._send_control(
-                        proc, "initialize", {"skills": []}
+                    messages = read_jsonl(proc.stdout)
+                    await self._initialize_cli(
+                        proc,
+                        messages,
+                        stderr,
+                        resume_session_id=resume_session_id,
+                        allowed_tools=allowed_tools,
                     )
-                except (BrokenPipeError, ConnectionResetError) as exc:
-                    detail = await stderr.text()
-                    if resume_session_id and _is_missing_session_error(detail):
-                        raise SessionResumeError(detail) from exc
-                    raise RuntimeError(detail or str(exc)) from exc
-                await self._await_initialize(
-                    proc,
-                    messages,
-                    init_id,
-                    stderr,
-                    resume_session_id=resume_session_id,
-                    allowed_tools=allowed_tools,
-                )
 
-                await self._write_json(
-                    proc,
-                    {
-                        "type": "user",
-                        "message": {"role": "user", "content": prompt},
-                        "parent_tool_use_id": None,
-                        "session_id": resume_session_id or "default",
-                    },
-                )
+                    await self._send_user_message(
+                        proc,
+                        prompt,
+                        session_id=resume_session_id or "default",
+                        stderr=stderr,
+                        resume_session_id=resume_session_id,
+                    )
 
-                seen_session_id = resume_session_id
-                last_prompt_tokens: int | None = None
-                last_prompt_model: str | None = None
-                saw_result = False
-                progressed = False
-                emitted_turn_started = False
+                    seen_session_id = resume_session_id
+                    last_prompt_tokens: int | None = None
+                    last_prompt_model: str | None = None
+                    saw_result = False
+                    progressed = False
+                    emitted_turn_started = False
 
-                async for msg in messages:
-                    msg_type = msg.get("type")
-                    if msg_type == "result" and msg.get("is_error"):
-                        detail = _error_result_text(msg)
+                    async for msg in messages:
+                        msg_type = msg.get("type")
+                        if msg_type == "result" and msg.get("is_error"):
+                            detail = _error_result_text(msg)
+                            if (
+                                resume_session_id
+                                and not progressed
+                                and _is_missing_session_error(detail)
+                            ):
+                                raise SessionResumeError(detail)
+                            raise RuntimeError(detail)
+
+                        session_id = msg.get("session_id")
+                        if (
+                            isinstance(session_id, str)
+                            and session_id
+                            and session_id != seen_session_id
+                        ):
+                            seen_session_id = session_id
+                            yield SessionStarted(session_id)
+
+                        if msg_type == "control_request":
+                            await self._handle_control_request(proc, msg, allowed_tools)
+                            continue
+
+                        if msg_type == "stream_event":
+                            if msg.get("parent_tool_use_id"):
+                                continue
+                            raw = msg.get("event") or {}
+                            raw_type = raw.get("type")
+                            if not emitted_turn_started and raw_type in (
+                                "message_start",
+                                "content_block_start",
+                                "content_block_delta",
+                            ):
+                                emitted_turn_started = True
+                                progressed = True
+                                yield TurnStarted()
+                            if raw_type == "content_block_delta":
+                                delta = raw.get("delta") or {}
+                                if delta.get("type") == "text_delta":
+                                    chunk = delta.get("text")
+                                    if isinstance(chunk, str) and chunk:
+                                        progressed = True
+                                        yield TextDelta(chunk)
+                        elif (
+                            msg_type == "system"
+                            and msg.get("subtype") == "compact_boundary"
+                        ):
+                            progressed = True
+                            yield CompactionNotice()
+                        elif msg_type == "assistant":
+                            inner = (
+                                msg.get("message")
+                                if isinstance(msg.get("message"), dict)
+                                else msg
+                            )
+                            usage = inner.get("usage") or msg.get("usage") or {}
+                            parent_tool = msg.get("parent_tool_use_id")
+                            msg_model = inner.get("model") or msg.get("model")
+                            msg_id = inner.get("id") or msg.get("message_id")
+                            if (
+                                parent_tool is None
+                                and isinstance(usage, dict)
+                                and usage
+                            ):
+                                progressed = True
+                                yield MessageUsage(
+                                    message_id=msg_id,
+                                    model=msg_model,
+                                    usage=usage,
+                                )
+                                keys = (
+                                    "input_tokens",
+                                    "cache_read_input_tokens",
+                                    "cache_creation_input_tokens",
+                                )
+                                counts = tuple(usage.get(k, 0) for k in keys)
+                                if any(k in usage for k in keys) and all(
+                                    is_int(c) and c >= 0 for c in counts
+                                ):
+                                    last_prompt_tokens = sum(counts)
+                                    last_prompt_model = msg_model
+                            content = inner.get("content") or []
+                            if parent_tool is None and isinstance(content, list):
+                                for block in content:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                        and isinstance(block.get("text"), str)
+                                    ):
+                                        progressed = True
+                                        yield TextBlockDone(block["text"])
+                        elif msg_type == "result":
+                            saw_result = True
+                            model_usage = msg.get("modelUsage") or msg.get(
+                                "model_usage"
+                            )
+                            context_usage = _context_usage_from_turn(
+                                last_prompt_tokens, last_prompt_model, model_usage
+                            )
+                            progressed = True
+                            yield TurnResult(
+                                usage=msg.get("usage"),
+                                model_usage=model_usage,
+                                context_usage=context_usage,
+                                total_cost_usd=msg.get("total_cost_usd"),
+                                duration_ms=msg.get("duration_ms"),
+                                duration_api_ms=msg.get("duration_api_ms"),
+                                num_turns=msg.get("num_turns"),
+                            )
+                            break
+
+                    if not saw_result:
+                        detail = await stderr.text()
+                        rc = await proc.wait()
                         if (
                             resume_session_id
                             and not progressed
                             and _is_missing_session_error(detail)
                         ):
                             raise SessionResumeError(detail)
-                        raise RuntimeError(detail)
-
-                    session_id = msg.get("session_id")
-                    if (
-                        isinstance(session_id, str)
-                        and session_id
-                        and session_id != seen_session_id
-                    ):
-                        seen_session_id = session_id
-                        yield SessionStarted(session_id)
-
-                    if msg_type == "control_request":
-                        await self._handle_control_request(proc, msg, allowed_tools)
-                        continue
-
-                    if msg_type == "stream_event":
-                        if msg.get("parent_tool_use_id"):
-                            continue
-                        raw = msg.get("event") or {}
-                        raw_type = raw.get("type")
-                        if not emitted_turn_started and raw_type in (
-                            "message_start",
-                            "content_block_start",
-                            "content_block_delta",
-                        ):
-                            emitted_turn_started = True
-                            progressed = True
-                            yield TurnStarted()
-                        if raw_type == "content_block_delta":
-                            delta = raw.get("delta") or {}
-                            if delta.get("type") == "text_delta":
-                                chunk = delta.get("text")
-                                if isinstance(chunk, str) and chunk:
-                                    progressed = True
-                                    yield TextDelta(chunk)
-                    elif (
-                        msg_type == "system"
-                        and msg.get("subtype") == "compact_boundary"
-                    ):
-                        progressed = True
-                        yield CompactionNotice()
-                    elif msg_type == "assistant":
-                        inner = (
-                            msg.get("message")
-                            if isinstance(msg.get("message"), dict)
-                            else msg
+                        raise RuntimeError(
+                            detail
+                            or f"Claude CLI exited without completing the turn (status {rc})."
                         )
-                        usage = inner.get("usage") or msg.get("usage") or {}
-                        parent_tool = msg.get("parent_tool_use_id")
-                        msg_model = inner.get("model") or msg.get("model")
-                        msg_id = inner.get("id") or msg.get("message_id")
-                        if parent_tool is None and isinstance(usage, dict) and usage:
-                            progressed = True
-                            yield MessageUsage(
-                                message_id=msg_id,
-                                model=msg_model,
-                                usage=usage,
-                            )
-                            keys = (
-                                "input_tokens",
-                                "cache_read_input_tokens",
-                                "cache_creation_input_tokens",
-                            )
-                            counts = tuple(usage.get(k, 0) for k in keys)
-                            if any(k in usage for k in keys) and all(
-                                isinstance(c, int) and c >= 0 for c in counts
-                            ):
-                                last_prompt_tokens = sum(counts)
-                                last_prompt_model = msg_model
-                        content = inner.get("content") or []
-                        if parent_tool is None and isinstance(content, list):
-                            for block in content:
-                                if (
-                                    isinstance(block, dict)
-                                    and block.get("type") == "text"
-                                    and isinstance(block.get("text"), str)
-                                ):
-                                    progressed = True
-                                    yield TextBlockDone(block["text"])
-                    elif msg_type == "result":
-                        saw_result = True
-                        model_usage = msg.get("modelUsage") or msg.get("model_usage")
-                        context_usage = _context_usage_from_turn(
-                            last_prompt_tokens, last_prompt_model, model_usage
+                except (asyncio.CancelledError, GeneratorExit):
+                    with suppress(Exception, TimeoutError):
+                        await asyncio.wait_for(
+                            self._send_control(proc, "interrupt"), timeout=0.5
                         )
-                        progressed = True
-                        yield TurnResult(
-                            usage=msg.get("usage"),
-                            model_usage=model_usage,
-                            context_usage=context_usage,
-                            total_cost_usd=msg.get("total_cost_usd"),
-                            duration_ms=msg.get("duration_ms"),
-                            duration_api_ms=msg.get("duration_api_ms"),
-                            num_turns=msg.get("num_turns"),
-                        )
-                        break
-
-                if not saw_result:
-                    detail = await stderr.text()
-                    rc = await proc.wait()
-                    raise RuntimeError(
-                        detail
-                        or f"Claude CLI exited without completing the turn (status {rc})."
-                    )
-            except (asyncio.CancelledError, GeneratorExit):
-                with suppress(Exception, TimeoutError):
-                    await asyncio.wait_for(
-                        self._send_control(proc, "interrupt"), timeout=0.5
-                    )
-                await bridge.cancel_in_flight()
-                raise
-            finally:
-                await terminate_process(proc, stderr)
+                    await bridge.cancel_in_flight()
+                    raise
 
     async def compact(
         self,
@@ -761,10 +747,7 @@ class AnthropicBackend:
                 model_info_by_id=self._http_model_info,
                 http_client_factory=self._http_client_factory,
             )
-        if is_http_session_id(resume_session_id):
-            raise SessionResumeError(
-                "Session was created in HTTP API mode and cannot be resumed by the CLI."
-            )
+        reject_http_session_for_cli(resume_session_id)
         del tools
         cli_path = self._resolve_cli()
         env = {
@@ -779,47 +762,28 @@ class AnthropicBackend:
             effort=effort,
             resume_session_id=resume_session_id,
         )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_path,
-            env=env,
-            start_new_session=(os.name == "posix"),
-        )
-        stderr = StderrCollector(proc.stderr)
-        try:
+        async with managed_subprocess(*cmd, cwd=workspace_path, env=env) as (
+            proc,
+            stderr,
+        ):
             messages = read_jsonl(proc.stdout)
             compacted = False
             latest_session_id: str | None = resume_session_id
             try:
                 async with asyncio.timeout(COMPACT_TIMEOUT_S):
-                    try:
-                        init_id = await self._send_control(
-                            proc, "initialize", {"skills": []}
-                        )
-                    except (BrokenPipeError, ConnectionResetError) as exc:
-                        detail = await stderr.text()
-                        if _is_missing_session_error(detail):
-                            raise SessionResumeError(detail) from exc
-                        raise RuntimeError(detail or str(exc)) from exc
-                    await self._await_initialize(
+                    await self._initialize_cli(
                         proc,
                         messages,
-                        init_id,
                         stderr,
                         resume_session_id=resume_session_id,
                     )
 
-                    await self._write_json(
+                    await self._send_user_message(
                         proc,
-                        {
-                            "type": "user",
-                            "message": {"role": "user", "content": "/compact"},
-                            "parent_tool_use_id": None,
-                            "session_id": resume_session_id,
-                        },
+                        "/compact",
+                        session_id=resume_session_id,
+                        stderr=stderr,
+                        resume_session_id=resume_session_id,
                     )
 
                     async for msg in messages:
@@ -849,6 +813,8 @@ class AnthropicBackend:
 
             if not compacted:
                 detail = await stderr.text()
+                if _is_missing_session_error(detail):
+                    raise SessionResumeError(detail)
                 raise RuntimeError(
                     detail or "Claude did not confirm that compaction completed."
                 )
@@ -871,16 +837,11 @@ class AnthropicBackend:
                                     resp.get("error") or "get_context_usage failed"
                                 )
                             usage = resp.get("response") or {}
-                            used = usage.get("totalTokens")
-                            window = usage.get("rawMaxTokens")
-                            if isinstance(used, int) and used >= 0:
-                                context_usage = {
-                                    "used_tokens": used,
-                                    "window_tokens": window
-                                    if isinstance(window, int) and window > 0
-                                    else None,
-                                    "model": usage.get("model"),
-                                }
+                            context_usage = context_usage_payload(
+                                usage.get("totalTokens"),
+                                usage.get("rawMaxTokens"),
+                                usage.get("model"),
+                            )
                             break
             except TimeoutError:
                 logger.warning(
@@ -894,5 +855,3 @@ class AnthropicBackend:
             return CompactResult(
                 session_id=latest_session_id, context_usage=context_usage
             )
-        finally:
-            await terminate_process(proc, stderr)

@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -19,8 +18,8 @@ from typing import Any
 import httpx
 
 from ..auth import ProviderId
-from ..mcp_bridge import _validate_arguments
-from ..tools import ToolSpec
+from ..notes import write_text
+from ..tools import ToolSpec, validate_tool_arguments
 from .base import (
     EFFORT_LEVELS,
     CompactResult,
@@ -34,6 +33,7 @@ from .base import (
     TurnResult,
     TurnStarted,
 )
+from .base import is_int as _is_int
 
 logger = logging.getLogger("nocturnomath.backends.http")
 
@@ -102,12 +102,12 @@ _ANTHROPIC_VERSION = "2023-06-01"
 _GEMINI_25_THINKING_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
 
 
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def _is_pos_int(value: Any) -> bool:
     return _is_int(value) and value > 0
+
+
+def _is_openai_reasoning(model: str) -> bool:
+    return bool(_OPENAI_REASONING_RE.match(model) and "chat-latest" not in model)
 
 
 def _validate_http_api_key(provider_title: str, api_key: str) -> str:
@@ -132,6 +132,14 @@ def _sanitize_error_text(text: str, secret: str | None) -> str:
 def is_http_session_id(session_id: str | None) -> bool:
     """Return whether ``session_id`` identifies a direct HTTP thread."""
     return bool(session_id and session_id.startswith(HTTP_SESSION_PREFIX))
+
+
+def reject_http_session_for_cli(session_id: str | None) -> None:
+    """Raise ``SessionResumeError`` when CLI mode receives a direct HTTP session ID."""
+    if is_http_session_id(session_id):
+        raise SessionResumeError(
+            "Session was created in HTTP API mode and cannot be resumed by the CLI."
+        )
 
 
 class HttpThreadStore:
@@ -198,18 +206,7 @@ class HttpThreadStore:
                 "context_window": context_window,
             }
         )
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{path.stem}-", suffix=".tmp", dir=str(self.root)
-        )
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-            os.replace(tmp_path, path)
-        except BaseException:
-            with suppress(OSError):
-                tmp_path.unlink()
-            raise
+        write_text(path, payload)
 
 
 def make_http_client(
@@ -228,22 +225,31 @@ async def _iter_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
     buf = ""
     first_text = True
 
-    def pop_line() -> str | None:
+    def drain(*, final: bool) -> list[str]:
         nonlocal buf
-        idx_n = buf.find("\n")
-        idx_r = buf.find("\r")
-        if idx_n == -1 and idx_r == -1:
-            return None
-        if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
-            if idx_r == len(buf) - 1:
-                return None
-            line = buf[:idx_r]
-            consume = idx_r + (2 if buf[idx_r + 1] == "\n" else 1)
-            buf = buf[consume:]
-            return line
-        line = buf[:idx_n]
-        buf = buf[idx_n + 1 :]
-        return line
+        lines: list[str] = []
+        pos = 0
+        length = len(buf)
+        while pos < length:
+            idx_n = buf.find("\n", pos)
+            idx_r = buf.find("\r", pos)
+            if idx_n == -1 and idx_r == -1:
+                break
+            if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+                if not final and idx_r == length - 1:
+                    break
+                lines.append(buf[pos:idx_r])
+                pos = idx_r + (
+                    2 if idx_r + 1 < length and buf[idx_r + 1] == "\n" else 1
+                )
+            else:
+                lines.append(buf[pos:idx_n])
+                pos = idx_n + 1
+        buf = buf[pos:]
+        if final and buf:
+            lines.append(buf)
+            buf = ""
+        return lines
 
     async for chunk in response.aiter_bytes():
         text = decoder.decode(chunk, final=False)
@@ -251,7 +257,7 @@ async def _iter_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
             first_text = False
             text = text.removeprefix("\ufeff")
         buf += text
-        while (line := pop_line()) is not None:
+        for line in drain(final=False):
             yield line
 
     tail = decoder.decode(b"", final=True)
@@ -259,22 +265,8 @@ async def _iter_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
         first_text = False
         tail = tail.removeprefix("\ufeff")
     buf += tail
-    while True:
-        idx_n = buf.find("\n")
-        idx_r = buf.find("\r")
-        if idx_n == -1 and idx_r == -1:
-            break
-        if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
-            yield buf[:idx_r]
-            consume = idx_r + (
-                2 if idx_r + 1 < len(buf) and buf[idx_r + 1] == "\n" else 1
-            )
-            buf = buf[consume:]
-        else:
-            yield buf[:idx_n]
-            buf = buf[idx_n + 1 :]
-    if buf:
-        yield buf
+    for line in drain(final=True):
+        yield line
 
 
 async def iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
@@ -302,6 +294,21 @@ async def iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, 
                 event_name = value.strip()
             elif field == "data":
                 data_lines.append(value)
+
+
+async def _iter_sse_json(
+    response: httpx.Response,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    async with aclosing(iter_sse_events(response)) as sse_events:
+        async for event_name, raw_data in sse_events:
+            if not raw_data or raw_data == "[DONE]":
+                continue
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                yield event_name, data
 
 
 def http_error_message(
@@ -333,6 +340,29 @@ def http_error_message(
     return base
 
 
+def _sanitize_exception(exc: Exception, secret: str) -> RuntimeError | None:
+    raw = str(exc)
+    sanitized = _sanitize_error_text(raw or type(exc).__name__, secret)
+    return RuntimeError(sanitized) if sanitized != raw else None
+
+
+def _should_retry_without_effort(
+    status_code: int,
+    attempt: int,
+    enabled: bool,
+    err_msg: str,
+    keywords: Sequence[str],
+) -> bool:
+    if status_code != 400 or attempt != 0 or not enabled:
+        return False
+    lowered = err_msg.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _tool_error(message: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": message}], "is_error": True}
+
+
 def _parse_tool_arguments(raw_json: str) -> tuple[dict[str, Any] | None, str | None]:
     if not raw_json.strip():
         return {}, None
@@ -347,15 +377,9 @@ def _parse_tool_arguments(raw_json: str) -> tuple[dict[str, Any] | None, str | N
     return parsed, None
 
 
-_SKIPPED_STEER_RESULT: dict[str, Any] = {
-    "content": [
-        {
-            "type": "text",
-            "text": "Skipped: the user sent a new message. Read and address it before running further tools.",
-        }
-    ],
-    "is_error": True,
-}
+_SKIPPED_STEER_RESULT: dict[str, Any] = _tool_error(
+    "Skipped: the user sent a new message. Read and address it before running further tools."
+)
 
 
 async def execute_tool_call(
@@ -367,43 +391,46 @@ async def execute_tool_call(
     """Validate and run an in-process ``ToolSpec`` without swallowing cancellations."""
     spec = tool_by_name.get(name)
     if spec is None:
-        return {
-            "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
-            "is_error": True,
-        }
+        return _tool_error(f"Unknown tool: {name}")
     if raw_args is None:
         raw_args = {}
     if not isinstance(raw_args, dict):
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Tool '{name}' arguments must be a JSON object.",
-                }
-            ],
-            "is_error": True,
-        }
+        return _tool_error(f"Tool '{name}' arguments must be a JSON object.")
     try:
-        cleaned = _validate_arguments(spec.input_schema, raw_args)
+        cleaned = validate_tool_arguments(spec.input_schema, raw_args)
     except ValueError as exc:
-        return {"content": [{"type": "text", "text": str(exc)}], "is_error": True}
+        return _tool_error(str(exc))
     try:
         return await asyncio.wait_for(spec.handler(cleaned), timeout=tool_timeout_s)
     except TimeoutError:
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Tool '{name}' timed out after {tool_timeout_s}s.",
-                }
-            ],
-            "is_error": True,
-        }
+        return _tool_error(f"Tool '{name}' timed out after {tool_timeout_s}s.")
     except Exception as exc:
-        return {
-            "content": [{"type": "text", "text": str(exc) or type(exc).__name__}],
-            "is_error": True,
-        }
+        return _tool_error(str(exc) or type(exc).__name__)
+
+
+async def _iter_tool_batch_results(
+    calls: Sequence[Any],
+    *,
+    tool_by_name: Mapping[str, ToolSpec],
+    tool_timeout_s: int,
+    extract_call: Callable[[Any], tuple[str, Any, str | None]],
+) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
+    """Execute a round's tool calls sequentially, short-circuiting after steer."""
+    steered_out = False
+    for call in calls:
+        if steered_out:
+            yield call, _SKIPPED_STEER_RESULT
+            continue
+        name, raw_args, json_err = extract_call(call)
+        if json_err is not None:
+            result = _tool_error(json_err)
+        else:
+            result = await execute_tool_call(
+                tool_by_name, name, raw_args, tool_timeout_s
+            )
+        if result.get("steered"):
+            steered_out = True
+        yield call, result
 
 
 def _tool_text_and_images(
@@ -437,6 +464,106 @@ def _add_int_usage(target: dict[str, int], source: Mapping[str, Any] | None) -> 
             target[key] = target.get(key, 0) + value
 
 
+def _interrupted_text(partial_text: str, assistant_note: str) -> str:
+    return (
+        f"{partial_text}\n\n{assistant_note}"
+        if partial_text.strip()
+        else assistant_note
+    )
+
+
+def _resolve_context_window(
+    info: Mapping[str, Any] | None,
+    *,
+    saved_model: str | None,
+    target_model: str,
+    saved_window: Any,
+) -> int | None:
+    info_window = info.get("context_window") if isinstance(info, Mapping) else None
+    if _is_pos_int(info_window):
+        return info_window
+    same_model = saved_model is None or saved_model == target_model
+    return saved_window if same_model and _is_pos_int(saved_window) else None
+
+
+async def _fetch_http_model_pages(
+    provider_title: str,
+    url: str,
+    *,
+    headers_fn: Callable[[str], dict[str, str]],
+    api_key: str,
+    http_client_factory: Callable[..., httpx.AsyncClient] | None,
+    params_for_token: Callable[[str | None], dict[str, str] | None] | None = None,
+    next_token_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    max_pages: int = 5,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch one or more paginated model-list JSON payloads with sanitized errors."""
+    pages: list[dict[str, Any]] = []
+    token: str | None = None
+    try:
+        headers = headers_fn(api_key)
+        async with (
+            asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
+            make_http_client(
+                http_client_factory, timeout=HTTP_DISCOVERY_TIMEOUT_S
+            ) as client,
+        ):
+            for _ in range(max_pages):
+                params = params_for_token(token) if params_for_token else None
+                response = await client.get(url, headers=headers, params=params)
+                if response.status_code != 200:
+                    err_msg = _sanitize_error_text(
+                        http_error_message(provider_title, response, response.content),
+                        api_key,
+                    )
+                    logger.warning(
+                        "%s HTTP model discovery failed: %s", provider_title, err_msg
+                    )
+                    return [], err_msg
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    break
+                pages.append(payload)
+                if next_token_fn is None:
+                    break
+                token = next_token_fn(payload)
+                if not token:
+                    break
+    except Exception as exc:
+        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
+        logger.warning("%s HTTP model discovery failed: %s", provider_title, err_msg)
+        return [], err_msg
+    return pages, None
+
+
+async def _http_post_json(
+    provider_title: str,
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    body: Mapping[str, Any],
+    api_key: str,
+    http_client_factory: Callable[..., httpx.AsyncClient] | None,
+) -> Any:
+    try:
+        async with make_http_client(
+            http_client_factory, timeout=HTTP_TIMEOUT
+        ) as client:
+            response = await client.post(url, headers=headers, json=body)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    _sanitize_error_text(
+                        http_error_message(provider_title, response, response.content),
+                        api_key,
+                    )
+                )
+            return response.json()
+    except Exception as exc:
+        if (sanitized := _sanitize_exception(exc, api_key)) is not None:
+            raise sanitized from None
+        raise
+
+
 def _resume_state(
     store: HttpThreadStore, resume_session_id: str | None
 ) -> tuple[str, list[Any], str | None, int | None]:
@@ -457,6 +584,81 @@ def _resume_state(
             ctx_window if _is_pos_int(ctx_window) else None,
         )
     return store.new_session_id(), [], None, None
+
+
+async def _compact_http_thread(
+    *,
+    provider: ProviderId,
+    provider_title: str,
+    headers: Mapping[str, str],
+    api_key: str,
+    workspace_path: Path,
+    model: str | None,
+    resume_session_id: str,
+    resolve_context: Callable[[str, str | None, Any], int | None],
+    repair_history: Callable[[list[Any]], None],
+    render_history: Callable[[list[Any]], str],
+    build_request: Callable[[str, str], tuple[str, dict[str, Any]]],
+    parse_response: Callable[[Any], tuple[str, int | None]],
+    format_compacted: Callable[[str], list[Any]],
+    save_context_window: bool = True,
+    http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
+) -> CompactResult:
+    """Shared stateless compaction flow across direct HTTP providers."""
+    store = HttpThreadStore(workspace_path, provider)
+    saved = store.load(resume_session_id)
+    target_model = model or saved.get("model")
+    if not isinstance(target_model, str) or not target_model:
+        raise RuntimeError("No model is available to compact this session.")
+    saved_model = saved.get("model") if isinstance(saved.get("model"), str) else None
+    context_window = resolve_context(
+        target_model, saved_model, saved.get("context_window")
+    )
+
+    history = saved["messages"]
+    if isinstance(history, list):
+        history = list(history)
+        repair_history(history)
+    transcript = render_history(history)
+    compact_prompt = (
+        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
+        if transcript
+        else COMPACTION_PROMPT
+    )
+
+    url, body = build_request(target_model, compact_prompt)
+    payload = await _http_post_json(
+        provider_title,
+        url,
+        headers=headers,
+        body=body,
+        api_key=api_key,
+        http_client_factory=http_client_factory,
+    )
+    summary, token_count = parse_response(payload)
+    if not summary:
+        raise RuntimeError(f"{provider_title} did not return a compaction summary.")
+
+    store.save(
+        resume_session_id,
+        model=target_model,
+        messages=format_compacted(summary),
+        context_window=context_window if save_context_window else None,
+    )
+    context_usage = (
+        {
+            "used_tokens": token_count + 20,
+            "window_tokens": context_window,
+            "model": target_model,
+        }
+        if token_count is not None
+        else None
+    )
+    return CompactResult(
+        session_id=resume_session_id,
+        context_usage=context_usage,
+        record_reloaded=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,55 +745,42 @@ async def discover_anthropic_http_models(
 ) -> tuple[list[ModelSpec], dict[str, dict[str, Any]], str | None]:
     """List Claude models via ``GET /v1/models``."""
     base = _anthropic_base_url()
+    pages, err_msg = await _fetch_http_model_pages(
+        "Anthropic",
+        f"{base}/v1/models",
+        headers_fn=_anthropic_headers,
+        api_key=api_key,
+        http_client_factory=http_client_factory,
+        params_for_token=lambda tok: {
+            "limit": "100",
+            **({"after_id": tok} if tok else {}),
+        },
+        next_token_fn=lambda payload: (
+            payload.get("last_id")
+            if payload.get("has_more") and isinstance(payload.get("last_id"), str)
+            else None
+        ),
+    )
+    if err_msg is not None:
+        return [], {}, err_msg
+
     raw_items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    after_id: str | None = None
-    try:
-        headers = _anthropic_headers(api_key)
-        async with (
-            asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
-            make_http_client(
-                http_client_factory, timeout=HTTP_DISCOVERY_TIMEOUT_S
-            ) as client,
-        ):
-            for _ in range(5):
-                params: dict[str, str] = {"limit": "100"}
-                if after_id is not None:
-                    params["after_id"] = after_id
-                response = await client.get(
-                    f"{base}/v1/models", headers=headers, params=params
-                )
-                if response.status_code != 200:
-                    err_msg = _sanitize_error_text(
-                        http_error_message("Anthropic", response, response.content),
-                        api_key,
-                    )
-                    logger.warning("Anthropic HTTP model discovery failed: %s", err_msg)
-                    return [], {}, err_msg
-                payload = response.json()
-                data = payload.get("data") if isinstance(payload, dict) else None
-                if not isinstance(data, list):
-                    break
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    mid = item.get("id")
-                    if (
-                        isinstance(mid, str)
-                        and mid.startswith("claude-")
-                        and mid not in seen_ids
-                    ):
-                        seen_ids.add(mid)
-                        raw_items.append(item)
-                if not payload.get("has_more"):
-                    break
-                after_id = payload.get("last_id")
-                if not isinstance(after_id, str) or not after_id:
-                    break
-    except Exception as exc:
-        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        logger.warning("Anthropic HTTP model discovery failed: %s", err_msg)
-        return [], {}, err_msg
+    for payload in pages:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id")
+            if (
+                isinstance(mid, str)
+                and mid.startswith("claude-")
+                and mid not in seen_ids
+            ):
+                seen_ids.add(mid)
+                raw_items.append(item)
 
     if not raw_items:
         return [], {}, None
@@ -659,6 +848,18 @@ def _anthropic_tool_result_block(
     return block
 
 
+def _finalize_anthropic_tool_block(block: dict[str, Any]) -> None:
+    if block.get("type") != "tool_use" or "_partial_json" not in block:
+        return
+    raw_json = "".join(block.pop("_partial_json", []))
+    if raw_json.strip():
+        parsed, json_err = _parse_tool_arguments(raw_json)
+        if json_err is not None:
+            block["_json_error"] = json_err
+        elif parsed is not None:
+            block["input"] = parsed
+
+
 def _finalize_anthropic_interrupted(
     working_messages: list[Any],
     *,
@@ -689,11 +890,7 @@ def _finalize_anthropic_interrupted(
         )
         return
     if isinstance(last, dict) and last.get("role") == "user":
-        suffix = (
-            f"{partial_text}\n\n{assistant_note}"
-            if partial_text.strip()
-            else assistant_note
-        )
+        suffix = _interrupted_text(partial_text, assistant_note)
         working_messages.append(
             {"role": "assistant", "content": [{"type": "text", "text": suffix}]}
         )
@@ -783,7 +980,6 @@ async def run_anthropic_http_turn(
     session_id, saved_messages, saved_model, saved_window = _resume_state(
         store, resume_session_id
     )
-    same_model = saved_model is None or saved_model == model
     if saved_model and saved_model != model:
         saved_messages = _sanitize_anthropic_for_model_switch(saved_messages)
     info = (
@@ -791,10 +987,8 @@ async def run_anthropic_http_turn(
         if model_info is not None
         else _anthropic_capabilities(model, {})
     )
-    context_window = (
-        info["context_window"]
-        if _is_pos_int(info.get("context_window"))
-        else (saved_window if same_model else None)
+    context_window = _resolve_context_window(
+        info, saved_model=saved_model, target_model=model, saved_window=saved_window
     )
     max_tokens_meta = info.get("max_tokens")
     max_tokens = (
@@ -868,31 +1062,20 @@ async def run_anthropic_http_turn(
                                 http_error_message("Anthropic", response, raw_err),
                                 api_key,
                             )
-                            lowered = err_msg.lower()
-                            if (
-                                response.status_code == 400
-                                and effort_attempt == 0
-                                and include_effort
-                                and any(
-                                    k in lowered
-                                    for k in ("output_config", "thinking", "effort")
-                                )
+                            if _should_retry_without_effort(
+                                response.status_code,
+                                effort_attempt,
+                                include_effort,
+                                err_msg,
+                                ("output_config", "thinking", "effort"),
                             ):
                                 include_effort = False
                                 retry_without_effort = True
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async with aclosing(iter_sse_events(response)) as sse_events:
-                            async for event_name, raw_data in sse_events:
-                                if not raw_data or raw_data == "[DONE]":
-                                    continue
-                                try:
-                                    data = json.loads(raw_data)
-                                except json.JSONDecodeError:
-                                    continue
-                                if not isinstance(data, dict):
-                                    continue
+                        async with aclosing(_iter_sse_json(response)) as events:
+                            async for event_name, data in events:
                                 ev_type = data.get("type") or event_name
 
                                 if ev_type == "error":
@@ -1018,18 +1201,8 @@ async def run_anthropic_http_turn(
                                         open_text_indices.discard(idx)
                                         if block["text"]:
                                             yield TextBlockDone(block["text"])
-                                    elif block["type"] == "tool_use":
-                                        raw_json = "".join(
-                                            block.pop("_partial_json", [])
-                                        )
-                                        if raw_json.strip():
-                                            parsed, json_err = _parse_tool_arguments(
-                                                raw_json
-                                            )
-                                            if json_err is not None:
-                                                block["_json_error"] = json_err
-                                            elif parsed is not None:
-                                                block["input"] = parsed
+                                    else:
+                                        _finalize_anthropic_tool_block(block)
                                 elif ev_type == "message_delta":
                                     _merge_usage(round_usage, data.get("usage"))
                                     delta = data.get("delta")
@@ -1062,17 +1235,7 @@ async def run_anthropic_http_turn(
                                 yield TextBlockDone(block["text"])
                         for idx in sorted(blocks_by_index):
                             block = blocks_by_index[idx]
-                            if (
-                                block.get("type") == "tool_use"
-                                and "_partial_json" in block
-                            ):
-                                raw_json = "".join(block.pop("_partial_json", []))
-                                if raw_json.strip():
-                                    parsed, json_err = _parse_tool_arguments(raw_json)
-                                    if json_err is not None:
-                                        block["_json_error"] = json_err
-                                    elif parsed is not None:
-                                        block["input"] = parsed
+                            _finalize_anthropic_tool_block(block)
                             assistant_blocks.append(block)
                         break
 
@@ -1144,28 +1307,18 @@ async def run_anthropic_http_turn(
                         f"Anthropic turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
                     )
                 completed_tool_results = []
-                steered_out = False
-                for block in tool_blocks:
-                    tc_id = str(block.get("id") or "")
-                    tc_name = str(block.get("name") or "")
-                    if steered_out:
-                        completed_tool_results.append(
-                            _anthropic_tool_result_block(tc_id, _SKIPPED_STEER_RESULT)
-                        )
-                        continue
-                    if "_json_error" in block:
-                        result = {
-                            "content": [{"type": "text", "text": block["_json_error"]}],
-                            "is_error": True,
-                        }
-                    else:
-                        result = await execute_tool_call(
-                            tool_by_name, tc_name, block.get("input"), tool_timeout_s
-                        )
-                    if result.get("steered"):
-                        steered_out = True
+                async for block, result in _iter_tool_batch_results(
+                    tool_blocks,
+                    tool_by_name=tool_by_name,
+                    tool_timeout_s=tool_timeout_s,
+                    extract_call=lambda b: (
+                        str(b.get("name") or ""),
+                        b.get("input"),
+                        b.get("_json_error"),
+                    ),
+                ):
                     completed_tool_results.append(
-                        _anthropic_tool_result_block(tc_id, result)
+                        _anthropic_tool_result_block(str(block.get("id") or ""), result)
                     )
                 pending_tool_ids = []
                 working_messages.append(
@@ -1178,9 +1331,6 @@ async def run_anthropic_http_turn(
                     messages=working_messages,
                     context_window=context_window,
                 )
-        raise RuntimeError(
-            f"Anthropic turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
-        )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
             _finalize_anthropic_interrupted(
@@ -1212,9 +1362,8 @@ async def run_anthropic_http_turn(
                 messages=working_messages,
                 context_window=context_window,
             )
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
+        if (sanitized := _sanitize_exception(exc, api_key)) is not None:
+            raise sanitized from None
         raise
 
 
@@ -1282,117 +1431,80 @@ async def compact_anthropic_http(
 ) -> CompactResult:
     """Compact an HTTP Anthropic conversation by summarizing saved messages."""
     headers = _anthropic_headers(api_key)
-    store = HttpThreadStore(workspace_path, "anthropic")
-    saved = store.load(resume_session_id)
-    target_model = model or saved.get("model")
-    if not isinstance(target_model, str) or not target_model:
-        raise RuntimeError("No model is available to compact this session.")
-    saved_model = saved.get("model") if isinstance(saved.get("model"), str) else None
-    resolved_info = (model_info_by_id or {}).get(target_model) or model_info
-    info = (
-        dict(resolved_info)
-        if resolved_info is not None
-        else _anthropic_capabilities(target_model, {})
-    )
-    context_window = (
-        info["context_window"]
-        if _is_pos_int(info.get("context_window"))
-        else (
-            saved.get("context_window")
-            if saved_model == target_model and _is_pos_int(saved.get("context_window"))
+    base = _anthropic_base_url()
+
+    def info_for(target_model: str) -> dict[str, Any]:
+        resolved = (model_info_by_id or {}).get(target_model) or model_info
+        return (
+            dict(resolved)
+            if resolved is not None
+            else _anthropic_capabilities(target_model, {})
+        )
+
+    def build_request(
+        target_model: str, compact_prompt: str
+    ) -> tuple[str, dict[str, Any]]:
+        info = info_for(target_model)
+        max_tokens = (
+            min(info["max_tokens"], 8192)
+            if _is_pos_int(info.get("max_tokens"))
+            else min(_anthropic_default_max_tokens(target_model), 4096)
+        )
+        return f"{base}/v1/messages", {
+            "model": target_model,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": compact_prompt}],
+        }
+
+    def parse_response(payload: Any) -> tuple[str, int | None]:
+        stop_reason = payload.get("stop_reason") if isinstance(payload, dict) else None
+        if stop_reason in ("max_tokens", "refusal", "model_context_window_exceeded"):
+            raise RuntimeError(f"Anthropic compaction stopped early ({stop_reason}).")
+        content = payload.get("content") if isinstance(payload, dict) else None
+        summary_parts = [
+            str(block.get("text") or "")
+            for block in (content or [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
+        output_tokens = (
+            (payload.get("usage") or {}).get("output_tokens")
+            if isinstance(payload, dict)
             else None
         )
-    )
-    max_tokens = (
-        min(info["max_tokens"], 8192)
-        if _is_pos_int(info.get("max_tokens"))
-        else min(_anthropic_default_max_tokens(target_model), 4096)
-    )
+        return summary, (
+            output_tokens if _is_int(output_tokens) and output_tokens >= 0 else None
+        )
 
-    history = saved["messages"]
-    if isinstance(history, list):
-        history = list(history)
-        _repair_anthropic_messages(history)
-    transcript = _render_anthropic_history_for_compaction(history)
-    compact_prompt = (
-        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
-        if transcript
-        else COMPACTION_PROMPT
-    )
-
-    base = _anthropic_base_url()
-    body = {
-        "model": target_model,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": compact_prompt}],
-    }
-    try:
-        async with make_http_client(
-            http_client_factory, timeout=HTTP_TIMEOUT
-        ) as client:
-            response = await client.post(
-                f"{base}/v1/messages", headers=headers, json=body
+    return await _compact_http_thread(
+        provider="anthropic",
+        provider_title="Anthropic",
+        headers=headers,
+        api_key=api_key,
+        workspace_path=workspace_path,
+        model=model,
+        resume_session_id=resume_session_id,
+        resolve_context=lambda target_model, saved_model, saved_window: (
+            _resolve_context_window(
+                info_for(target_model),
+                saved_model=saved_model,
+                target_model=target_model,
+                saved_window=saved_window,
             )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    _sanitize_error_text(
-                        http_error_message("Anthropic", response, response.content),
-                        api_key,
-                    )
-                )
-            payload = response.json()
-    except Exception as exc:
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
-        raise
-
-    stop_reason = payload.get("stop_reason") if isinstance(payload, dict) else None
-    if stop_reason in ("max_tokens", "refusal", "model_context_window_exceeded"):
-        raise RuntimeError(f"Anthropic compaction stopped early ({stop_reason}).")
-
-    content = payload.get("content") if isinstance(payload, dict) else None
-    summary_parts = [
-        str(block.get("text") or "")
-        for block in (content or [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    ]
-    summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
-    if not summary:
-        raise RuntimeError("Anthropic did not return a compaction summary.")
-
-    compacted_messages = [
-        {
-            "role": "user",
-            "content": "Summary of our earlier conversation before compaction:",
-        },
-        {"role": "assistant", "content": [{"type": "text", "text": summary}]},
-    ]
-    store.save(
-        resume_session_id,
-        model=target_model,
-        messages=compacted_messages,
-        context_window=context_window,
-    )
-    output_tokens = (
-        (payload.get("usage") or {}).get("output_tokens")
-        if isinstance(payload, dict)
-        else None
-    )
-    context_usage = (
-        {
-            "used_tokens": output_tokens + 20,
-            "window_tokens": context_window,
-            "model": target_model,
-        }
-        if _is_int(output_tokens) and output_tokens >= 0
-        else None
-    )
-    return CompactResult(
-        session_id=resume_session_id,
-        context_usage=context_usage,
-        record_reloaded=False,
+        ),
+        repair_history=_repair_anthropic_messages,
+        render_history=_render_anthropic_history_for_compaction,
+        build_request=build_request,
+        parse_response=parse_response,
+        format_compacted=lambda summary: [
+            {
+                "role": "user",
+                "content": "Summary of our earlier conversation before compaction:",
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": summary}]},
+        ],
+        http_client_factory=http_client_factory,
     )
 
 
@@ -1428,28 +1540,18 @@ async def discover_openai_http_models(
 ) -> tuple[list[ModelSpec], str | None]:
     """List chat/reasoning models via ``GET /models``."""
     base = _openai_base_url()
-    try:
-        headers = _openai_headers(api_key)
-        async with (
-            asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
-            make_http_client(
-                http_client_factory, timeout=HTTP_DISCOVERY_TIMEOUT_S
-            ) as client,
-        ):
-            response = await client.get(f"{base}/models", headers=headers)
-            if response.status_code != 200:
-                err_msg = _sanitize_error_text(
-                    http_error_message("OpenAI", response, response.content), api_key
-                )
-                logger.warning("OpenAI HTTP model discovery failed: %s", err_msg)
-                return [], err_msg
-            payload = response.json()
-    except Exception as exc:
-        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        logger.warning("OpenAI HTTP model discovery failed: %s", err_msg)
+    pages, err_msg = await _fetch_http_model_pages(
+        "OpenAI",
+        f"{base}/models",
+        headers_fn=_openai_headers,
+        api_key=api_key,
+        http_client_factory=http_client_factory,
+        max_pages=1,
+    )
+    if err_msg is not None:
         return [], err_msg
 
-    data = payload.get("data") if isinstance(payload, dict) else None
+    data = pages[0].get("data") if pages else None
     if not isinstance(data, list):
         return [], None
 
@@ -1484,11 +1586,7 @@ async def discover_openai_http_models(
 
     specs: list[ModelSpec] = []
     for mid in ids:
-        efforts = (
-            ["low", "medium", "high"]
-            if _OPENAI_REASONING_RE.match(mid) and "chat-latest" not in mid
-            else []
-        )
+        efforts = ["low", "medium", "high"] if _is_openai_reasoning(mid) else []
         specs.append(
             ModelSpec(
                 id=mid,
@@ -1606,11 +1704,7 @@ def _finalize_openai_interrupted(
     last = working_items[-1] if working_items else None
     needs_reply = not isinstance(last, dict) or last.get("role") != "assistant"
     if needs_reply:
-        suffix = (
-            f"{partial_text}\n\n{assistant_note}"
-            if partial_text.strip()
-            else assistant_note
-        )
+        suffix = _interrupted_text(partial_text, assistant_note)
         working_items.append(
             {
                 "type": "message",
@@ -1683,6 +1777,35 @@ def _openai_refusal_in_item(item: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _process_openai_output_item(
+    item: Mapping[str, Any],
+    *,
+    emitted_parts: set[tuple[str, int]],
+    working_items: list[Any],
+    pending_calls: list[dict[str, Any]],
+) -> list[str]:
+    """Validate, store, and return any unemitted text blocks for one output item."""
+    refusal = _openai_refusal_in_item(item)
+    if refusal is not None:
+        raise RuntimeError(f"OpenAI refused the request: {refusal}")
+    texts: list[str] = []
+    if item.get("type") == "message":
+        item_id = str(item.get("id") or "")
+        content = item.get("content")
+        if isinstance(content, list):
+            for c_idx, part in enumerate(content):
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    key = (item_id, c_idx)
+                    part_text = str(part.get("text") or "")
+                    if part_text and key not in emitted_parts:
+                        emitted_parts.add(key)
+                        texts.append(part_text)
+    _store_openai_output_item(
+        item, working_items=working_items, pending_calls=pending_calls
+    )
+    return texts
+
+
 async def run_openai_http_turn(
     prompt: str,
     *,
@@ -1730,9 +1853,7 @@ async def run_openai_http_turn(
             http_client_factory, timeout=HTTP_TIMEOUT
         ) as client:
             include_effort = bool(effort)
-            include_reasoning = bool(
-                _OPENAI_REASONING_RE.match(model) and "chat-latest" not in model
-            )
+            include_reasoning = _is_openai_reasoning(model)
             for round_idx in range(1, MAX_TOOL_ROUNDS + 1):
                 partial_text_chunks = []
                 pending_calls = []
@@ -1773,20 +1894,12 @@ async def run_openai_http_turn(
                             err_msg = _sanitize_error_text(
                                 http_error_message("OpenAI", response, raw_err), api_key
                             )
-                            lowered = err_msg.lower()
-                            if (
-                                response.status_code == 400
-                                and effort_attempt == 0
-                                and (include_effort or include_reasoning)
-                                and any(
-                                    k in lowered
-                                    for k in (
-                                        "reasoning",
-                                        "encrypted_content",
-                                        "include",
-                                        "effort",
-                                    )
-                                )
+                            if _should_retry_without_effort(
+                                response.status_code,
+                                effort_attempt,
+                                include_effort or include_reasoning,
+                                err_msg,
+                                ("reasoning", "encrypted_content", "include", "effort"),
                             ):
                                 include_effort = False
                                 include_reasoning = False
@@ -1794,16 +1907,8 @@ async def run_openai_http_turn(
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async with aclosing(iter_sse_events(response)) as sse_events:
-                            async for event_name, raw_data in sse_events:
-                                if not raw_data or raw_data == "[DONE]":
-                                    continue
-                                try:
-                                    data = json.loads(raw_data)
-                                except json.JSONDecodeError:
-                                    continue
-                                if not isinstance(data, dict):
-                                    continue
+                        async with aclosing(_iter_sse_json(response)) as events:
+                            async for event_name, data in events:
                                 ev_type = data.get("type") or event_name
 
                                 if ev_type == "error":
@@ -1908,37 +2013,14 @@ async def run_openai_http_turn(
                                     item = data.get("item")
                                     if not isinstance(item, dict):
                                         continue
-                                    refusal = _openai_refusal_in_item(item)
-                                    if refusal is not None:
-                                        raise RuntimeError(
-                                            f"OpenAI refused the request: {refusal}"
-                                        )
                                     saw_done_items = True
-                                    item_id = str(item.get("id") or "")
-                                    if item.get("type") == "message":
-                                        content = item.get("content") or []
-                                        if isinstance(content, list):
-                                            for c_idx, part in enumerate(content):
-                                                if (
-                                                    isinstance(part, dict)
-                                                    and part.get("type")
-                                                    == "output_text"
-                                                ):
-                                                    key = (item_id, c_idx)
-                                                    part_text = str(
-                                                        part.get("text") or ""
-                                                    )
-                                                    if (
-                                                        part_text
-                                                        and key not in emitted_parts
-                                                    ):
-                                                        emitted_parts.add(key)
-                                                        yield TextBlockDone(part_text)
-                                    _store_openai_output_item(
+                                    for text in _process_openai_output_item(
                                         item,
+                                        emitted_parts=emitted_parts,
                                         working_items=round_output_items,
                                         pending_calls=round_pending_calls,
-                                    )
+                                    ):
+                                        yield TextBlockDone(text)
                                 elif ev_type == "response.completed":
                                     saw_completed = True
                                     if not round_started:
@@ -1957,41 +2039,13 @@ async def run_openai_http_turn(
                                             for out_item in resp["output"]:
                                                 if not isinstance(out_item, dict):
                                                     continue
-                                                refusal = _openai_refusal_in_item(
-                                                    out_item
-                                                )
-                                                if refusal is not None:
-                                                    raise RuntimeError(
-                                                        f"OpenAI refused the request: {refusal}"
-                                                    )
-                                                out_id = str(out_item.get("id") or "")
-                                                if out_item.get("type") == "message":
-                                                    for c_idx, part in enumerate(
-                                                        out_item.get("content") or ()
-                                                    ):
-                                                        if (
-                                                            isinstance(part, dict)
-                                                            and part.get("type")
-                                                            == "output_text"
-                                                        ):
-                                                            key = (out_id, c_idx)
-                                                            part_text = str(
-                                                                part.get("text") or ""
-                                                            )
-                                                            if (
-                                                                part_text
-                                                                and key
-                                                                not in emitted_parts
-                                                            ):
-                                                                emitted_parts.add(key)
-                                                                yield TextBlockDone(
-                                                                    part_text
-                                                                )
-                                                _store_openai_output_item(
+                                                for text in _process_openai_output_item(
                                                     out_item,
+                                                    emitted_parts=emitted_parts,
                                                     working_items=round_output_items,
                                                     pending_calls=round_pending_calls,
-                                                )
+                                                ):
+                                                    yield TextBlockDone(text)
 
                     if not retry_without_reasoning:
                         if not saw_completed:
@@ -2038,35 +2092,26 @@ async def run_openai_http_turn(
                     )
 
                 completed_outputs = []
-                steered_out = False
-                for call in pending_calls:
-                    call_id = call["call_id"]
-                    call_name = call["name"]
-                    if steered_out:
-                        completed_outputs.append(
-                            _openai_tool_output(call_id, _SKIPPED_STEER_RESULT)
-                        )
-                        continue
+
+                def extract_openai_call(
+                    call: dict[str, Any],
+                ) -> tuple[str, Any, str | None]:
                     parsed_args, json_err = _parse_tool_arguments(call["arguments"])
-                    if json_err is not None:
-                        result = {
-                            "content": [{"type": "text", "text": json_err}],
-                            "is_error": True,
-                        }
-                    else:
-                        result = await execute_tool_call(
-                            tool_by_name, call_name, parsed_args, tool_timeout_s
-                        )
-                    if result.get("steered"):
-                        steered_out = True
-                    completed_outputs.append(_openai_tool_output(call_id, result))
+                    return call["name"], parsed_args, json_err
+
+                async for call, result in _iter_tool_batch_results(
+                    pending_calls,
+                    tool_by_name=tool_by_name,
+                    tool_timeout_s=tool_timeout_s,
+                    extract_call=extract_openai_call,
+                ):
+                    completed_outputs.append(
+                        _openai_tool_output(call["call_id"], result)
+                    )
                 working_items.extend(completed_outputs)
                 completed_outputs = []
                 pending_calls = []
                 store.save(session_id, model=model, messages=working_items)
-        raise RuntimeError(
-            f"OpenAI turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
-        )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
             _finalize_openai_interrupted(
@@ -2088,9 +2133,8 @@ async def run_openai_http_turn(
                 assistant_note="(Error before response completed.)",
             )
             store.save(session_id, model=model, messages=working_items)
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
+        if (sanitized := _sanitize_exception(exc, api_key)) is not None:
+            raise sanitized from None
         raise
 
 
@@ -2151,124 +2195,94 @@ async def compact_openai_http(
 ) -> CompactResult:
     """Compact an HTTP OpenAI conversation via stateless summary replacement."""
     headers = _openai_headers(api_key)
-    store = HttpThreadStore(workspace_path, "openai")
-    saved = store.load(resume_session_id)
-    target_model = model or saved.get("model")
-    if not isinstance(target_model, str) or not target_model:
-        raise RuntimeError("No model is available to compact this session.")
-
-    history = saved["messages"]
-    if isinstance(history, list):
-        history = list(history)
-        _repair_openai_items(history)
-    transcript = _render_openai_history_for_compaction(history)
-    compact_prompt = (
-        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
-        if transcript
-        else COMPACTION_PROMPT
-    )
-
     base = _openai_base_url()
-    body = {
-        "model": target_model,
-        "instructions": system_prompt,
-        "input": [{"role": "user", "content": compact_prompt}],
-        "store": False,
-        "stream": False,
-    }
-    try:
-        async with make_http_client(
-            http_client_factory, timeout=HTTP_TIMEOUT
-        ) as client:
-            response = await client.post(
-                f"{base}/responses", headers=headers, json=body
-            )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    _sanitize_error_text(
-                        http_error_message("OpenAI", response, response.content),
-                        api_key,
-                    )
-                )
-            payload = response.json()
-    except Exception as exc:
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
-        raise
 
-    if isinstance(payload, dict):
-        if payload.get("error"):
-            err = payload["error"]
-            detail = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(str(detail or "OpenAI compaction failed."))
-        status = payload.get("status")
-        if status in ("failed", "incomplete"):
-            details = payload.get("incomplete_details")
-            reason = details.get("reason") if isinstance(details, dict) else status
-            raise RuntimeError(f"OpenAI compaction stopped early ({reason}).")
-
-    summary_parts: list[str] = []
-    for item in payload.get("output") or ():
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for part in item.get("content") or ():
-            if isinstance(part, dict) and part.get("type") == "output_text":
-                text = str(part.get("text") or "")
-                if text:
-                    summary_parts.append(text)
-    if not summary_parts and isinstance(payload.get("output_text"), str):
-        summary_parts.append(payload["output_text"])
-    summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
-    if not summary:
-        raise RuntimeError("OpenAI did not return a compaction summary.")
-
-    compacted_items = [
-        {
-            "role": "user",
-            "content": "Summary of our earlier conversation before compaction:",
-        },
-        {
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": summary}],
-        },
-    ]
-    store.save(resume_session_id, model=target_model, messages=compacted_items)
-    usage = payload.get("usage") if isinstance(payload, dict) else None
-    output_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
-    reasoning_tokens = (
-        (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-        if isinstance(usage, dict)
-        and isinstance(usage.get("output_tokens_details"), dict)
-        else None
-    )
-    visible_tokens = (
-        max(
-            0,
-            output_tokens
-            - (
-                reasoning_tokens
-                if _is_int(reasoning_tokens) and 0 <= reasoning_tokens <= output_tokens
-                else 0
-            ),
+    def parse_response(payload: Any) -> tuple[str, int | None]:
+        if isinstance(payload, dict):
+            if payload.get("error"):
+                err = payload["error"]
+                detail = err.get("message") if isinstance(err, dict) else str(err)
+                raise RuntimeError(str(detail or "OpenAI compaction failed."))
+            status = payload.get("status")
+            if status in ("failed", "incomplete"):
+                details = payload.get("incomplete_details")
+                reason = details.get("reason") if isinstance(details, dict) else status
+                raise RuntimeError(f"OpenAI compaction stopped early ({reason}).")
+        summary_parts: list[str] = []
+        for item in (payload.get("output") or ()) if isinstance(payload, dict) else ():
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for part in item.get("content") or ():
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = str(part.get("text") or "")
+                    if text:
+                        summary_parts.append(text)
+        if (
+            not summary_parts
+            and isinstance(payload, dict)
+            and isinstance(payload.get("output_text"), str)
+        ):
+            summary_parts.append(payload["output_text"])
+        summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        output_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+        reasoning_tokens = (
+            (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+            if isinstance(usage, dict)
+            and isinstance(usage.get("output_tokens_details"), dict)
+            else None
         )
-        if _is_int(output_tokens) and output_tokens >= 0
-        else None
-    )
-    context_usage = (
-        {
-            "used_tokens": visible_tokens + 20,
-            "window_tokens": None,
-            "model": target_model,
-        }
-        if visible_tokens is not None
-        else None
-    )
-    return CompactResult(
-        session_id=resume_session_id,
-        context_usage=context_usage,
-        record_reloaded=False,
+        visible_tokens = (
+            max(
+                0,
+                output_tokens
+                - (
+                    reasoning_tokens
+                    if _is_int(reasoning_tokens)
+                    and 0 <= reasoning_tokens <= output_tokens
+                    else 0
+                ),
+            )
+            if _is_int(output_tokens) and output_tokens >= 0
+            else None
+        )
+        return summary, visible_tokens
+
+    return await _compact_http_thread(
+        provider="openai",
+        provider_title="OpenAI",
+        headers=headers,
+        api_key=api_key,
+        workspace_path=workspace_path,
+        model=model,
+        resume_session_id=resume_session_id,
+        resolve_context=lambda *_args: None,
+        repair_history=_repair_openai_items,
+        render_history=_render_openai_history_for_compaction,
+        build_request=lambda target_model, compact_prompt: (
+            f"{base}/responses",
+            {
+                "model": target_model,
+                "instructions": system_prompt,
+                "input": [{"role": "user", "content": compact_prompt}],
+                "store": False,
+                "stream": False,
+            },
+        ),
+        parse_response=parse_response,
+        format_compacted=lambda summary: [
+            {
+                "role": "user",
+                "content": "Summary of our earlier conversation before compaction:",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": summary}],
+            },
+        ],
+        save_context_window=False,
+        http_client_factory=http_client_factory,
     )
 
 
@@ -2313,61 +2327,50 @@ async def discover_google_http_models(
 ) -> tuple[list[ModelSpec], dict[str, dict[str, Any]], str | None]:
     """List Gemini models via ``GET /models``."""
     base = _google_base_url()
+    pages, err_msg = await _fetch_http_model_pages(
+        "Google",
+        f"{base}/models",
+        headers_fn=_google_headers,
+        api_key=api_key,
+        http_client_factory=http_client_factory,
+        params_for_token=lambda tok: {
+            "pageSize": "100",
+            **({"pageToken": tok} if tok else {}),
+        },
+        next_token_fn=lambda payload: (
+            payload.get("nextPageToken")
+            if isinstance(payload.get("nextPageToken"), str)
+            and payload.get("nextPageToken")
+            else None
+        ),
+    )
+    if err_msg is not None:
+        return [], {}, err_msg
+
     raw_items: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    page_token: str | None = None
-    try:
-        headers = _google_headers(api_key)
-        async with (
-            asyncio.timeout(HTTP_DISCOVERY_TIMEOUT_S),
-            make_http_client(
-                http_client_factory, timeout=HTTP_DISCOVERY_TIMEOUT_S
-            ) as client,
-        ):
-            for _ in range(5):
-                params: dict[str, str] = {"pageSize": "100"}
-                if page_token is not None:
-                    params["pageToken"] = page_token
-                response = await client.get(
-                    f"{base}/models", headers=headers, params=params
-                )
-                if response.status_code != 200:
-                    err_msg = _sanitize_error_text(
-                        http_error_message("Google", response, response.content),
-                        api_key,
-                    )
-                    logger.warning("Google HTTP model discovery failed: %s", err_msg)
-                    return [], {}, err_msg
-                payload = response.json()
-                models = payload.get("models") if isinstance(payload, dict) else None
-                if not isinstance(models, list):
-                    break
-                for item in models:
-                    if not isinstance(item, dict):
-                        continue
-                    methods = item.get("supportedGenerationMethods") or ()
-                    if "generateContent" not in methods:
-                        continue
-                    raw_name = item.get("name")
-                    if not isinstance(raw_name, str):
-                        continue
-                    raw_id = raw_name.removeprefix("models/")
-                    if not raw_id.startswith("gemini-"):
-                        continue
-                    lowered = raw_id.lower()
-                    if any(marker in lowered for marker in _GOOGLE_MODEL_EXCLUDE):
-                        continue
-                    if raw_id not in seen_ids:
-                        seen_ids.add(raw_id)
-                        raw_items.append({"raw_id": raw_id, **item})
-                next_token = payload.get("nextPageToken")
-                if not isinstance(next_token, str) or not next_token:
-                    break
-                page_token = next_token
-    except Exception as exc:
-        err_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        logger.warning("Google HTTP model discovery failed: %s", err_msg)
-        return [], {}, err_msg
+    for payload in pages:
+        models = payload.get("models")
+        if not isinstance(models, list):
+            continue
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods") or ()
+            if "generateContent" not in methods:
+                continue
+            raw_name = item.get("name")
+            if not isinstance(raw_name, str):
+                continue
+            raw_id = raw_name.removeprefix("models/")
+            if not raw_id.startswith("gemini-"):
+                continue
+            lowered = raw_id.lower()
+            if any(marker in lowered for marker in _GOOGLE_MODEL_EXCLUDE):
+                continue
+            if raw_id not in seen_ids:
+                seen_ids.add(raw_id)
+                raw_items.append({"raw_id": raw_id, **item})
 
     if not raw_items:
         return [], {}, None
@@ -2403,21 +2406,19 @@ async def discover_google_http_models(
 def _append_google_model_part(
     parts: list[dict[str, Any]], part: dict[str, Any]
 ) -> None:
+    keys = part.keys()
     if (
         parts
-        and set(part.keys()) == {"text"}
-        and set(parts[-1].keys()) == {"text"}
-        and isinstance(part["text"], str)
-    ):
-        parts[-1]["text"] += part["text"]
-        return
-    if (
-        parts
-        and set(part.keys()) == {"text", "thought"}
-        and part.get("thought") is True
-        and set(parts[-1].keys()) == {"text", "thought"}
-        and parts[-1].get("thought") is True
-        and isinstance(part["text"], str)
+        and isinstance(part.get("text"), str)
+        and keys == parts[-1].keys()
+        and (
+            keys == {"text"}
+            or (
+                keys == {"text", "thought"}
+                and part.get("thought") is True
+                and parts[-1].get("thought") is True
+            )
+        )
     ):
         parts[-1]["text"] += part["text"]
         return
@@ -2474,11 +2475,7 @@ def _finalize_google_interrupted(
         working_contents.append({"role": "model", "parts": [{"text": assistant_note}]})
         return
     if isinstance(last, dict) and last.get("role") == "user":
-        suffix = (
-            f"{partial_text}\n\n{assistant_note}"
-            if partial_text.strip()
-            else assistant_note
-        )
+        suffix = _interrupted_text(partial_text, assistant_note)
         working_contents.append({"role": "model", "parts": [{"text": suffix}]})
 
 
@@ -2596,16 +2593,13 @@ async def run_google_http_turn(
     session_id, saved_contents, saved_model, saved_window = _resume_state(
         store, resume_session_id
     )
-    same_model = saved_model is None or saved_model == model
     if saved_model and saved_model != model:
         saved_contents = _sanitize_google_for_model_switch(saved_contents, model)
-    info_window = (
-        model_info.get("context_window") if isinstance(model_info, Mapping) else None
-    )
-    context_window = (
-        info_window
-        if _is_pos_int(info_window)
-        else (saved_window if same_model else None)
+    context_window = _resolve_context_window(
+        model_info,
+        saved_model=saved_model,
+        target_model=model,
+        saved_window=saved_window,
     )
     base = _google_base_url()
     model_slug = urllib.parse.quote(model.removeprefix("models/"), safe="")
@@ -2691,39 +2685,28 @@ async def run_google_http_turn(
                             err_msg = _sanitize_error_text(
                                 http_error_message("Google", response, raw_err), api_key
                             )
-                            lowered = err_msg.lower()
-                            if (
-                                response.status_code == 400
-                                and thinking_attempt == 0
-                                and include_thinking
-                                and any(
-                                    k in lowered
-                                    for k in (
-                                        "thinking",
-                                        "thinkingconfig",
-                                        "thinkinglevel",
-                                        "thinkingbudget",
-                                        "thinking_config",
-                                        "thinking_level",
-                                        "thinking_budget",
-                                    )
-                                )
+                            if _should_retry_without_effort(
+                                response.status_code,
+                                thinking_attempt,
+                                include_thinking,
+                                err_msg,
+                                (
+                                    "thinking",
+                                    "thinkingconfig",
+                                    "thinkinglevel",
+                                    "thinkingbudget",
+                                    "thinking_config",
+                                    "thinking_level",
+                                    "thinking_budget",
+                                ),
                             ):
                                 include_thinking = False
                                 retry_without_thinking = True
                                 continue
                             raise RuntimeError(err_msg)
 
-                        async with aclosing(iter_sse_events(response)) as sse_events:
-                            async for _, raw_data in sse_events:
-                                if not raw_data or raw_data == "[DONE]":
-                                    continue
-                                try:
-                                    data = json.loads(raw_data)
-                                except json.JSONDecodeError:
-                                    continue
-                                if not isinstance(data, dict):
-                                    continue
+                        async with aclosing(_iter_sse_json(response)) as events:
+                            async for _, data in events:
                                 if "error" in data and data["error"] is not None:
                                     err = data["error"]
                                     msg_text = (
@@ -2860,35 +2843,24 @@ async def run_google_http_turn(
 
                 completed_responses = []
                 extra_image_parts: list[dict[str, Any]] = []
-                steered_out = False
-                for call in pending_calls:
-                    if steered_out:
-                        resp_part, _ = _google_function_response_part(
-                            call, _SKIPPED_STEER_RESULT, multimodal=multimodal_fr
-                        )
-                        completed_responses.append(resp_part)
-                        continue
+
+                def extract_google_call(
+                    call: dict[str, Any],
+                ) -> tuple[str, Any, str | None]:
                     raw_args = call.get("args")
                     if raw_args is None:
-                        raw_args = {}
-                    elif isinstance(raw_args, str):
+                        return call["name"], {}, None
+                    if isinstance(raw_args, str):
                         parsed_args, json_err = _parse_tool_arguments(raw_args)
-                        if json_err is not None:
-                            result = {
-                                "content": [{"type": "text", "text": json_err}],
-                                "is_error": True,
-                            }
-                            resp_part, _ = _google_function_response_part(
-                                call, result, multimodal=multimodal_fr
-                            )
-                            completed_responses.append(resp_part)
-                            continue
-                        raw_args = parsed_args
-                    result = await execute_tool_call(
-                        tool_by_name, call["name"], raw_args, tool_timeout_s
-                    )
-                    if result.get("steered"):
-                        steered_out = True
+                        return call["name"], parsed_args, json_err
+                    return call["name"], raw_args, None
+
+                async for call, result in _iter_tool_batch_results(
+                    pending_calls,
+                    tool_by_name=tool_by_name,
+                    tool_timeout_s=tool_timeout_s,
+                    extract_call=extract_google_call,
+                ):
                     resp_part, img_parts = _google_function_response_part(
                         call, result, multimodal=multimodal_fr
                     )
@@ -2913,9 +2885,6 @@ async def run_google_http_turn(
                     messages=working_contents,
                     context_window=context_window,
                 )
-        raise RuntimeError(
-            f"Google Gemini turn exceeded maximum tool rounds ({MAX_TOOL_ROUNDS})."
-        )
     except (asyncio.CancelledError, GeneratorExit):
         if made_progress:
             _finalize_google_interrupted(
@@ -2947,9 +2916,8 @@ async def run_google_http_turn(
                 messages=working_contents,
                 context_window=context_window,
             )
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
+        if (sanitized := _sanitize_exception(exc, api_key)) is not None:
+            raise sanitized from None
         raise
 
 
@@ -2999,125 +2967,85 @@ async def compact_google_http(
 ) -> CompactResult:
     """Compact an HTTP Google Gemini conversation by summarizing saved contents."""
     headers = _google_headers(api_key)
-    store = HttpThreadStore(workspace_path, "google")
-    saved = store.load(resume_session_id)
-    target_model = model or saved.get("model")
-    if not isinstance(target_model, str) or not target_model:
-        raise RuntimeError("No model is available to compact this session.")
-    saved_model = saved.get("model") if isinstance(saved.get("model"), str) else None
-    resolved_info = (model_info_by_id or {}).get(target_model) or model_info
-    context_window = (
-        resolved_info["context_window"]
-        if resolved_info and _is_pos_int(resolved_info.get("context_window"))
-        else (
-            saved.get("context_window")
-            if saved_model == target_model and _is_pos_int(saved.get("context_window"))
+    base = _google_base_url()
+
+    def build_request(
+        target_model: str, compact_prompt: str
+    ) -> tuple[str, dict[str, Any]]:
+        model_slug = urllib.parse.quote(target_model.removeprefix("models/"), safe="")
+        return f"{base}/models/{model_slug}:generateContent", {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": compact_prompt}]}],
+        }
+
+    def parse_response(payload: Any) -> tuple[str, int | None]:
+        prompt_fb = payload.get("promptFeedback") if isinstance(payload, dict) else None
+        if isinstance(prompt_fb, dict) and prompt_fb.get("blockReason"):
+            raise RuntimeError(
+                f"Google Gemini blocked compaction ({prompt_fb['blockReason']})."
+            )
+        summary_parts: list[str] = []
+        candidates = payload.get("candidates") if isinstance(payload, dict) else None
+        if isinstance(candidates, list) and candidates:
+            cand = candidates[0] if isinstance(candidates[0], dict) else {}
+            finish_reason = cand.get("finishReason")
+            if finish_reason and finish_reason not in (
+                "STOP",
+                "FINISH_REASON_UNSPECIFIED",
+            ):
+                raise RuntimeError(
+                    f"Google Gemini compaction stopped early ({finish_reason})."
+                )
+            for part in (cand.get("content") or {}).get("parts") or ():
+                if (
+                    isinstance(part, dict)
+                    and part.get("thought") is not True
+                    and isinstance(part.get("text"), str)
+                    and part["text"]
+                ):
+                    summary_parts.append(part["text"])
+        summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
+        if not summary:
+            raise RuntimeError("Google Gemini did not return a compaction summary.")
+        candidates_tokens = (
+            (payload.get("usageMetadata") or {}).get("candidatesTokenCount")
+            if isinstance(payload, dict)
             else None
         )
-    )
-
-    history = saved["messages"]
-    if isinstance(history, list):
-        history = list(history)
-        _repair_google_contents(history)
-    transcript = _render_google_history_for_compaction(history)
-    compact_prompt = (
-        f"Earlier conversation transcript:\n\n{transcript}\n\n{COMPACTION_PROMPT}"
-        if transcript
-        else COMPACTION_PROMPT
-    )
-
-    base = _google_base_url()
-    model_slug = urllib.parse.quote(target_model.removeprefix("models/"), safe="")
-    body = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": compact_prompt}]}],
-    }
-    try:
-        async with make_http_client(
-            http_client_factory, timeout=HTTP_TIMEOUT
-        ) as client:
-            response = await client.post(
-                f"{base}/models/{model_slug}:generateContent",
-                headers=headers,
-                json=body,
-            )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    _sanitize_error_text(
-                        http_error_message("Google", response, response.content),
-                        api_key,
-                    )
-                )
-            payload = response.json()
-    except Exception as exc:
-        sanitized_msg = _sanitize_error_text(str(exc) or type(exc).__name__, api_key)
-        if sanitized_msg != str(exc):
-            raise RuntimeError(sanitized_msg) from None
-        raise
-
-    prompt_fb = payload.get("promptFeedback") if isinstance(payload, dict) else None
-    if isinstance(prompt_fb, dict) and prompt_fb.get("blockReason"):
-        raise RuntimeError(
-            f"Google Gemini blocked compaction ({prompt_fb['blockReason']})."
+        return summary, (
+            candidates_tokens
+            if _is_int(candidates_tokens) and candidates_tokens >= 0
+            else None
         )
 
-    summary_parts: list[str] = []
-    candidates = payload.get("candidates") if isinstance(payload, dict) else None
-    if isinstance(candidates, list) and candidates:
-        cand = candidates[0] if isinstance(candidates[0], dict) else {}
-        finish_reason = cand.get("finishReason")
-        if finish_reason and finish_reason not in (
-            "STOP",
-            "FINISH_REASON_UNSPECIFIED",
-        ):
-            raise RuntimeError(
-                f"Google Gemini compaction stopped early ({finish_reason})."
+    return await _compact_http_thread(
+        provider="google",
+        provider_title="Google",
+        headers=headers,
+        api_key=api_key,
+        workspace_path=workspace_path,
+        model=model,
+        resume_session_id=resume_session_id,
+        resolve_context=lambda target_model, saved_model, saved_window: (
+            _resolve_context_window(
+                (model_info_by_id or {}).get(target_model) or model_info,
+                saved_model=saved_model,
+                target_model=target_model,
+                saved_window=saved_window,
             )
-        parts = (cand.get("content") or {}).get("parts") or ()
-        for part in parts:
-            if (
-                isinstance(part, dict)
-                and part.get("thought") is not True
-                and isinstance(part.get("text"), str)
-                and part["text"]
-            ):
-                summary_parts.append(part["text"])
-    summary = "\n\n".join(part for part in summary_parts if part.strip()).strip()
-    if not summary:
-        raise RuntimeError("Google Gemini did not return a compaction summary.")
-
-    compacted_contents = [
-        {
-            "role": "user",
-            "parts": [
-                {"text": "Summary of our earlier conversation before compaction:"}
-            ],
-        },
-        {"role": "model", "parts": [{"text": summary}]},
-    ]
-    store.save(
-        resume_session_id,
-        model=target_model,
-        messages=compacted_contents,
-        context_window=context_window,
-    )
-    candidates_tokens = (
-        (payload.get("usageMetadata") or {}).get("candidatesTokenCount")
-        if isinstance(payload, dict)
-        else None
-    )
-    context_usage = (
-        {
-            "used_tokens": candidates_tokens + 20,
-            "window_tokens": context_window,
-            "model": target_model,
-        }
-        if _is_int(candidates_tokens) and candidates_tokens >= 0
-        else None
-    )
-    return CompactResult(
-        session_id=resume_session_id,
-        context_usage=context_usage,
-        record_reloaded=False,
+        ),
+        repair_history=_repair_google_contents,
+        render_history=_render_google_history_for_compaction,
+        build_request=build_request,
+        parse_response=parse_response,
+        format_compacted=lambda summary: [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Summary of our earlier conversation before compaction:"}
+                ],
+            },
+            {"role": "model", "parts": [{"text": summary}]},
+        ],
+        http_client_factory=http_client_factory,
     )

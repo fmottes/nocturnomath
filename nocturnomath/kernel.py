@@ -72,10 +72,14 @@ class Kernel:
         self.start(reason)
 
     def shutdown(self):
-        if self.kc is not None:
-            self.kc.stop_channels()
-        if self.km is not None:
-            self.km.shutdown_kernel(now=True)
+        kc, self.kc = self.kc, None
+        km, self.km = self.km, None
+        try:
+            if kc is not None:
+                kc.stop_channels()
+        finally:
+            if km is not None:
+                km.shutdown_kernel(now=True)
 
     def is_alive(self):
         return self.km is not None and self.km.is_alive()
@@ -102,10 +106,10 @@ class Kernel:
         parts = []
         images = []
         note = None
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
 
         while True:
-            left = deadline - time.time()
+            left = deadline - time.monotonic()
             if left <= 0:
                 if note is not None:  # the grace period after an interrupt ran out too
                     if self.is_alive():
@@ -114,7 +118,7 @@ class Kernel:
                     break
                 self.interrupt()
                 note = f"[timed out after {timeout}s; kernel interrupted, partial output above]"
-                deadline = time.time() + 10  # let the interrupt traceback arrive
+                deadline = time.monotonic() + 10  # let the interrupt traceback arrive
                 continue
 
             try:

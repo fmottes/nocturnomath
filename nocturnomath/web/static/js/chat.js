@@ -1,7 +1,7 @@
-import { elements, state } from "./state.js?v=20261117-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
-import { openLightbox } from "./ui.js?v=20261016-3";
-import { rewriteDocumentLinks } from "./workspace.js?v=20261120-1";
+import { elements, state } from "./state.js?v=20261124-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20261124-2";
+import { openLightbox } from "./ui.js?v=20261124-2";
+import { rewriteDocumentLinks } from "./workspace.js?v=20261124-2";
 
 // ============================================================================
 // Chat UI Rendering
@@ -48,25 +48,91 @@ function openAssistantBubble(timeLabel) {
   const body = document.createElement("div");
   body.className = "bubble-body markdown-body";
 
+  const streamEl = document.createElement("div");
+  streamEl.className = "bubble-stream";
+  body.appendChild(streamEl);
+
   bubble.appendChild(meta);
   bubble.appendChild(body);
   elements.chatMessages.appendChild(bubble);
 
   state.currentAssistantBubble = {
     container: bubble,
-    body: body,
-    rawText: "",
+    body,
+    streamEl,
     streamText: "",
   };
   return state.currentAssistantBubble;
 }
 
-function renderAssistantBubble(bubble) {
-  const separator = bubble.rawText && bubble.streamText ? "\n\n" : "";
-  bubble.body.innerHTML = renderMarkdown(bubble.rawText + separator + bubble.streamText);
-  highlightBlocks(bubble.body);
-  renderMath(bubble.body);
+function appendFinalizedBlock(bubble, text) {
+  if (!text) return;
+  const block = document.createElement("div");
+  block.className = "bubble-block";
+  block.innerHTML = renderMarkdown(text);
+  highlightBlocks(block);
+  renderMath(block);
+  bubble.body.insertBefore(block, bubble.streamEl);
   scrollChatToBottom();
+}
+
+function renderStreamBlock(bubble) {
+  bubble.streamEl.innerHTML = bubble.streamText ? renderMarkdown(bubble.streamText) : "";
+  if (bubble.streamText) renderMath(bubble.streamEl);
+  scrollChatToBottom();
+}
+
+const STREAM_RENDER_INTERVAL_MS = 60;
+let pendingDeltaFrame = null;
+let pendingDeltaTimer = null;
+let lastDeltaRenderAt = 0;
+
+export function cancelAssistantDeltaRender() {
+  if (pendingDeltaTimer !== null) {
+    clearTimeout(pendingDeltaTimer);
+    pendingDeltaTimer = null;
+  }
+  if (pendingDeltaFrame !== null && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(pendingDeltaFrame);
+  }
+  pendingDeltaFrame = null;
+}
+
+function flushAssistantStream() {
+  cancelAssistantDeltaRender();
+  const bubble = state.currentAssistantBubble;
+  if (!bubble) return;
+  if (bubble.streamText) {
+    const text = bubble.streamText;
+    bubble.streamText = "";
+    bubble.streamEl.replaceChildren();
+    appendFinalizedBlock(bubble, text);
+  }
+  bubble.streamEl.remove();
+}
+
+function runStreamRender() {
+  pendingDeltaFrame = null;
+  lastDeltaRenderAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  if (state.currentAssistantBubble) renderStreamBlock(state.currentAssistantBubble);
+}
+
+function scheduleAssistantDeltaRender() {
+  if (typeof requestAnimationFrame !== "function") {
+    if (state.currentAssistantBubble) renderStreamBlock(state.currentAssistantBubble);
+    return;
+  }
+  if (pendingDeltaFrame !== null || pendingDeltaTimer !== null) return;
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const wait = Math.max(0, STREAM_RENDER_INTERVAL_MS - (now - lastDeltaRenderAt));
+  if (wait > 0) {
+    pendingDeltaTimer = setTimeout(() => {
+      pendingDeltaTimer = null;
+      pendingDeltaFrame = requestAnimationFrame(runStreamRender);
+    }, wait);
+  } else {
+    pendingDeltaFrame = requestAnimationFrame(runStreamRender);
+  }
 }
 
 // Live streaming: the chunk extends the block currently being written, which
@@ -74,19 +140,21 @@ function renderAssistantBubble(bubble) {
 export function appendAssistantDelta(text) {
   const bubble = openAssistantBubble();
   bubble.streamText += text;
-  renderAssistantBubble(bubble);
+  scheduleAssistantDeltaRender();
 }
 
 export function appendAssistantChunk(text, timeLabel) {
+  cancelAssistantDeltaRender();
   const bubble = openAssistantBubble(timeLabel);
   // The completed block is authoritative: drop whatever was streamed for it
   // rather than appending, so streamed text is never duplicated.
   bubble.streamText = "";
-  bubble.rawText += (bubble.rawText ? "\n\n" : "") + text;
-  renderAssistantBubble(bubble);
+  bubble.streamEl.replaceChildren();
+  appendFinalizedBlock(bubble, text);
 }
 
 export function finalizeAssistantTurn() {
+  flushAssistantStream();
   state.currentAssistantBubble = null;
 }
 
@@ -94,6 +162,7 @@ export function finalizeAssistantTurn() {
 // Without this the whole turn's prose accumulates in the bubble opened by its
 // first block, so a verdict written after five probes renders above all five.
 export function closeAssistantBubble() {
+  flushAssistantStream();
   state.currentAssistantBubble = null;
 }
 
