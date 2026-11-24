@@ -12,6 +12,7 @@ import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,9 @@ from .base import (
     TurnEvent,
     TurnResult,
     TurnStarted,
+    context_usage_payload,
     find_cli_executables,
+    is_int,
     managed_subprocess,
     read_jsonl,
     resolve_cli_binary,
@@ -137,11 +140,7 @@ def _context_usage_from_turn(
         if isinstance(only, dict):
             model_usage = only
     window = (model_usage or {}).get("contextWindow")
-    return {
-        "used_tokens": last_prompt_tokens,
-        "window_tokens": window if isinstance(window, int) and window > 0 else None,
-        "model": last_prompt_model,
-    }
+    return context_usage_payload(last_prompt_tokens, window, last_prompt_model)
 
 
 def _parse_models(entries: list[Any]) -> list[ModelSpec]:
@@ -184,15 +183,7 @@ def _parse_models(entries: list[Any]) -> list[ModelSpec]:
             or (existing.is_default if existing else False),
         )
     if default_id and default_id in specs:
-        target = specs[default_id]
-        specs[default_id] = ModelSpec(
-            id=target.id,
-            raw_id=target.raw_id,
-            provider="anthropic",
-            label=target.label,
-            efforts=target.efforts,
-            is_default=True,
-        )
+        specs[default_id] = replace(specs[default_id], is_default=True)
     return list(specs.values())
 
 
@@ -224,6 +215,48 @@ class AnthropicBackend:
     @staticmethod
     async def _write_json(proc: asyncio.subprocess.Process, payload: dict[str, Any]):
         await write_json_line(proc, payload, "Claude CLI")
+
+    async def _send_user_message(
+        self,
+        proc: asyncio.subprocess.Process,
+        content: str,
+        *,
+        session_id: str,
+        stderr: StderrCollector,
+        resume_session_id: str | None = None,
+    ) -> None:
+        try:
+            await self._write_json(
+                proc,
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": content},
+                    "parent_tool_use_id": None,
+                    "session_id": session_id,
+                },
+            )
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            detail = await stderr.text()
+            if resume_session_id and _is_missing_session_error(detail):
+                raise SessionResumeError(detail) from exc
+            raise RuntimeError(detail or str(exc)) from exc
+
+    def _discovery_commit(
+        self,
+        *,
+        cli_path: Path | None = None,
+        http_model_info: Mapping[str, dict[str, Any]] = (),
+        error: str | None = None,
+    ) -> Callable[[], None]:
+        info_copy = dict(http_model_info)
+
+        def commit() -> None:
+            if cli_path is not None:
+                self.cli_path = cli_path
+            self._http_model_info = dict(info_copy)
+            self.last_discovery_error = error
+
+        return commit
 
     async def _await_initialize(
         self,
@@ -296,15 +329,7 @@ class AnthropicBackend:
             specs, info, err = await discover_anthropic_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
-
-            def commit_http(
-                discovered_info: dict[str, dict[str, Any]] = info,
-                discovery_error: str | None = err,
-            ) -> None:
-                self._http_model_info = dict(discovered_info)
-                self.last_discovery_error = discovery_error
-
-            return specs, commit_http
+            return specs, self._discovery_commit(http_model_info=info, error=err)
 
         env = auth.process_env()
         for candidate in claude_cli_candidates():
@@ -328,24 +353,12 @@ class AnthropicBackend:
                             proc, read_jsonl(proc.stdout), stderr
                         )
                     if not _has_claude_credentials(resp, auth, env):
-
-                        def commit(chosen: Path = candidate) -> None:
-                            self.cli_path = chosen
-                            self._http_model_info = {}
-                            self.last_discovery_error = None
-
-                        return [], commit
+                        return [], self._discovery_commit(cli_path=candidate)
                     raw_models = resp.get("models")
                     entries = raw_models if isinstance(raw_models, list) else []
                     models = _parse_models(entries)
                     if models:
-
-                        def commit(chosen: Path = candidate) -> None:
-                            self.cli_path = chosen
-                            self._http_model_info = {}
-                            self.last_discovery_error = None
-
-                        return models, commit
+                        return models, self._discovery_commit(cli_path=candidate)
                     logger.warning(
                         "Claude CLI at %s reported no usable models", candidate
                     )
@@ -354,11 +367,7 @@ class AnthropicBackend:
                     "Claude model discovery with %s failed: %s", candidate, exc
                 )
 
-        def clear_http() -> None:
-            self._http_model_info = {}
-            self.last_discovery_error = None
-
-        return [], clear_http
+        return [], self._discovery_commit()
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         models, commit = await self.discover_models_staged(auth)
@@ -567,14 +576,12 @@ class AnthropicBackend:
                         allowed_tools=allowed_tools,
                     )
 
-                    await self._write_json(
+                    await self._send_user_message(
                         proc,
-                        {
-                            "type": "user",
-                            "message": {"role": "user", "content": prompt},
-                            "parent_tool_use_id": None,
-                            "session_id": resume_session_id or "default",
-                        },
+                        prompt,
+                        session_id=resume_session_id or "default",
+                        stderr=stderr,
+                        resume_session_id=resume_session_id,
                     )
 
                     seen_session_id = resume_session_id
@@ -663,7 +670,7 @@ class AnthropicBackend:
                                 )
                                 counts = tuple(usage.get(k, 0) for k in keys)
                                 if any(k in usage for k in keys) and all(
-                                    isinstance(c, int) and c >= 0 for c in counts
+                                    is_int(c) and c >= 0 for c in counts
                                 ):
                                     last_prompt_tokens = sum(counts)
                                     last_prompt_model = msg_model
@@ -700,6 +707,12 @@ class AnthropicBackend:
                     if not saw_result:
                         detail = await stderr.text()
                         rc = await proc.wait()
+                        if (
+                            resume_session_id
+                            and not progressed
+                            and _is_missing_session_error(detail)
+                        ):
+                            raise SessionResumeError(detail)
                         raise RuntimeError(
                             detail
                             or f"Claude CLI exited without completing the turn (status {rc})."
@@ -765,14 +778,12 @@ class AnthropicBackend:
                         resume_session_id=resume_session_id,
                     )
 
-                    await self._write_json(
+                    await self._send_user_message(
                         proc,
-                        {
-                            "type": "user",
-                            "message": {"role": "user", "content": "/compact"},
-                            "parent_tool_use_id": None,
-                            "session_id": resume_session_id,
-                        },
+                        "/compact",
+                        session_id=resume_session_id,
+                        stderr=stderr,
+                        resume_session_id=resume_session_id,
                     )
 
                     async for msg in messages:
@@ -802,6 +813,8 @@ class AnthropicBackend:
 
             if not compacted:
                 detail = await stderr.text()
+                if _is_missing_session_error(detail):
+                    raise SessionResumeError(detail)
                 raise RuntimeError(
                     detail or "Claude did not confirm that compaction completed."
                 )
@@ -824,16 +837,11 @@ class AnthropicBackend:
                                     resp.get("error") or "get_context_usage failed"
                                 )
                             usage = resp.get("response") or {}
-                            used = usage.get("totalTokens")
-                            window = usage.get("rawMaxTokens")
-                            if isinstance(used, int) and used >= 0:
-                                context_usage = {
-                                    "used_tokens": used,
-                                    "window_tokens": window
-                                    if isinstance(window, int) and window > 0
-                                    else None,
-                                    "model": usage.get("model"),
-                                }
+                            context_usage = context_usage_payload(
+                                usage.get("totalTokens"),
+                                usage.get("rawMaxTokens"),
+                                usage.get("model"),
+                            )
                             break
             except TimeoutError:
                 logger.warning(

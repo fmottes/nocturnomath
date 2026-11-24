@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -19,6 +18,7 @@ from typing import Any
 import httpx
 
 from ..auth import ProviderId
+from ..notes import write_text
 from ..tools import ToolSpec, validate_tool_arguments
 from .base import (
     EFFORT_LEVELS,
@@ -33,6 +33,7 @@ from .base import (
     TurnResult,
     TurnStarted,
 )
+from .base import is_int as _is_int
 
 logger = logging.getLogger("nocturnomath.backends.http")
 
@@ -101,12 +102,12 @@ _ANTHROPIC_VERSION = "2023-06-01"
 _GEMINI_25_THINKING_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
 
 
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def _is_pos_int(value: Any) -> bool:
     return _is_int(value) and value > 0
+
+
+def _is_openai_reasoning(model: str) -> bool:
+    return bool(_OPENAI_REASONING_RE.match(model) and "chat-latest" not in model)
 
 
 def _validate_http_api_key(provider_title: str, api_key: str) -> str:
@@ -205,18 +206,7 @@ class HttpThreadStore:
                 "context_window": context_window,
             }
         )
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{path.stem}-", suffix=".tmp", dir=str(self.root)
-        )
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-            os.replace(tmp_path, path)
-        except BaseException:
-            with suppress(OSError):
-                tmp_path.unlink()
-            raise
+        write_text(path, payload)
 
 
 def make_http_client(
@@ -1596,11 +1586,7 @@ async def discover_openai_http_models(
 
     specs: list[ModelSpec] = []
     for mid in ids:
-        efforts = (
-            ["low", "medium", "high"]
-            if _OPENAI_REASONING_RE.match(mid) and "chat-latest" not in mid
-            else []
-        )
+        efforts = ["low", "medium", "high"] if _is_openai_reasoning(mid) else []
         specs.append(
             ModelSpec(
                 id=mid,
@@ -1867,9 +1853,7 @@ async def run_openai_http_turn(
             http_client_factory, timeout=HTTP_TIMEOUT
         ) as client:
             include_effort = bool(effort)
-            include_reasoning = bool(
-                _OPENAI_REASONING_RE.match(model) and "chat-latest" not in model
-            )
+            include_reasoning = _is_openai_reasoning(model)
             for round_idx in range(1, MAX_TOOL_ROUNDS + 1):
                 partial_text_chunks = []
                 pending_calls = []
@@ -2422,21 +2406,19 @@ async def discover_google_http_models(
 def _append_google_model_part(
     parts: list[dict[str, Any]], part: dict[str, Any]
 ) -> None:
+    keys = part.keys()
     if (
         parts
-        and set(part.keys()) == {"text"}
-        and set(parts[-1].keys()) == {"text"}
-        and isinstance(part["text"], str)
-    ):
-        parts[-1]["text"] += part["text"]
-        return
-    if (
-        parts
-        and set(part.keys()) == {"text", "thought"}
-        and part.get("thought") is True
-        and set(parts[-1].keys()) == {"text", "thought"}
-        and parts[-1].get("thought") is True
-        and isinstance(part["text"], str)
+        and isinstance(part.get("text"), str)
+        and keys == parts[-1].keys()
+        and (
+            keys == {"text"}
+            or (
+                keys == {"text", "thought"}
+                and part.get("thought") is True
+                and parts[-1].get("thought") is True
+            )
+        )
     ):
         parts[-1]["text"] += part["text"]
         return

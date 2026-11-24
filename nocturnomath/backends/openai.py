@@ -32,10 +32,13 @@ from .base import (
     TurnEvent,
     TurnResult,
     TurnStarted,
+    context_usage_payload,
     find_cli_executables,
+    is_int,
     managed_subprocess,
     package_version,
     resolve_cli_binary,
+    rpc_error_message,
     write_json_line,
 )
 from .http import (
@@ -133,11 +136,15 @@ def _toml_quote(value: str) -> str:
     return "".join(out)
 
 
+def _toml_key(name: str) -> str:
+    return name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_quote(name)
+
+
 def _toml_mcp_override(
     cfg: dict[str, Any], *, tool_timeout_s: int = DEFAULT_TOOL_TIMEOUT_S
 ) -> str:
     env_items = ", ".join(
-        f"{key if re.fullmatch(r'[A-Za-z0-9_-]+', str(key)) else _toml_quote(str(key))}={_toml_quote(str(val))}"
+        f"{_toml_key(str(key))}={_toml_quote(str(val))}"
         for key, val in (cfg.get("env") or {}).items()
     )
     args_toml = ", ".join(_toml_quote(str(arg)) for arg in (cfg.get("args") or ()))
@@ -170,10 +177,7 @@ def _disabled_mcp_overrides(codex_home: Path) -> list[str]:
                 )
     flags: list[str] = []
     for name in sorted(names):
-        if name == "explore":
-            continue
-        key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_quote(name)
-        flags.extend(["-c", f"mcp_servers.{key}.enabled=false"])
+        flags.extend(["-c", f"mcp_servers.{_toml_key(name)}.enabled=false"])
     return flags
 
 
@@ -183,20 +187,28 @@ def _extract_context_usage(
     last = tu.get("last") or {}
     if not isinstance(last, dict):
         return None
-    window = tu.get("modelContextWindow")
     used = last.get("totalTokens")
-    if not isinstance(used, int) or used < 0:
+    if not is_int(used) or used < 0:
         inp = last.get("inputTokens")
         cached = last.get("cachedInputTokens", 0)
-        if isinstance(inp, int) and inp >= 0:
-            used = inp + (cached if isinstance(cached, int) else 0)
-    if not isinstance(used, int) or used < 0:
-        return None
-    return {
-        "used_tokens": used,
-        "window_tokens": window if isinstance(window, int) and window > 0 else None,
-        "model": model,
-    }
+        if is_int(inp) and inp >= 0:
+            used = inp + (cached if is_int(cached) else 0)
+    return context_usage_payload(used, tu.get("modelContextWindow"), model)
+
+
+_SERVER_REQUEST_RESULTS: dict[str, dict[str, Any]] = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "execCommandApproval": {
+        "decision": {"denied": {"rejection": "Built-in tools are disabled."}}
+    },
+    "applyPatchApproval": {
+        "decision": {"denied": {"rejection": "Built-in tools are disabled."}}
+    },
+    "item/permissions/requestApproval": {"permissions": {}, "scope": "turn"},
+    "item/tool/requestUserInput": {"answers": {}},
+    "mcpServer/elicitation/request": {"action": "decline"},
+}
 
 
 class OpenAIBackend:
@@ -214,7 +226,6 @@ class OpenAIBackend:
         self.cli_path = cli_path
         self._http_client_factory = http_client_factory
         self.last_discovery_error: str | None = None
-        self._next_rpc_id = 0
 
     def _resolve_cli(self) -> Path:
         self.cli_path = resolve_cli_binary(
@@ -230,9 +241,23 @@ class OpenAIBackend:
         codex_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
         return env, codex_home
 
-    def _next_id(self) -> int:
-        self._next_rpc_id += 1
-        return self._next_rpc_id
+    @staticmethod
+    def _app_server_cmd(
+        cli_path: Path,
+        disabled_flags: Sequence[str],
+        *,
+        mcp_override: str = "mcp_servers={}",
+    ) -> list[str]:
+        return [
+            str(cli_path),
+            "app-server",
+            *CODEX_DISABLE_FLAGS,
+            "-c",
+            mcp_override,
+            *disabled_flags,
+            "--listen",
+            "stdio://",
+        ]
 
     @staticmethod
     async def _send(proc: asyncio.subprocess.Process, payload: dict[str, Any]) -> None:
@@ -250,52 +275,29 @@ class OpenAIBackend:
             stderr,
             label="Codex app-server",
             on_request=lambda msg: self._handle_server_request(proc, msg),
-            next_id=self._next_id,
         )
+
+    def _discovery_commit(
+        self,
+        *,
+        cli_path: Path | None = None,
+        error: str | None = None,
+    ) -> Callable[[], None]:
+        def commit() -> None:
+            if cli_path is not None:
+                self.cli_path = cli_path
+            self.last_discovery_error = error
+
+        return commit
 
     async def _handle_server_request(
         self, proc: asyncio.subprocess.Process, msg: dict[str, Any]
     ) -> None:
         req_id = msg.get("id")
         method = msg.get("method")
-        if method in (
-            "item/commandExecution/requestApproval",
-            "item/fileChange/requestApproval",
-        ):
-            await self._send(
-                proc,
-                {"jsonrpc": "2.0", "id": req_id, "result": {"decision": "decline"}},
-            )
-        elif method in ("execCommandApproval", "applyPatchApproval"):
-            await self._send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "decision": {
-                            "denied": {"rejection": "Built-in tools are disabled."}
-                        }
-                    },
-                },
-            )
-        elif method == "item/permissions/requestApproval":
-            await self._send(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {"permissions": {}, "scope": "turn"},
-                },
-            )
-        elif method == "item/tool/requestUserInput":
-            await self._send(
-                proc, {"jsonrpc": "2.0", "id": req_id, "result": {"answers": {}}}
-            )
-        elif method == "mcpServer/elicitation/request":
-            await self._send(
-                proc, {"jsonrpc": "2.0", "id": req_id, "result": {"action": "decline"}}
-            )
+        result = _SERVER_REQUEST_RESULTS.get(str(method))
+        if result is not None:
+            await self._send(proc, {"jsonrpc": "2.0", "id": req_id, "result": result})
         else:
             await self._send(
                 proc,
@@ -316,6 +318,33 @@ class OpenAIBackend:
         )
         await client.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
+    @staticmethod
+    async def _open_thread(
+        client: JsonRpcClient,
+        *,
+        cwd: str,
+        system_prompt: str,
+        model: str | None,
+        resume_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        thread_params: dict[str, Any] = {
+            "cwd": cwd,
+            "baseInstructions": system_prompt,
+            **({"model": model} if model else {}),
+            "sandbox": "read-only",
+            "approvalPolicy": "never",
+        }
+        if resume_session_id:
+            try:
+                return await client.rpc(
+                    "thread/resume", {"threadId": resume_session_id, **thread_params}
+                )
+            except RuntimeError as exc:
+                if _is_missing_thread_error(str(exc)):
+                    raise SessionResumeError(str(exc)) from exc
+                raise
+        return await client.rpc("thread/start", thread_params)
+
     async def discover_models_staged(
         self, auth: ProviderAuth
     ) -> tuple[list[ModelSpec], Callable[[], None]]:
@@ -324,32 +353,18 @@ class OpenAIBackend:
             specs, err = await discover_openai_http_models(
                 api_key, http_client_factory=self._http_client_factory
             )
-
-            def commit_http(discovery_error: str | None = err) -> None:
-                self.last_discovery_error = discovery_error
-
-            return specs, commit_http
-
-        def clear_error() -> None:
-            self.last_discovery_error = None
+            return specs, self._discovery_commit(error=err)
 
         candidates = codex_cli_candidates()
         if not candidates:
-            return [], clear_error
+            return [], self._discovery_commit()
         env, codex_home = self._prepare_env(auth)
+        disabled_flags = _disabled_mcp_overrides(codex_home)
         fallback_commit: Callable[[], None] | None = None
         for candidate in candidates:
             try:
                 async with managed_subprocess(
-                    str(candidate),
-                    "app-server",
-                    *CODEX_DISABLE_FLAGS,
-                    "-c",
-                    "mcp_servers={}",
-                    *_disabled_mcp_overrides(codex_home),
-                    "--listen",
-                    "stdio://",
-                    env=env,
+                    *self._app_server_cmd(candidate, disabled_flags), env=env
                 ) as (proc, stderr):
                     async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
                         messages = JsonMessageStream(proc.stdout)
@@ -362,12 +377,7 @@ class OpenAIBackend:
                             and acct.get("account") is None
                             and not has_env_key
                         ):
-
-                            def commit(chosen: Path = candidate) -> None:
-                                self.cli_path = chosen
-                                self.last_discovery_error = None
-
-                            return [], commit
+                            return [], self._discovery_commit(cli_path=candidate)
 
                         raw_models: list[dict[str, Any]] = []
                         cursor: str | None = None
@@ -416,10 +426,7 @@ class OpenAIBackend:
                                 )
                             )
 
-                        def commit(chosen: Path = candidate) -> None:
-                            self.cli_path = chosen
-                            self.last_discovery_error = None
-
+                        commit = self._discovery_commit(cli_path=candidate)
                         if specs:
                             return specs, commit
                         if fallback_commit is None:
@@ -428,9 +435,7 @@ class OpenAIBackend:
                 logger.warning(
                     "Codex model discovery with %s failed: %s", candidate, exc
                 )
-        if fallback_commit is not None:
-            return [], fallback_commit
-        return [], clear_error
+        return [], fallback_commit or self._discovery_commit()
 
     async def discover_models(self, auth: ProviderAuth) -> list[ModelSpec]:
         specs, commit = await self.discover_models_staged(auth)
@@ -472,48 +477,35 @@ class OpenAIBackend:
         reject_http_session_for_cli(resume_session_id)
         cli_path = self._resolve_cli()
         env, codex_home = self._prepare_env(auth)
+        disabled_flags = _disabled_mcp_overrides(codex_home)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             async with McpToolBridge(tools) as bridge:
-                cfg = bridge.stdio_server_config()
+                mcp_override = _toml_mcp_override(
+                    bridge.stdio_server_config(), tool_timeout_s=tool_timeout_s
+                )
                 async with managed_subprocess(
-                    str(cli_path),
-                    "app-server",
-                    *CODEX_DISABLE_FLAGS,
-                    "-c",
-                    _toml_mcp_override(cfg, tool_timeout_s=tool_timeout_s),
-                    *_disabled_mcp_overrides(codex_home),
-                    "--listen",
-                    "stdio://",
+                    *self._app_server_cmd(
+                        cli_path, disabled_flags, mcp_override=mcp_override
+                    ),
                     cwd=isolated_cwd,
                     env=env,
                 ) as (proc, stderr):
                     thread_id = resume_session_id
                     turn_id: str | None = None
+                    client: JsonRpcClient | None = None
                     try:
                         messages = JsonMessageStream(proc.stdout)
                         client = self._rpc_client(proc, messages, stderr)
                         await self._initialize_session(client)
-                        thread_params = {
-                            "cwd": isolated_cwd,
-                            "baseInstructions": system_prompt,
-                            "model": model,
-                            "sandbox": "read-only",
-                            "approvalPolicy": "never",
-                        }
-                        if resume_session_id:
-                            try:
-                                res = await client.rpc(
-                                    "thread/resume",
-                                    {"threadId": resume_session_id, **thread_params},
-                                )
-                            except RuntimeError as exc:
-                                if _is_missing_thread_error(str(exc)):
-                                    raise SessionResumeError(str(exc)) from exc
-                                raise
-                        else:
-                            res = await client.rpc("thread/start", thread_params)
+                        res = await self._open_thread(
+                            client,
+                            cwd=isolated_cwd,
+                            system_prompt=system_prompt,
+                            model=model,
+                            resume_session_id=resume_session_id,
+                        )
                         thread_id = (res.get("thread") or {}).get(
                             "id"
                         ) or resume_session_id
@@ -539,6 +531,7 @@ class OpenAIBackend:
                         latest_total: dict[str, Any] | None = None
                         accumulated_last: dict[str, int] = {}
                         saw_compaction_item = False
+                        emitted_turn_started = False
                         turn_finished = False
 
                         def _is_other_turn(notif_params: dict[str, Any]) -> bool:
@@ -563,11 +556,12 @@ class OpenAIBackend:
                                 continue
                             if method == "item/started":
                                 item = params.get("item") or {}
-                                if item.get("type") in (
+                                if not emitted_turn_started and item.get("type") in (
                                     "reasoning",
                                     "mcpToolCall",
                                     "agentMessage",
                                 ):
+                                    emitted_turn_started = True
                                     yield TurnStarted()
                             elif method == "item/agentMessage/delta":
                                 delta = params.get("delta")
@@ -588,15 +582,9 @@ class OpenAIBackend:
                                     yield CompactionNotice()
                             elif method == "thread/tokenUsage/updated":
                                 tu = params.get("tokenUsage") or {}
-                                notif_turn_id = params.get("turnId")
                                 total = tu.get("total") or {}
                                 last = tu.get("last") or {}
-                                if (
-                                    turn_id
-                                    and isinstance(notif_turn_id, str)
-                                    and notif_turn_id
-                                    and notif_turn_id != turn_id
-                                ):
+                                if _is_other_turn(params):
                                     if isinstance(total, dict) and total:
                                         baseline_total = total
                                 else:
@@ -607,17 +595,12 @@ class OpenAIBackend:
                                         latest_total = total
                                     if isinstance(last, dict):
                                         for key, val in last.items():
-                                            if isinstance(val, int):
+                                            if is_int(val):
                                                 accumulated_last[key] = (
                                                     accumulated_last.get(key, 0) + val
                                                 )
                             elif method == "error":
-                                err = params.get("error") or {}
-                                message = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else str(err)
-                                )
+                                message = rpc_error_message(params.get("error"))
                                 if message:
                                     last_error = message
                             elif method == "turn/completed":
@@ -629,14 +612,8 @@ class OpenAIBackend:
                                         "OpenAI Codex turn was interrupted."
                                     )
                                 if status == "failed":
-                                    err = turn.get("error") or {}
-                                    message = (
-                                        err.get("message")
-                                        if isinstance(err, dict)
-                                        else None
-                                    )
                                     raise RuntimeError(
-                                        message
+                                        rpc_error_message(turn.get("error"))
                                         or last_error
                                         or "OpenAI Codex could not finish this turn."
                                     )
@@ -644,8 +621,8 @@ class OpenAIBackend:
                                     turn_usage: dict[str, Any] | None = {
                                         key: max(0, val - baseline_total.get(key, 0))
                                         for key, val in latest_total.items()
-                                        if isinstance(val, int)
-                                        and isinstance(baseline_total.get(key, 0), int)
+                                        if is_int(val)
+                                        and is_int(baseline_total.get(key, 0))
                                     }
                                 elif resume_session_id is None and latest_total:
                                     turn_usage = latest_total
@@ -668,20 +645,12 @@ class OpenAIBackend:
                                 or "Codex app-server disconnected unexpectedly."
                             )
                     except (asyncio.CancelledError, GeneratorExit):
-                        if thread_id and turn_id:
+                        if client is not None and thread_id and turn_id:
                             with suppress(Exception, TimeoutError):
                                 await asyncio.wait_for(
-                                    self._send(
-                                        proc,
-                                        {
-                                            "jsonrpc": "2.0",
-                                            "id": self._next_id(),
-                                            "method": "turn/interrupt",
-                                            "params": {
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                            },
-                                        },
+                                    client.send_request(
+                                        "turn/interrupt",
+                                        {"threadId": thread_id, "turnId": turn_id},
                                     ),
                                     timeout=0.5,
                                 )
@@ -712,18 +681,12 @@ class OpenAIBackend:
         reject_http_session_for_cli(resume_session_id)
         cli_path = self._resolve_cli()
         env, codex_home = self._prepare_env(auth)
+        disabled_flags = _disabled_mcp_overrides(codex_home)
         with tempfile.TemporaryDirectory(
             prefix="nocturnomath-codex-cwd-", ignore_cleanup_errors=True
         ) as isolated_cwd:
             async with managed_subprocess(
-                str(cli_path),
-                "app-server",
-                *CODEX_DISABLE_FLAGS,
-                "-c",
-                "mcp_servers={}",
-                *_disabled_mcp_overrides(codex_home),
-                "--listen",
-                "stdio://",
+                *self._app_server_cmd(cli_path, disabled_flags),
                 cwd=isolated_cwd,
                 env=env,
             ) as (proc, stderr):
@@ -731,25 +694,17 @@ class OpenAIBackend:
                 client = self._rpc_client(proc, messages, stderr)
                 compacted = False
                 context_usage: dict[str, Any] | None = None
+                last_error: str | None = None
                 try:
                     async with asyncio.timeout(COMPACT_TIMEOUT_S):
                         await self._initialize_session(client)
-                        try:
-                            await client.rpc(
-                                "thread/resume",
-                                {
-                                    "threadId": resume_session_id,
-                                    "cwd": isolated_cwd,
-                                    "baseInstructions": system_prompt,
-                                    **({"model": model} if model else {}),
-                                    "sandbox": "read-only",
-                                    "approvalPolicy": "never",
-                                },
-                            )
-                        except RuntimeError as exc:
-                            if _is_missing_thread_error(str(exc)):
-                                raise SessionResumeError(str(exc)) from exc
-                            raise
+                        await self._open_thread(
+                            client,
+                            cwd=isolated_cwd,
+                            system_prompt=system_prompt,
+                            model=model,
+                            resume_session_id=resume_session_id,
+                        )
                         messages.clear_buffered()
                         await client.rpc(
                             "thread/compact/start",
@@ -757,21 +712,17 @@ class OpenAIBackend:
                         )
                         deadline: float | None = None
                         while True:
-                            if deadline is None:
-                                try:
-                                    msg = await messages.__anext__()
-                                except StopAsyncIteration:
+                            timeout: float | None = None
+                            if deadline is not None:
+                                timeout = deadline - asyncio.get_running_loop().time()
+                                if timeout <= 0:
                                     break
-                            else:
-                                remaining = deadline - asyncio.get_running_loop().time()
-                                if remaining <= 0:
-                                    break
-                                try:
-                                    msg = await asyncio.wait_for(
-                                        messages.__anext__(), timeout=remaining
-                                    )
-                                except (TimeoutError, StopAsyncIteration):
-                                    break
+                            try:
+                                msg = await messages.next_message(timeout=timeout)
+                            except TimeoutError:
+                                break
+                            if msg is None:
+                                break
                             if msg.get("id") is not None and "method" in msg:
                                 await self._handle_server_request(proc, msg)
                                 continue
@@ -797,23 +748,16 @@ class OpenAIBackend:
                             elif method == "turn/completed":
                                 turn = params.get("turn") or {}
                                 if turn.get("status") == "failed":
-                                    err = turn.get("error") or {}
-                                    message = (
-                                        err.get("message")
-                                        if isinstance(err, dict)
-                                        else None
-                                    )
                                     raise RuntimeError(
-                                        message or "Codex compaction failed."
+                                        rpc_error_message(turn.get("error"))
+                                        or last_error
+                                        or "Codex compaction failed."
                                     )
                                 break
                             elif method == "error":
-                                err = params.get("error") or {}
-                                message = (
-                                    err.get("message")
-                                    if isinstance(err, dict)
-                                    else str(err)
-                                )
+                                message = rpc_error_message(params.get("error"))
+                                if message:
+                                    last_error = message
                                 if not params.get("willRetry"):
                                     raise RuntimeError(
                                         message or "Codex compaction failed."
@@ -826,7 +770,9 @@ class OpenAIBackend:
                 if not compacted:
                     detail = await stderr.text()
                     raise RuntimeError(
-                        detail or "Codex did not confirm that compaction completed."
+                        last_error
+                        or detail
+                        or "Codex did not confirm that compaction completed."
                     )
                 return CompactResult(
                     session_id=resume_session_id, context_usage=context_usage

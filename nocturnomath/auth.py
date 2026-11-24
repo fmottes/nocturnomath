@@ -84,9 +84,8 @@ _INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
 }
 
 _PROVIDER_SECRET_ENV: dict[ProviderId, tuple[str, ...]] = {
-    "anthropic": _CREDENTIAL_ENV["anthropic"],
-    "openai": (*_CREDENTIAL_ENV["openai"], "CODEX_ACCESS_TOKEN"),
-    "google": _CREDENTIAL_ENV["google"],
+    provider: (*keys, *blockers)
+    for provider, (_, blockers, keys) in _DIRECT_API_KEY_RULES.items()
 }
 
 ALL_PROVIDER_SECRET_ENV: tuple[str, ...] = tuple(
