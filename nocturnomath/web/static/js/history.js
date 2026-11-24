@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js?v=20261117-2";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261118-1";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261124-1";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -146,6 +146,7 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
 const welcomeCard = document.getElementById("system-welcome")?.cloneNode(true);
 
 export function clearChat(showWelcome = true) {
+  cancelAssistantDeltaRender();
   state.followChat = true;
   elements.chatMessages.replaceChildren();
   if (showWelcome && welcomeCard) {

@@ -2,7 +2,7 @@ import { elements, state } from "./state.js?v=20261117-2";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261118-2";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261124-1";
 
 // ============================================================================
 // Workspace & Files Management
@@ -291,6 +291,13 @@ export function setSessionDefaults(defaults) {
   elements.sessionDefaultsSave.disabled = !state.models.length;
 }
 
+export function clearDraftSelection(agent) {
+  agent.draftModel = null;
+  agent.draftProvider = null;
+  agent.draftRawModel = null;
+  agent.draftEffort = null;
+}
+
 export function setModelCatalogue(
   models = [],
   labels = {},
@@ -332,10 +339,7 @@ export function setModelCatalogue(
         agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider, modelRawIds);
         agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
       } else {
-        agent.draftModel = null;
-        agent.draftProvider = null;
-        agent.draftRawModel = null;
-        agent.draftEffort = null;
+        clearDraftSelection(agent);
       }
     }
     if (agentModels && Object.prototype.hasOwnProperty.call(agentModels, agent.agent_id)) {
@@ -393,13 +397,6 @@ function recordRecentWorkspace(path) {
   const projects = [path, ...recentWorkspaces().filter((item) => item !== path)]
     .slice(0, RECENT_WORKSPACE_LIMIT);
   localStorage.setItem(RECENT_WORKSPACES_KEY, JSON.stringify(projects));
-}
-
-function removeRecentWorkspace(path) {
-  localStorage.setItem(
-    RECENT_WORKSPACES_KEY,
-    JSON.stringify(recentWorkspaces().filter((item) => item !== path))
-  );
 }
 
 function renderRecentWorkspaces() {

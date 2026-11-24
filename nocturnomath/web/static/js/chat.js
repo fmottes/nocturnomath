@@ -1,7 +1,7 @@
 import { elements, state } from "./state.js?v=20261117-2";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
 import { openLightbox } from "./ui.js?v=20261016-3";
-import { rewriteDocumentLinks } from "./workspace.js?v=20261120-1";
+import { rewriteDocumentLinks } from "./workspace.js?v=20261124-1";
 
 // ============================================================================
 // Chat UI Rendering
@@ -69,15 +69,43 @@ function renderAssistantBubble(bubble) {
   scrollChatToBottom();
 }
 
+let pendingDeltaFrame = null;
+
+export function cancelAssistantDeltaRender() {
+  if (pendingDeltaFrame !== null && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(pendingDeltaFrame);
+  }
+  pendingDeltaFrame = null;
+}
+
+function flushAssistantDeltaRender() {
+  if (pendingDeltaFrame === null) return;
+  cancelAssistantDeltaRender();
+  if (state.currentAssistantBubble) renderAssistantBubble(state.currentAssistantBubble);
+}
+
+function scheduleAssistantDeltaRender() {
+  if (typeof requestAnimationFrame !== "function") {
+    if (state.currentAssistantBubble) renderAssistantBubble(state.currentAssistantBubble);
+    return;
+  }
+  if (pendingDeltaFrame !== null) return;
+  pendingDeltaFrame = requestAnimationFrame(() => {
+    pendingDeltaFrame = null;
+    if (state.currentAssistantBubble) renderAssistantBubble(state.currentAssistantBubble);
+  });
+}
+
 // Live streaming: the chunk extends the block currently being written, which
 // assistant_text later replaces with its final form.
 export function appendAssistantDelta(text) {
   const bubble = openAssistantBubble();
   bubble.streamText += text;
-  renderAssistantBubble(bubble);
+  scheduleAssistantDeltaRender();
 }
 
 export function appendAssistantChunk(text, timeLabel) {
+  cancelAssistantDeltaRender();
   const bubble = openAssistantBubble(timeLabel);
   // The completed block is authoritative: drop whatever was streamed for it
   // rather than appending, so streamed text is never duplicated.
@@ -87,6 +115,7 @@ export function appendAssistantChunk(text, timeLabel) {
 }
 
 export function finalizeAssistantTurn() {
+  flushAssistantDeltaRender();
   state.currentAssistantBubble = null;
 }
 
@@ -94,6 +123,7 @@ export function finalizeAssistantTurn() {
 // Without this the whole turn's prose accumulates in the bubble opened by its
 // first block, so a verdict written after five probes renders above all five.
 export function closeAssistantBubble() {
+  flushAssistantDeltaRender();
   state.currentAssistantBubble = null;
 }
 

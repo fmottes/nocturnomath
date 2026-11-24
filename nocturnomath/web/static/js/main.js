@@ -1,11 +1,11 @@
 import { elements, state } from "./state.js?v=20261117-2";
 import { initWebSocket, sendWs } from "./transport.js?v=20261016-3";
-import { openWorkspace, applyWorkspace, browseFolders, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261120-1";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261118-1";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261118-1";
+import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, resolveCatalogueModel, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId } from "./workspace.js?v=20261124-1";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261124-1";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261124-1";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261016-3";
-import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261118-2";
+import { cancelCreateFolder, cancelEdit, openDocument, saveEdit, saveFolder, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261124-1";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -149,10 +149,7 @@ function applyExplorer(agent, repaint = false) {
       merged.draftProvider = state.modelProviders[resolvedDraft] || merged.draftProvider || null;
       merged.draftRawModel = rawModelId(resolvedDraft, merged.draftProvider);
     } else {
-      merged.draftModel = null;
-      merged.draftProvider = null;
-      merged.draftRawModel = null;
-      merged.draftEffort = null;
+      clearDraftSelection(merged);
     }
   }
   state.agents.set(agent.agent_id, merged);
@@ -167,7 +164,7 @@ function applyExplorer(agent, repaint = false) {
     updateAgentStatus(merged.is_busy && (!merged.status || merged.status === "idle")
       ? "thinking" : (merged.status || "idle"));
     renderPendingPrompts(merged.pending_prompts || []);
-    if (agent.documents) refreshDocuments();
+    if (agent.documents) setDocuments(agent.documents, agent.documents_default, agent.folders);
     if (repaint) {
       restoreChat(merged.records || [], merged.kernel_busy);
       restoreExplorerView(merged);
@@ -304,8 +301,11 @@ function handleServerEvent(event) {
       else if (event.type === "system_message") appendSystemMessage(event.text);
       if (!["session_resumed", "session_reset"].includes(event.type)) return;
     } else {
+      let tabsChanged = false;
       if (event.type === "status_change") {
-        current.is_busy = !["idle", "cancelled"].includes(event.status);
+        const nextBusy = !["idle", "cancelled"].includes(event.status);
+        if (current.is_busy !== nextBusy) tabsChanged = true;
+        current.is_busy = nextBusy;
         current.status = event.status;
         current.stateSeq = (current.stateSeq || 0) + 1;
       }
@@ -328,7 +328,10 @@ function handleServerEvent(event) {
       if (event.type === "context_usage_changed") current.context_usage = event.context_usage;
       if (event.type === "pending_prompts_changed") current.pending_prompts = event.pending_prompts || [];
       if (event.type === "user_message") {
-        if (event.session_id) current.session_id = event.session_id;
+        if (event.session_id && current.session_id !== event.session_id) {
+          current.session_id = event.session_id;
+          tabsChanged = true;
+        }
         if (event.model) {
           current.model = event.model;
           current.modelProvider = state.modelProviders[event.model] || current.modelProvider || null;
@@ -336,7 +339,7 @@ function handleServerEvent(event) {
         if (event.effort !== undefined) current.effort = event.effort;
       }
       state.agents.set(event.agent_id, current);
-      renderExplorerTabs();
+      if (tabsChanged) renderExplorerTabs();
       if (
         event.agent_id !== state.activeAgentId
         && !["agent_focused", "session_reset", "session_resumed"].includes(event.type)
@@ -401,9 +404,7 @@ function handleServerEvent(event) {
         setActiveModelAndEffort(agent.model, agent.effort);
       }
       if (event.session_id && agent) {
-        agent.session_id = event.session_id;
         setSessionId(event.session_id);
-        renderExplorerTabs();
       }
       appendUserMessage(event.text);
       break;
@@ -467,18 +468,15 @@ function handleServerEvent(event) {
 
     case "status_change": {
       const agent = state.agents.get(event.agent_id);
-      if (agent) {
-        agent.is_busy = !["idle", "cancelled"].includes(event.status);
-        if (
-          ["cancelled", "idle"].includes(event.status) &&
-          !agent.draftModel &&
-          !agent.draftRawModel
-        ) {
-          setActiveModelAndEffort(agent.model, agent.effort);
-        }
+      if (
+        agent &&
+        ["cancelled", "idle"].includes(event.status) &&
+        !agent.draftModel &&
+        !agent.draftRawModel
+      ) {
+        setActiveModelAndEffort(agent.model, agent.effort);
       }
       updateAgentStatus(event.status);
-      renderExplorerTabs();
       if (event.status === "idle") {
         refreshContextUsage(event.agent_id);
       }
@@ -509,8 +507,9 @@ function handleServerEvent(event) {
 
     case "session_reset": {
       const targetId = event.agent_id || state.activeAgentId;
-      if (state.agents.has(targetId)) {
-        Object.assign(state.agents.get(targetId), {
+      const target = state.agents.get(targetId);
+      if (target) {
+        Object.assign(target, {
           context_usage: null,
           session_id: event.session_id ?? null,
           records: [],
@@ -519,11 +518,8 @@ function handleServerEvent(event) {
           model: event.model,
           modelProvider: state.modelProviders[event.model] || null,
           effort: event.effort,
-          draftModel: null,
-          draftProvider: null,
-          draftRawModel: null,
-          draftEffort: null,
         });
+        clearDraftSelection(target);
       }
       renderExplorerTabs();
       if (!event.agent_id || event.agent_id === state.activeAgentId) {
@@ -557,18 +553,16 @@ function handleServerEvent(event) {
     case "session_resumed": {
       ++explorerSelectSeq;
       const resumedId = event.session_id || event.id || null;
-      if (state.agents.has(event.agent_id)) {
-        Object.assign(state.agents.get(event.agent_id), {
+      const target = state.agents.get(event.agent_id);
+      if (target) {
+        Object.assign(target, {
           session_id: resumedId,
           can_compact: event.can_compact ?? Boolean(event.context_restored),
           draftText: "",
           scrollTop: 0,
           followChat: true,
-          draftModel: null,
-          draftProvider: null,
-          draftRawModel: null,
-          draftEffort: null,
         });
+        clearDraftSelection(target);
       }
       applyExplorer({
         is_busy: false,
@@ -705,10 +699,7 @@ function setupEventListeners() {
     const agent = state.agents.get(state.activeAgentId);
     if (agent) {
       agent.draftText = "";
-      agent.draftModel = null;
-      agent.draftProvider = null;
-      agent.draftRawModel = null;
-      agent.draftEffort = null;
+      clearDraftSelection(agent);
     }
   });
 
