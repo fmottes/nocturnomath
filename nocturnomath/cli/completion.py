@@ -88,11 +88,9 @@ class CommandCompleter(Completer):
         if name == "/effort":
             if " " in argument.lstrip():
                 return []
-            current = (self._pending_model() if self._pending_model else None) or (
-                self.runtime.session.model
-                if self.runtime.session
-                else self.runtime.model
-            )
+            current = (
+                self._pending_model() if self._pending_model else None
+            ) or self.runtime.current_model
             return [
                 (level, f"reasoning effort for {current}")
                 for level in self.runtime.model_efforts.get(current or "", [])
@@ -119,9 +117,19 @@ class CommandCompleter(Completer):
         if session is None:
             return []
         if name == "/resume":
-            return [
-                (record["id"], record["title"]) for record in session.list_sessions()
-            ] + [("--kernel", "replay the stored probes")]
+            tokens = argument.split()
+            completed = tokens if argument.endswith(" ") else tokens[:-1]
+            has_session = any(not token.startswith("-") for token in completed)
+            has_kernel_flag = "--kernel" in completed
+            items: list[tuple[str, str]] = []
+            if not has_session:
+                items.extend(
+                    (record["id"], record["title"])
+                    for record in session.list_sessions()
+                )
+            if not has_kernel_flag:
+                items.append(("--kernel", "replay the stored probes"))
+            return items
         if name == "/docs":
             return [
                 (document["name"], "included" if document["included"] else "")
