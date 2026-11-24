@@ -136,6 +136,9 @@ EVENT_PAYLOAD = {
     },
     "name": "summary.md",
     "action": "created",
+    "current": "0.3.1",
+    "latest": "0.4.0",
+    "command": "uv tool upgrade nocturnomath",
 }
 
 EVENT_TYPES = [
@@ -163,6 +166,7 @@ EVENT_TYPES = [
     "context_usage_changed",
     "pending_prompts_changed",
     "document_saved",
+    "update_available",
 ]
 
 

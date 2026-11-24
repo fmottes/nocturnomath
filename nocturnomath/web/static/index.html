@@ -20,7 +20,7 @@
   <!-- Hand-drafted chrome: rough.js frames -->
   <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js" integrity="sha384-1NLkwxMO2sOqcq7rQkFBhIAUJtbt8ziLxhVKVgKfFGMEU8pF+GEq5LVogviveup6" crossorigin="anonymous"></script>
   <link rel="stylesheet" href="/static/css/base.css">
-  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/components.css?v=20261124-3">
   <link rel="stylesheet" href="/static/css/layout.css">
   <link rel="stylesheet" href="/static/css/chat.css?v=20261118-1">
   <link rel="stylesheet" href="/static/css/viewer.css">
@@ -44,6 +44,7 @@
           <span class="brand-icon landing-brand-icon" aria-hidden="true"></span>
         </div>
         <div class="landing-actions">
+          <span class="update-notice hidden" data-update-notice role="status"><a target="_blank" rel="noopener noreferrer"></a><button type="button" data-dismiss-update aria-label="Dismiss update notice">&times;</button></span>
           <button class="btn btn-xs btn-ghost" id="btn-auth-landing" type="button">Auth</button>
           <button class="btn btn-xs btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
         </div>
@@ -106,6 +107,7 @@
 
       <!-- Controls & Status -->
       <div class="header-right">
+        <span class="update-notice hidden" data-update-notice role="status"><a target="_blank" rel="noopener noreferrer"></a><button type="button" data-dismiss-update aria-label="Dismiss update notice">&times;</button></span>
         <button class="btn btn-sm btn-ghost theme-toggle" type="button" data-theme-toggle>Dark</button>
         <button class="btn btn-sm btn-ghost" id="btn-auth" type="button">Auth</button>
         <button class="btn btn-sm btn-ghost" id="btn-settings" type="button">Settings</button>
@@ -492,7 +494,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261124-2"></script>
+  <script type="module" src="/static/js/main.js?v=20261124-3"></script>
   <script src="/static/js/sketch.js?v=20261124-2"></script>
 </body>
 </html>

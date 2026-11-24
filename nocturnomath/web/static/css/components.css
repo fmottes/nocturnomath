@@ -91,6 +91,19 @@
 
 .header-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
 
+.update-notice {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 6px 3px 8px;
+  background: var(--sheet); border: 1px solid var(--blue);
+  font-family: var(--font-mono); font-size: 0.6875rem; color: var(--blue); white-space: nowrap;
+}
+.update-notice a { color: inherit; text-decoration: none; }
+.update-notice a:hover { text-decoration: underline; }
+.update-notice button {
+  padding: 0 2px; border: 0; background: transparent;
+  color: var(--ink-soft); font-size: 0.875rem; line-height: 1; cursor: pointer;
+}
+.update-notice button:hover { color: var(--ink); }
+
 .status-indicator {
   display: flex;
   flex: 0 0 auto;

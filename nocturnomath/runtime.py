@@ -16,6 +16,7 @@ from .auth import PROVIDER_TITLES, PROVIDERS, AuthStore, ProviderId
 from .backends import DEFAULT_EFFORT, AgentBackend, default_backends
 from .prompt import DEFAULT_EXPLORATION_PROMPT
 from .session import DEFAULT_PROMPT_MODE, PROMPT_MODES, ExplorationSession
+from .updates import check_for_update
 
 logger = logging.getLogger("nocturnomath.runtime")
 
@@ -103,6 +104,8 @@ class Runtime:
         self._closed_session_meta_cache: dict[
             Path, tuple[int, int, tuple[str | None, str | None, str | None]]
         ] = {}
+        self.update_available: dict[str, str] | None = None
+        self._update_task: asyncio.Task | None = None
         if session is not None:
             self.primary_agent_id = self._new_agent_id()
             self.agents[self.primary_agent_id] = session
@@ -140,6 +143,18 @@ class Runtime:
         for agent_id, session in items:
             self._subscribe_to_agent(agent_id, session)
         self._wake_slurm_monitor()
+        if self._update_task is None:
+            with suppress(RuntimeError):
+                self._update_task = asyncio.get_running_loop().create_task(
+                    self._check_for_update()
+                )
+
+    async def _check_for_update(self):
+        with suppress(Exception):
+            info = await check_for_update()
+            if info and self._started:
+                self.update_available = info
+                await self.emit("update_available", dict(info))
 
     def _wake_slurm_monitor(self):
         if not self._started:
@@ -970,6 +985,8 @@ class Runtime:
         self._started = False
         if self._slurm_task is not None:
             self._slurm_task.cancel()
+        if self._update_task is not None:
+            self._update_task.cancel()
         self.changing = False
         for agent_id in list(self.agents):
             self._unsubscribe_agent(agent_id)
@@ -1290,6 +1307,9 @@ class Runtime:
         session = self.session
         auth_public = self.auth_public()
         catalogue = self.catalogue_payload()
+        update_available = (
+            dict(self.update_available) if self.update_available else None
+        )
         if session is None:
             return {
                 "is_open": False,
@@ -1305,6 +1325,7 @@ class Runtime:
                 "agents": [],
                 "navigator_root": str(self.navigator_root),
                 "auth": auth_public,
+                "update_available": update_available,
             }
         config = session.workspace.read_config()
         documents_default = bool(config.get("documents_default", True))
@@ -1398,6 +1419,7 @@ class Runtime:
             "plots": session.list_plots(),
             "agents": agents,
             "auth": auth_public,
+            "update_available": update_available,
         }
 
     def export_notebook(
@@ -1656,6 +1678,9 @@ class Runtime:
         if self._slurm_task is not None:
             self._slurm_task.cancel()
             await asyncio.gather(self._slurm_task, return_exceptions=True)
+        if self._update_task is not None:
+            self._update_task.cancel()
+            await asyncio.gather(self._update_task, return_exceptions=True)
         sessions = list(self.agents.values())
         await asyncio.gather(*(session.interrupt() for session in sessions))
         await asyncio.gather(

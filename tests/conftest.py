@@ -6,6 +6,11 @@ import pytest
 from nocturnomath.session import ExplorationSession
 
 
+@pytest.fixture(autouse=True)
+def _disable_update_checks(monkeypatch):
+    monkeypatch.setenv("NOCTURNOMATH_NO_UPDATE_CHECK", "1")
+
+
 class FakeKernel:
     def __init__(self, cwd=None, environment=None):
         self.on_start = None

@@ -134,6 +134,7 @@ class TerminalApp:
         self._live: Live | None = None
         self._stream_text = ""
         self._last_stream_render = 0.0
+        self._update_announced = False
 
     # ------------------------------------------------------------------ output
 
@@ -250,6 +251,17 @@ class TerminalApp:
             "Type /help for commands.",
             style="dim",
         )
+        self._announce_update(self.runtime.update_available)
+
+    def _announce_update(self, info: dict[str, Any] | None):
+        if not info or self._update_announced:
+            return
+        self._update_announced = True
+        self.write(
+            f"update available: {info['current']} → {info['latest']} "
+            f"(run: {info['command']})",
+            style="yellow",
+        )
 
     def bottom_toolbar(self) -> str:
         session = self.runtime.session
@@ -310,6 +322,9 @@ class TerminalApp:
             self.write(f"[{event_type}] {payload}", style="dim")
             return
         handler(payload)
+
+    def _render_update_available(self, payload):
+        self._announce_update(payload)
 
     def _render_assistant_delta(self, payload):
         chunk = payload.get("text", "")

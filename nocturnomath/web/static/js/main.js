@@ -26,6 +26,19 @@ function applyTheme(theme) {
   window.dispatchEvent(new CustomEvent("nocturnomath:themechange"));
 }
 
+let updateDismissed = false;
+function setUpdateNotice(info) {
+  const show = Boolean(info?.latest) && !updateDismissed;
+  document.querySelectorAll("[data-update-notice]").forEach((el) => {
+    el.classList.toggle("hidden", !show);
+    if (!show) return;
+    const link = el.querySelector("a");
+    link.textContent = `v${info.latest} available`;
+    link.href = info.url || "https://github.com/fmottes/nocturnomath";
+    link.title = `Update available (${info.current} → ${info.latest}). Run: ${info.command}`;
+  });
+}
+
 function explorerLabel(agent) {
   return agent.session_id || "New";
 }
@@ -367,13 +380,19 @@ function handleServerEvent(event) {
       break;
     case "init":
       applyWorkspace(event.workspace);
+      setUpdateNotice(event.workspace?.update_available);
       if (event.workspace?.is_open) installExplorers(event.workspace.agents || []);
       break;
     case "workspace_updated":
       clearChat();
       state.activeAgentId = null;
       applyWorkspace(event.workspace);
+      setUpdateNotice(event.workspace?.update_available);
       installExplorers(event.workspace.agents || [], false);
+      break;
+
+    case "update_available":
+      setUpdateNotice(event);
       break;
 
     case "agent_removed": {
@@ -679,6 +698,12 @@ function setupEventListeners() {
   document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
     button.addEventListener("click", () => {
       applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
+  });
+  document.querySelectorAll("[data-dismiss-update]").forEach((button) => {
+    button.addEventListener("click", () => {
+      updateDismissed = true;
+      setUpdateNotice(null);
     });
   });
   applyTheme(document.documentElement.dataset.theme);
