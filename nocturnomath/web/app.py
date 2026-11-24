@@ -242,6 +242,36 @@ def create_app(
             raise PermissionError("Folder is outside the configured workspace root.")
         return target
 
+    async def create_and_broadcast_agent(requested_by: str | None = None):
+        new_id = await runtime.create_agent_async()
+        snapshot = runtime.agent_snapshot(new_id)
+        payload = (
+            {"requested_by": requested_by, **snapshot}
+            if requested_by is not None
+            else snapshot
+        )
+        await runtime.broadcast("agent_added", payload)
+        return snapshot
+
+    async def restart_and_broadcast_kernel(agent_id: str, session: ExplorationSession):
+        await runtime.transition_agent(agent_id, session.kernel.restart)
+        alive = session.kernel.is_alive()
+        await runtime.broadcast(
+            "kernel_restarted", {"agent_id": agent_id, "kernel_alive": alive}
+        )
+        return alive
+
+    async def open_and_broadcast_workspace(path: Path | str, python: str | None):
+        nonlocal initial_python
+        target = navigation_path(path)
+        await runtime.transition(
+            runtime.open_workspace, target, python or initial_python
+        )
+        initial_python = None
+        info = await workspace_snapshot()
+        await runtime.broadcast("workspace_updated", {"workspace": info})
+        return info
+
     @app.get("/", response_class=HTMLResponse)
     async def get_index():
         index_path = STATIC_DIR / "index.html"
@@ -268,15 +298,12 @@ def create_app(
                 detail="Open a workspace folder before using the agent.",
             )
         try:
-            agent_id = await runtime.create_agent_async()
-            snapshot = runtime.agent_snapshot(agent_id)
+            return await create_and_broadcast_agent()
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Failed to create explorer")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await runtime.broadcast("agent_added", snapshot)
-        return snapshot
 
     @app.delete("/api/agents/{agent_id}")
     async def close_agent(agent_id: str):
@@ -332,11 +359,7 @@ def create_app(
         return {
             "auth": runtime.auth_public(),
             "model": runtime.session.model if runtime.session else runtime.model,
-            "models": runtime.models,
-            "model_labels": runtime.model_labels,
-            "model_providers": runtime.model_providers,
-            "model_raw_ids": runtime.model_raw_ids,
-            "model_efforts": runtime.model_efforts,
+            **runtime.catalogue_payload(),
             "effort": runtime.session.effort if runtime.session else runtime.effort,
             "agent_models": {
                 agent_id: {"model": agent.model, "effort": agent.effort}
@@ -396,17 +419,10 @@ def create_app(
 
     @app.post("/api/workspace")
     async def change_workspace(request: WorkspaceChangeRequest):
-        nonlocal initial_python
         if runtime.session is not None:
             require_idle("change workspace")
         try:
-            target = navigation_path(request.path)
-            await runtime.transition(
-                runtime.open_workspace, target, request.python or initial_python
-            )
-            initial_python = None
-            info = await workspace_snapshot()
-            await runtime.broadcast("workspace_updated", {"workspace": info})
+            info = await open_and_broadcast_workspace(request.path, request.python)
             return {"status": "ok", "workspace": info}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
@@ -448,9 +464,10 @@ def create_app(
         }
 
     def documents_payload(session: ExplorationSession):
+        documents, folders = session.documents_and_folders()
         return {
-            "documents": session.list_documents(),
-            "folders": session.workspace.list_document_folders(),
+            "documents": documents,
+            "folders": folders,
             "documents_default": session.documents_default,
         }
 
@@ -492,12 +509,8 @@ def create_app(
     async def set_documents_default(
         request: DocumentsDefaultRequest, agent_id: str | None = None
     ):
-        session = active_session(agent_id)
-        session.set_documents_default(request.enabled)
-        for other in list(runtime.agents.values()):
-            if other is not session and other.workspace_path == session.workspace_path:
-                other.documents_default = session.documents_default
-                other.document_choices = {}
+        active_session(agent_id)
+        session = runtime.set_documents_default(request.enabled, agent_id)
         return documents_payload(session)
 
     @app.get("/api/documents/{name:path}")
@@ -525,16 +538,9 @@ def create_app(
 
     @app.delete("/api/documents/{name:path}")
     async def delete_document(name: str, agent_id: str | None = None):
-        session = active_session(agent_id)
+        active_session(agent_id)
         try:
-            session.delete_document(name)
-            for other in list(runtime.agents.values()):
-                if (
-                    other is not session
-                    and other.workspace_path == session.workspace_path
-                ):
-                    other.document_choices.pop(name, None)
-                    other._sent_documents.pop(name, None)
+            session = runtime.delete_document(name, agent_id)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Document not found")
         except ValueError as exc:
@@ -603,17 +609,10 @@ def create_app(
         session = active_session(agent_id)
         resolved_agent_id = agent_id or runtime.primary_agent_id
         try:
-            await runtime.transition_agent(resolved_agent_id, session.kernel.restart)
+            alive = await restart_and_broadcast_kernel(resolved_agent_id, session)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await runtime.broadcast(
-            "kernel_restarted",
-            {
-                "agent_id": resolved_agent_id,
-                "kernel_alive": session.kernel.is_alive(),
-            },
-        )
-        return {"status": "ok", "kernel_alive": session.kernel.is_alive()}
+        return {"status": "ok", "kernel_alive": alive}
 
     @app.post("/api/kernel/interrupt")
     async def interrupt_kernel(agent_id: str | None = None):
@@ -732,7 +731,6 @@ def create_app(
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
-        nonlocal initial_python
         origin = websocket.headers.get("origin")
         if origin and not _same_origin(
             origin, websocket.url.scheme, websocket.headers.get("host", "")
@@ -775,10 +773,7 @@ def create_app(
 
                 if action == "new_agent":
                     try:
-                        agent_id = await runtime.create_agent_async()
-                        await runtime.broadcast(
-                            "agent_added", runtime.agent_snapshot(agent_id)
-                        )
+                        await create_and_broadcast_agent()
                     except Exception as exc:
                         await runtime.broadcast("error", {"message": str(exc)})
                     continue
@@ -787,16 +782,8 @@ def create_app(
                     target_path = data.get("path")
                     if target_path:
                         try:
-                            target_path = navigation_path(target_path)
-                            await runtime.transition(
-                                runtime.open_workspace,
-                                target_path,
-                                data.get("python") or initial_python,
-                            )
-                            initial_python = None
-                            info = await workspace_snapshot()
-                            await runtime.broadcast(
-                                "workspace_updated", {"workspace": info}
+                            await open_and_broadcast_workspace(
+                                target_path, data.get("python")
                             )
                         except Exception as exc:
                             await runtime.broadcast("error", {"message": str(exc)})
@@ -817,14 +804,7 @@ def create_app(
                         continue
                     if text == "/new":
                         try:
-                            new_id = await runtime.create_agent_async()
-                            await runtime.broadcast(
-                                "agent_added",
-                                {
-                                    "requested_by": agent_id,
-                                    **runtime.agent_snapshot(new_id),
-                                },
-                            )
+                            await create_and_broadcast_agent(requested_by=agent_id)
                         except Exception as exc:
                             await runtime.broadcast(
                                 "error", {"agent_id": agent_id, "message": str(exc)}
@@ -832,16 +812,7 @@ def create_app(
                         continue
                     if text == "/restart":
                         try:
-                            await runtime.transition_agent(
-                                agent_id, session.kernel.restart
-                            )
-                            await runtime.broadcast(
-                                "kernel_restarted",
-                                {
-                                    "agent_id": agent_id,
-                                    "kernel_alive": session.kernel.is_alive(),
-                                },
-                            )
+                            await restart_and_broadcast_kernel(agent_id, session)
                         except RuntimeError as exc:
                             await runtime.broadcast(
                                 "error", {"agent_id": agent_id, "message": str(exc)}
@@ -946,28 +917,14 @@ def create_app(
                             interrupt_tasks[agent_id] = bg
                 elif action == "restart_kernel":
                     try:
-                        await runtime.transition_agent(agent_id, session.kernel.restart)
-                        await runtime.broadcast(
-                            "kernel_restarted",
-                            {
-                                "agent_id": agent_id,
-                                "kernel_alive": session.kernel.is_alive(),
-                            },
-                        )
+                        await restart_and_broadcast_kernel(agent_id, session)
                     except RuntimeError as exc:
                         await runtime.broadcast(
                             "error", {"agent_id": agent_id, "message": str(exc)}
                         )
                 elif action == "new_session":
                     try:
-                        new_id = await runtime.create_agent_async()
-                        await runtime.broadcast(
-                            "agent_added",
-                            {
-                                "requested_by": agent_id,
-                                **runtime.agent_snapshot(new_id),
-                            },
-                        )
+                        await create_and_broadcast_agent(requested_by=agent_id)
                     except Exception as exc:
                         await runtime.broadcast(
                             "error", {"agent_id": agent_id, "message": str(exc)}

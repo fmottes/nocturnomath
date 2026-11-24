@@ -263,14 +263,7 @@ class TerminalApp:
         effort_part = f" · effort {effort}" if effort else ""
         workspace = session.workspace
         chat = "new" if workspace.session_pending else workspace.session_id
-        custom_auth = []
-        for provider in PROVIDERS:
-            auth_entry = self.runtime.auth.get(provider)
-            if auth_entry.method != "cli":
-                custom_auth.append(f"{provider}:{auth_entry.method}")
-            elif auth_entry.direct_api_key():
-                custom_auth.append(f"{provider}:api_key(env)")
-        auth_summary = ", ".join(custom_auth) if custom_auth else "cli"
+        auth_summary = self.runtime.auth.short_summary_label()
         return (
             f"kernel {kernel} · model {model}{effort_part} · "
             f"auth {auth_summary} · chat {chat} · {self.status}"
@@ -602,6 +595,11 @@ class TerminalApp:
             self.error(str(exc))
             return True
 
+    def _clear_pending_selection(self) -> None:
+        self.pending_model = None
+        self.pending_model_provider = None
+        self.pending_effort = None
+
     async def run_query(self, text: str):
         raw_model = (
             self.runtime.model_raw_ids.get(self.pending_model)
@@ -619,9 +617,7 @@ class TerminalApp:
         except (RuntimeError, ValueError) as exc:
             self.error(str(exc))
             return
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         if query_state == "pending":
             session = self.runtime.session
             snapshot = session.pending_prompts_snapshot() if session else []
@@ -649,9 +645,7 @@ class TerminalApp:
 
     async def _command_new(self, argument: str) -> bool:
         self.require_idle("start a new session")
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         await self.runtime.transition(self.runtime.reset_session)
         await self.runtime.emit("session_reset", {})
         return True
@@ -724,9 +718,7 @@ class TerminalApp:
         data = await self.runtime.transition(
             self.runtime.resume_session, ids[0], restore_kernel
         )
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         await self.runtime.emit("session_resumed", data)
         return True
 
@@ -880,9 +872,7 @@ class TerminalApp:
                     f"Dropped pending model {self.pending_model}: not in the new catalogue.",
                     style="dim",
                 )
-                self.pending_model = None
-                self.pending_model_provider = None
-                self.pending_effort = None
+                self._clear_pending_selection()
             else:
                 self.pending_model = resolved
                 self.pending_model_provider = self.runtime.model_providers.get(resolved)
@@ -914,9 +904,7 @@ class TerminalApp:
             self.runtime.open_workspace, session.workspace_path, argument
         )
         self.initial_python = None
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         self.write("New research environment; this starts a new chat.")
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
@@ -931,9 +919,7 @@ class TerminalApp:
             self.runtime.open_workspace, argument, self.initial_python
         )
         self.initial_python = None
-        self.pending_model = None
-        self.pending_model_provider = None
-        self.pending_effort = None
+        self._clear_pending_selection()
         await self.runtime.emit(
             "workspace_updated", {"workspace": self.runtime.workspace_snapshot()}
         )
