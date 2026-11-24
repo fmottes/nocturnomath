@@ -6,57 +6,23 @@
  * than a scribble, and every element keeps a stable seed so redraws never
  * "boil". Nothing here touches figures, tables or numbers — data is drawn
  * precisely, by the code that produced it.
- *
- * rough-notation is used for one thing only: marking a genuinely important
- * result (a fact the agent recorded) with the single highlighter accent.
  */
 (function () {
   "use strict";
 
   var rough = window.rough;
-  var RoughNotation = window.RoughNotation;
   if (!rough) return; // CSS keeps precise 1px borders as the fallback
 
   var SVG_NS = "http://www.w3.org/2000/svg";
+  var colorCache = {};
+
   function cssColor(name, fallback) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
-  }
-
-  // --------------------------------------------------------------------------
-  // Motion preference. Only decorative motion is affected: the highlighter
-  // drawing itself in. Structural linework is static either way.
-  // --------------------------------------------------------------------------
-  var MOTION_KEY = "nocturnomath.motion";
-
-  function systemPrefersReduced() {
-    return !!(
-      window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    );
-  }
-
-  function storedMotion() {
-    try {
-      return window.localStorage.getItem(MOTION_KEY);
-    } catch (e) {
-      return null;
+    if (Object.prototype.hasOwnProperty.call(colorCache, name)) {
+      return colorCache[name] || fallback;
     }
-  }
-
-  // The system preference is the default. A stored override is only honoured
-  // while a control exists to reverse it — see start().
-  var motionOn = !systemPrefersReduced();
-
-  function applyMotion(on) {
-    motionOn = on;
-    document.documentElement.setAttribute("data-motion", on ? "on" : "off");
-    try {
-      window.localStorage.setItem(MOTION_KEY, on ? "on" : "off");
-    } catch (e) {
-      /* preference simply does not persist */
-    }
-    for (var i = 0; i < waiting.length; i++) {
-      if (waiting[i].__annotation) waiting[i].__annotation.animate = on;
-    }
+    var value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    colorCache[name] = value;
+    return value || fallback;
   }
 
   // Chrome only. Order is irrelevant; each element is drawn independently.
@@ -191,121 +157,41 @@
   }
 
   // --------------------------------------------------------------------------
-  // Annotation: the single highlighter, drawn in once, on recorded facts only.
-  // --------------------------------------------------------------------------
-  var annotated = new WeakSet();
-  var waiting = [];
-  var revealFrame = null;
-  var revealTimer = null;
-
-  function inView(el) {
-    var r = el.getBoundingClientRect();
-    if (!r.height) return false;
-    return r.top < window.innerHeight - 16 && r.bottom > 0;
-  }
-
-  function revealVisible() {
-    revealFrame = null;
-    for (var i = waiting.length - 1; i >= 0; i--) {
-      var target = waiting[i];
-      if (!target.isConnected) {
-        waiting.splice(i, 1);
-        continue;
-      }
-      if (!inView(target)) continue;
-      waiting.splice(i, 1);
-      target.__annotation.show();
-    }
-    if (!waiting.length && revealTimer !== null) {
-      clearInterval(revealTimer);
-      revealTimer = null;
-    }
-  }
-
-  function scheduleReveal() {
-    if (revealFrame === null) revealFrame = requestAnimationFrame(revealVisible);
-    // Scroll events are the usual trigger, but a result can also come into
-    // view because the pane was resized or the log re-laid out. A cheap poll,
-    // alive only while something is still waiting, covers those cases.
-    if (revealTimer === null && waiting.length) {
-      revealTimer = setInterval(revealVisible, 300);
-    }
-  }
-
-  function markResult(notification) {
-    if (!RoughNotation || annotated.has(notification)) return;
-    annotated.add(notification);
-
-    var spans = notification.querySelectorAll("span");
-    var target = spans.length > 1 ? spans[spans.length - 1] : null;
-    if (!target) return;
-
-    var annotation = RoughNotation.annotate(target, {
-      type: "highlight",
-      color: cssColor("--highlighter", "#fde68a"),
-      multiline: true,
-      animate: motionOn,
-      animationDuration: 480,
-      iterations: 1,
-    });
-    target.__annotation = annotation;
-    waiting.push(target);
-    scheduleReveal();
-  }
-
-  function scanAnnotations(root) {
-    if (root.matches && root.matches(".note-notification.fact")) markResult(root);
-    if (!root.querySelectorAll) return;
-    var found = root.querySelectorAll(".note-notification.fact");
-    for (var i = 0; i < found.length; i++) markResult(found[i]);
-  }
-
-  // --------------------------------------------------------------------------
-  // Boot, and keep up with the nodes app.js appends as a run proceeds.
+  // Boot, and keep up with chat cards appended as a run proceeds.
   // --------------------------------------------------------------------------
   function start() {
     scan(document.body);
-    scanAnnotations(document.body);
-
-    new MutationObserver(function (mutations) {
-      for (var i = 0; i < mutations.length; i++) {
-        var added = mutations[i].addedNodes;
-        for (var j = 0; j < added.length; j++) {
-          var node = added[j];
-          if (node.nodeType !== 1 || node.classList.contains("rough-annotation")) continue;
-          scan(node);
-          scanAnnotations(node);
-        }
-      }
-    }).observe(document.body, { childList: true, subtree: true });
-
-    var motionToggle = document.getElementById("motion-toggle");
-    if (motionToggle) {
-      if (storedMotion() !== null) motionOn = storedMotion() === "on";
-      motionToggle.checked = motionOn;
-      motionToggle.addEventListener("change", function () {
-        applyMotion(motionToggle.checked);
-      });
-    }
-    applyMotion(motionOn);
 
     var log = document.getElementById("chat-messages");
-    if (log) log.addEventListener("scroll", scheduleReveal, { passive: true });
-    window.addEventListener("scroll", scheduleReveal, { passive: true });
-    window.addEventListener("resize", scheduleReveal, { passive: true });
-    window.addEventListener("nocturnomath:themechange", redrawAll);
+    if (log) {
+      new MutationObserver(function (mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          var added = mutations[i].addedNodes;
+          for (var j = 0; j < added.length; j++) {
+            var node = added[j];
+            if (node.nodeType === 1) scan(node);
+          }
+        }
+      }).observe(log, { childList: true });
+    }
+
+    window.addEventListener("nocturnomath:themechange", function () {
+      colorCache = {};
+      redrawAll();
+    });
 
     // Modals are hidden at load, so they have no measurable box until opened.
-    ["folder-modal", "history-modal"].forEach(function (id) {
-      var modal = document.getElementById(id);
-      if (!modal) return;
-      new MutationObserver(function () {
-        if (!modal.classList.contains("hidden")) {
-          var dialog = modal.querySelector(".modal-dialog");
-          if (dialog) schedule(dialog);
-        }
-      }).observe(modal, { attributes: true, attributeFilter: ["class"] });
-    });
+    var modals = document.querySelectorAll(".modal-backdrop");
+    for (var i = 0; i < modals.length; i++) {
+      (function (modal) {
+        new MutationObserver(function () {
+          if (!modal.classList.contains("hidden")) {
+            var dialog = modal.querySelector(".modal-dialog");
+            if (dialog) schedule(dialog);
+          }
+        }).observe(modal, { attributes: true, attributeFilter: ["class"] });
+      })(modals[i]);
+    }
   }
 
   if (document.readyState === "loading") {
@@ -316,10 +202,7 @@
 
   // Web fonts change measured heights; redraw once they have settled.
   if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(function () {
-      redrawAll();
-      scheduleReveal();
-    });
+    document.fonts.ready.then(redrawAll);
   }
 
   function redrawAll() {

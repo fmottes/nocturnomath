@@ -1,8 +1,9 @@
-import { elements, state } from "./state.js?v=20261117-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
-import { openLightbox } from "./ui.js?v=20261016-3";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261118-1";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261124-1";
+import { elements, state } from "./state.js?v=20261124-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20261124-2";
+import { openLightbox } from "./ui.js?v=20261124-2";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261124-2";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261124-2";
+import { agentQuery, apiJson } from "./transport.js?v=20261124-2";
 
 // ============================================================================
 // Workspace & Files Management
@@ -20,6 +21,7 @@ export function applyWorkspace(ws) {
     state.openDocumentContent = null;
     state.documentsFolder = "";
     state.sessionDefaults = null;
+    plotsGallerySignature = null;
     elements.modelSelect.value = "";
     elements.effortSelect.value = "";
     elements.sessionDefaultsStatus.textContent = "";
@@ -72,7 +74,6 @@ export function applyWorkspace(ws) {
 
 export function setSessionId(id) {
   state.currentSession = id || null;
-  if (elements.sessionIdBadge) elements.sessionIdBadge.textContent = id || "";
 }
 
 export function setContextUsage(usage) {
@@ -298,6 +299,32 @@ export function clearDraftSelection(agent) {
   agent.draftEffort = null;
 }
 
+export function syncDraftSelection(
+  agent,
+  {
+    previousProviders = state.modelProviders,
+    previousRawIds = state.modelRawIds,
+    models = state.models,
+    modelProviders = state.modelProviders,
+    modelRawIds = state.modelRawIds,
+    modelEfforts = state.modelEfforts,
+  } = {},
+) {
+  if (!agent?.draftModel && !agent?.draftRawModel) return null;
+  const draftProv = agent.draftProvider || previousProviders[agent.draftModel] || null;
+  const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv, previousRawIds);
+  const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders, modelRawIds);
+  if (!resolvedDraft) {
+    clearDraftSelection(agent);
+    return null;
+  }
+  agent.draftModel = resolvedDraft;
+  agent.draftProvider = modelProviders[resolvedDraft] || draftProv || null;
+  agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider, modelRawIds);
+  agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
+  return resolvedDraft;
+}
+
 export function setModelCatalogue(
   models = [],
   labels = {},
@@ -329,19 +356,14 @@ export function setModelCatalogue(
     modelRawIds,
   );
   for (const agent of state.agents.values()) {
-    if (agent.draftModel || agent.draftRawModel) {
-      const draftProv = agent.draftProvider || previousProviders[agent.draftModel] || null;
-      const draftRaw = agent.draftRawModel || rawModelId(agent.draftModel, draftProv, previousRawIds);
-      const resolvedDraft = resolveCatalogueModel(draftRaw, draftProv, models, modelProviders, modelRawIds);
-      if (resolvedDraft) {
-        agent.draftModel = resolvedDraft;
-        agent.draftProvider = modelProviders[resolvedDraft] || draftProv;
-        agent.draftRawModel = rawModelId(resolvedDraft, agent.draftProvider, modelRawIds);
-        agent.draftEffort = chooseEffort(modelEfforts[resolvedDraft] || [], agent.draftEffort);
-      } else {
-        clearDraftSelection(agent);
-      }
-    }
+    syncDraftSelection(agent, {
+      previousProviders,
+      previousRawIds,
+      models,
+      modelProviders,
+      modelRawIds,
+      modelEfforts,
+    });
     if (agentModels && Object.prototype.hasOwnProperty.call(agentModels, agent.agent_id)) {
       const serverAgent = agentModels[agent.agent_id];
       agent.model = serverAgent.model;
@@ -424,12 +446,11 @@ function renderRecentWorkspaces() {
 }
 
 export async function openWorkspace(path, python = null) {
-  const res = await fetch("/api/workspace", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, python }),
+  const data = await apiJson("/api/workspace", {
+    method: "POST",
+    body: { path, python },
+    fallbackError: "Unable to prepare research environment",
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || "Unable to prepare research environment");
   applyWorkspace(data.workspace);
   window.dispatchEvent(new CustomEvent("nocturnomath:workspace-opened", { detail: data.workspace }));
   return data.workspace;
@@ -502,12 +523,16 @@ function tabForPath(filePath) {
 let refreshing = false;
 export async function refreshDocuments() {
   if (!state.workspace?.is_open || refreshing || state.exiting) return;
+  if (state.ws && state.ws.readyState !== WebSocket.OPEN) return;
   refreshing = true;
   try {
-    await fetchDocuments();
     if (state.activeTab === "plots") await loadPlots();
-    else if (state.activeTab === "documents") await refreshOpenDocument();
-    else await loadDocument(state.activeDoc, "", true);
+    else if (state.activeTab === "documents") {
+      await fetchDocuments();
+      await refreshOpenDocument();
+    } else {
+      await loadDocument(state.activeDoc, "", true);
+    }
   } finally { refreshing = false; }
 }
 
@@ -528,8 +553,10 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     const res = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
     if (state.activeDoc !== filePath) return;
     if (!res.ok) {
-      showDocumentError(`File not found or empty: ${filePath}`);
-      state.documentContent = null;
+      if (!quiet) {
+        showDocumentError(`File not found or empty: ${filePath}`);
+        state.documentContent = null;
+      }
       return;
     }
     const data = await res.json();
@@ -565,7 +592,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     elements.docMetaLabel.textContent = `Updated: ${modifiedDate} (${data.size} B)`;
   } catch (e) {
     console.error("Error loading document:", e);
-    showDocumentError(`Failed to load document: ${e.message}`);
+    if (!quiet) showDocumentError(`Failed to load document: ${e.message}`);
   }
 }
 
@@ -620,8 +647,7 @@ export function rewriteEmbeddedImageUrls(container, documentPath) {
 export async function loadPlots() {
   if (!state.workspace?.is_open) return;
   try {
-    const query = state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
-    const res = await fetch(`/api/plots${query}`);
+    const res = await fetch(`/api/plots${agentQuery()}`);
     if (!res.ok) return;
     const data = await res.json();
     const plots = data.plots || [];
@@ -708,46 +734,62 @@ export function togglePlotsFilterMenu(open = elements.plotsFilterMenu.classList.
   elements.plotsFilterBtn.setAttribute("aria-expanded", String(open));
 }
 
+let plotsGallerySignature = null;
+let currentGalleryPlots = [];
+
+function createPlotCard(plot) {
+  const card = document.createElement("div");
+  card.className = "plot-card";
+  card.dataset.plotKey = `${plot.url}:${plot.modified}`;
+
+  const imgWrap = document.createElement("div");
+  imgWrap.className = "plot-card-img-wrap";
+  imgWrap.onclick = () => openLightbox(plot.url, plot.filename, currentGalleryPlots);
+
+  const img = document.createElement("img");
+  img.src = plot.url;
+  img.alt = plot.filename;
+  img.loading = "lazy";
+  imgWrap.appendChild(img);
+
+  const footer = document.createElement("div");
+  footer.className = "plot-card-footer";
+
+  const name = document.createElement("span");
+  name.className = "plot-card-name";
+  name.textContent = plot.filename;
+
+  const time = document.createElement("span");
+  time.textContent = new Date(plot.modified * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  footer.append(name, time);
+  card.append(imgWrap, footer);
+  return card;
+}
+
 export function renderPlotsGallery(plots, filtered = false) {
-  elements.plotsGrid.innerHTML = "";
-  if (!plots || !plots.length) {
+  const list = plots || [];
+  currentGalleryPlots = list;
+  const signature = JSON.stringify({
+    filtered,
+    items: list.map((p) => `${p.url}:${p.modified}`),
+  });
+  if (signature === plotsGallerySignature) return;
+  plotsGallerySignature = signature;
+
+  if (!list.length) {
     elements.plotsGrid.innerHTML = filtered
       ? `<div class="empty-state">No figures match the selected sessions.</div>`
       : `<div class="empty-state">No figures yet. Ask the agent to probe the system and produce a plot.</div>`;
     return;
   }
 
-  plots.forEach((p) => {
-    const card = document.createElement("div");
-    card.className = "plot-card";
-
-    const imgWrap = document.createElement("div");
-    imgWrap.className = "plot-card-img-wrap";
-    imgWrap.onclick = () => openLightbox(p.url, p.filename, plots);
-
-    const img = document.createElement("img");
-    img.src = p.url;
-    img.alt = p.filename;
-    img.loading = "lazy";
-    imgWrap.appendChild(img);
-
-    const footer = document.createElement("div");
-    footer.className = "plot-card-footer";
-
-    const name = document.createElement("span");
-    name.className = "plot-card-name";
-    name.textContent = p.filename;
-
-    const time = document.createElement("span");
-    time.textContent = new Date(p.modified * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-    footer.appendChild(name);
-    footer.appendChild(time);
-
-    card.appendChild(imgWrap);
-    card.appendChild(footer);
-    elements.plotsGrid.appendChild(card);
+  const existing = new Map();
+  elements.plotsGrid.querySelectorAll(".plot-card[data-plot-key]").forEach((card) => {
+    existing.set(card.dataset.plotKey, card);
   });
+  const nodes = list.map((p) => existing.get(`${p.url}:${p.modified}`) || createPlotCard(p));
+  elements.plotsGrid.replaceChildren(...nodes);
 }
 
 function showFolderPickerError(message = "") {
@@ -761,9 +803,7 @@ export async function browseFolders(path) {
   elements.folderBrowserPath.textContent = "Loading folders…";
   elements.folderList.innerHTML = "";
   try {
-    const res = await fetch(`/api/folders?path=${encodeURIComponent(path)}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const data = await apiJson(`/api/folders?path=${encodeURIComponent(path)}`);
 
     state.folderParent = data.parent;
     elements.newFolderInput.value = data.path;

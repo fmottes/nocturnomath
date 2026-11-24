@@ -1,4 +1,31 @@
-import { state } from "./state.js?v=20261117-2";
+import { state } from "./state.js?v=20261124-2";
+
+export function agentQuery(agentId = state.activeAgentId) {
+  return agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+}
+
+export async function apiJson(url, options = {}) {
+  const { fallbackError, body, headers, ...rest } = options;
+  const fetchOptions = { ...rest };
+  if (body !== undefined && typeof body !== "string") {
+    fetchOptions.headers = { "Content-Type": "application/json", ...(headers || {}) };
+    fetchOptions.body = JSON.stringify(body);
+  } else {
+    if (headers) fetchOptions.headers = headers;
+    if (body !== undefined) fetchOptions.body = body;
+  }
+  const response = await fetch(url, fetchOptions);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map((item) => item?.msg || JSON.stringify(item)).join("; ")
+      : data.detail;
+    const error = new Error(detail || fallbackError || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
 
 export function initWebSocket(onMessage, onOpen, onClose) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";

@@ -38,6 +38,8 @@ function sanitizeHtml(html) {
       continue;
     }
 
+    if (!element.attributes.length) continue;
+
     const attributes = Object.fromEntries(
       [...element.attributes].map((attribute) => [attribute.name, attribute.value])
     );

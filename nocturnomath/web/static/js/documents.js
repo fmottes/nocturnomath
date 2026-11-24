@@ -1,6 +1,7 @@
-import { elements, state } from "./state.js?v=20261117-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20260922-1";
-import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20261124-1";
+import { elements, state } from "./state.js?v=20261124-2";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20261124-2";
+import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20261124-2";
+import { agentQuery, apiJson } from "./transport.js?v=20261124-2";
 
 // ============================================================================
 // Documents tab: a folder browser for .nocturnomath/documents/ with a checkbox that
@@ -9,10 +10,6 @@ import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v
 // ============================================================================
 
 let listSignature = null;
-
-function agentQuery() {
-  return state.activeAgentId ? `?agent_id=${encodeURIComponent(state.activeAgentId)}` : "";
-}
 
 export function setDocuments(documents = [], documentsDefault = state.documentsDefault, folders = state.documentFolders) {
   state.documents = documents;
@@ -30,8 +27,8 @@ export function setDocuments(documents = [], documentsDefault = state.documentsD
   if (signature !== listSignature) {
     listSignature = signature;
     renderDocumentsList();
+    renderBreadcrumbs();
   }
-  renderBreadcrumbs();
   if (state.openDocument && !documents.some((d) => d.name === state.openDocument)) {
     showDocumentsView("list");
   }
@@ -78,13 +75,14 @@ export function navigateFolder(path) {
   state.documentsFolder = path;
   listSignature = null;
   showDocumentsView("list");
-  renderDocumentsList();
-  renderBreadcrumbs();
 }
 
 export function showDocumentsView(view) {
   state.documentsView = view;
-  if (view === "list") state.openDocument = null;
+  if (view === "list") {
+    state.openDocument = null;
+    if (listSignature === null) renderDocumentsList();
+  }
   const reading = view === "read";
   const editing = view === "edit" || view === "create";
   elements.documentsList.classList.toggle("hidden", view !== "list");
@@ -176,9 +174,7 @@ const TRASH_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" 
 async function deleteDocument(name) {
   if (!window.confirm(`Delete ${name}? This removes the file from .nocturnomath/documents/.`)) return;
   try {
-    const res = await fetch(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, { method: "DELETE" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const data = await apiJson(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, { method: "DELETE" });
     setDocuments(data.documents || [], data.documents_default, data.folders || []);
   } catch (error) {
     console.error("Unable to delete document:", error);
@@ -188,11 +184,10 @@ async function deleteDocument(name) {
 
 async function toggleIncluded(name, included, box) {
   try {
-    const res = await fetch(`/api/documents/${encodeURIComponent(name)}/include${agentQuery()}`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ included }),
+    await apiJson(`/api/documents/${encodeURIComponent(name)}/include${agentQuery()}`, {
+      method: "POST",
+      body: { included },
     });
-    if (!res.ok) throw new Error((await res.json()).detail || `HTTP ${res.status}`);
     const doc = state.documents.find((d) => d.name === name);
     if (doc) doc.included = included;
     listSignature = null;
@@ -204,17 +199,32 @@ async function toggleIncluded(name, included, box) {
 
 export async function setDocumentsDefault(enabled) {
   try {
-    const res = await fetch(`/api/documents/default${agentQuery()}`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
+    const data = await apiJson(`/api/documents/default${agentQuery()}`, {
+      method: "POST",
+      body: { enabled },
     });
-    if (!res.ok) throw new Error((await res.json()).detail || `HTTP ${res.status}`);
-    const data = await res.json();
     setDocuments(data.documents || [], data.documents_default, data.folders || []);
   } catch (error) {
     console.error("Unable to change the documents default:", error);
     elements.documentsDefaultToggle.checked = state.documentsDefault;
   }
+}
+
+function renderOpenDocument(name, data, { showView = true } = {}) {
+  const nextFolder = parentFolder(name);
+  if (nextFolder !== state.documentsFolder) {
+    state.documentsFolder = nextFolder;
+    listSignature = null;
+  }
+  state.openDocument = name;
+  state.openDocumentContent = data.content;
+  elements.documentsMarkdown.innerHTML = renderMarkdown(data.content || "", { breaks: false });
+  rewriteEmbeddedImageUrls(elements.documentsMarkdown, data.path);
+  rewriteDocumentLinks(elements.documentsMarkdown, data.path);
+  highlightBlocks(elements.documentsMarkdown);
+  renderMath(elements.documentsMarkdown);
+  if (showView) showDocumentsView("read");
+  elements.documentsMeta.textContent = `Updated: ${new Date(data.modified * 1000).toLocaleTimeString()} (${data.size} B)`;
 }
 
 export async function openDocument(name, quiet = false) {
@@ -233,16 +243,7 @@ export async function openDocument(name, quiet = false) {
   const data = await res.json();
   if (quiet && (state.openDocument !== name || window.getSelection()?.isCollapsed === false)) return;
   if (quiet && state.openDocumentContent === data.content) return;
-  state.documentsFolder = parentFolder(name);
-  state.openDocument = name;
-  state.openDocumentContent = data.content;
-  elements.documentsMarkdown.innerHTML = renderMarkdown(data.content || "", { breaks: false });
-  rewriteEmbeddedImageUrls(elements.documentsMarkdown, data.path);
-  rewriteDocumentLinks(elements.documentsMarkdown, data.path);
-  highlightBlocks(elements.documentsMarkdown);
-  renderMath(elements.documentsMarkdown);
-  if (!quiet) showDocumentsView("read");
-  elements.documentsMeta.textContent = `Updated: ${new Date(data.modified * 1000).toLocaleTimeString()} (${data.size} B)`;
+  renderOpenDocument(name, data, { showView: !quiet });
 }
 
 export function refreshOpenDocument() {
@@ -276,13 +277,10 @@ export async function saveFolder() {
   }
   const path = state.documentsFolder ? `${state.documentsFolder}/${name}` : name;
   try {
-    const res = await fetch(`/api/document-folders${agentQuery()}`, {
+    const data = await apiJson(`/api/document-folders${agentQuery()}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: { path },
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     setDocuments(data.documents || [], data.documents_default, data.folders || []);
     cancelCreateFolder();
     navigateFolder(path);
@@ -316,16 +314,17 @@ export async function saveEdit() {
     : { text };
   elements.documentsSave.disabled = true;
   try {
-    const res = await fetch(url, {
+    const data = await apiJson(url, {
       method: creating ? "POST" : "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-    if (creating) setDocuments(data.documents || [], data.documents_default, data.folders || []);
-    else await fetchDocuments();
-    await openDocument(creating ? data.name : state.openDocument);
+    if (creating) {
+      setDocuments(data.documents || [], data.documents_default, data.folders || []);
+      await openDocument(data.name);
+    } else {
+      await fetchDocuments();
+      renderOpenDocument(state.openDocument, data, { showView: true });
+    }
   } catch (error) {
     showDocumentError(error.message);
   } finally {
