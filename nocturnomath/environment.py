@@ -7,21 +7,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .auth import ALL_PROVIDER_SECRET_ENV
+
 MANAGED_RESEARCH_PACKAGES = ("ipykernel", "matplotlib", "numpy", "pandas")
 PRIVATE_APP_ENV = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-    "CODEX_ACCESS_TOKEN",
-    "CODEX_API_KEY",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
+    *ALL_PROVIDER_SECRET_ENV,
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
     "SSH_ASKPASS",
     "GIT_ASKPASS",
+)
+
+_ENV_CHECK_SCRIPT = (
+    "import sys, pathlib, platform; "
+    "assert sys.prefix != sys.base_prefix or (pathlib.Path(sys.prefix)/'conda-meta').is_dir(), "
+    "'Select a virtual or conda environment'; "
+    "import {packages}; "
+    "print(platform.python_version())"
 )
 
 
@@ -39,6 +41,17 @@ class ResearchEnvironment:
             os.path.abspath(self.workspace / Path(selected).expanduser())
         )
         managed = self.workspace / ".nocturnomath/venv/bin/python"
+
+        def check_python(packages: tuple[str, ...]) -> str:
+            output = self.command(
+                [
+                    str(self.python),
+                    "-c",
+                    _ENV_CHECK_SCRIPT.format(packages=", ".join(packages)),
+                ]
+            ).strip()
+            return output.splitlines()[-1] if output else ""
+
         if self.python == managed:
             if not self.python.exists():
                 self.command(
@@ -51,13 +64,8 @@ class ResearchEnvironment:
                     ]
                 )
             try:
-                self.command(
-                    [
-                        str(self.python),
-                        "-c",
-                        f"import {', '.join(MANAGED_RESEARCH_PACKAGES)}",
-                    ]
-                )
+                self.version = check_python(MANAGED_RESEARCH_PACKAGES)
+                return
             except ValueError:
                 # Repair an interrupted setup without asking uv to upgrade packages.
                 self.command(
@@ -70,20 +78,7 @@ class ResearchEnvironment:
                         *MANAGED_RESEARCH_PACKAGES,
                     ]
                 )
-        self.command(
-            [
-                str(self.python),
-                "-c",
-                "import sys, pathlib; assert sys.prefix != sys.base_prefix or (pathlib.Path(sys.prefix)/'conda-meta').is_dir(), 'Select a virtual or conda environment'; import ipykernel, matplotlib",
-            ]
-        )
-        self.version = self.command(
-            [
-                str(self.python),
-                "-c",
-                "import platform; print(platform.python_version())",
-            ]
-        ).strip()
+        self.version = check_python(("ipykernel", "matplotlib"))
 
     @staticmethod
     def uv():

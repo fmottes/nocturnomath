@@ -32,6 +32,35 @@ PROVIDER_METHODS: dict[ProviderId, dict[str, str]] = {
     },
 }
 
+_DIRECT_API_KEY_RULES: dict[
+    ProviderId, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+] = {
+    # (blocking boolean toggles, blocking non-empty vars, direct API key vars)
+    "anthropic": (
+        (
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ),
+        (
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        ),
+        ("ANTHROPIC_API_KEY",),
+    ),
+    "openai": (
+        (),
+        ("CODEX_ACCESS_TOKEN",),
+        ("CODEX_API_KEY", "OPENAI_API_KEY"),
+    ),
+    "google": (
+        ("GOOGLE_GENAI_USE_VERTEXAI",),
+        (),
+        ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    ),
+}
+
 _CREDENTIAL_ENV: dict[ProviderId, tuple[str, ...]] = {
     "anthropic": (
         "ANTHROPIC_API_KEY",
@@ -50,25 +79,8 @@ _CREDENTIAL_ENV: dict[ProviderId, tuple[str, ...]] = {
 }
 
 _INHERITED_ENV: dict[ProviderId, tuple[str, ...]] = {
-    "anthropic": (
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-        "ANTHROPIC_API_KEY",
-    ),
-    "openai": (
-        "CODEX_ACCESS_TOKEN",
-        "CODEX_API_KEY",
-        "OPENAI_API_KEY",
-    ),
-    "google": (
-        "GOOGLE_GENAI_USE_VERTEXAI",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-    ),
+    provider: (*toggles, *blockers, *keys)
+    for provider, (toggles, blockers, keys) in _DIRECT_API_KEY_RULES.items()
 }
 
 _PROVIDER_SECRET_ENV: dict[ProviderId, tuple[str, ...]] = {
@@ -77,13 +89,14 @@ _PROVIDER_SECRET_ENV: dict[ProviderId, tuple[str, ...]] = {
     "google": _CREDENTIAL_ENV["google"],
 }
 
+ALL_PROVIDER_SECRET_ENV: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        key for provider in PROVIDERS for key in _PROVIDER_SECRET_ENV[provider]
+    )
+)
+
 _BOOL_TOGGLE_ENV = frozenset(
-    {
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "GOOGLE_GENAI_USE_VERTEXAI",
-    }
+    name for toggles, _, _ in _DIRECT_API_KEY_RULES.values() for name in toggles
 )
 
 
@@ -94,13 +107,16 @@ def env_flag_enabled(name: str, env: Mapping[str, str] | None = None) -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
-def inherited_credential(provider: ProviderId = "anthropic") -> str | None:
+def inherited_credential(
+    provider: ProviderId = "anthropic", env: Mapping[str, str] | None = None
+) -> str | None:
     """Name the environment variable a CLI or direct HTTP client uses."""
+    source = os.environ if env is None else env
     for name in _INHERITED_ENV[provider]:
         if name in _BOOL_TOGGLE_ENV:
-            if env_flag_enabled(name):
+            if env_flag_enabled(name, source):
                 return name
-        elif (os.environ.get(name) or "").strip():
+        elif (source.get(name) or "").strip():
             return name
     return None
 
@@ -147,40 +163,18 @@ class ProviderAuth:
             return (self.credential or "").strip() or None
         if self.method != "cli":
             return None
-        if self.provider == "anthropic":
-            if any(
-                env_flag_enabled(name, source)
-                for name in (
-                    "CLAUDE_CODE_USE_BEDROCK",
-                    "CLAUDE_CODE_USE_VERTEX",
-                    "CLAUDE_CODE_USE_FOUNDRY",
-                )
-            ) or any(
-                (source.get(name) or "").strip()
-                for name in (
-                    "ANTHROPIC_AUTH_TOKEN",
-                    "CLAUDE_CODE_OAUTH_TOKEN",
-                    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-                )
-            ):
-                return None
-            return (source.get("ANTHROPIC_API_KEY") or "").strip() or None
-        if self.provider == "openai":
-            if (source.get("CODEX_ACCESS_TOKEN") or "").strip():
-                return None
-            return (
-                (source.get("CODEX_API_KEY") or "").strip()
-                or (source.get("OPENAI_API_KEY") or "").strip()
-                or None
-            )
-        if self.provider == "google":
-            if env_flag_enabled("GOOGLE_GENAI_USE_VERTEXAI", source):
-                return None
-            return (
-                (source.get("GEMINI_API_KEY") or "").strip()
-                or (source.get("GOOGLE_API_KEY") or "").strip()
-                or None
-            )
+        rule = _DIRECT_API_KEY_RULES.get(self.provider)
+        if rule is None:
+            return None
+        toggles, blockers, keys = rule
+        if any(env_flag_enabled(name, source) for name in toggles) or any(
+            (source.get(name) or "").strip() for name in blockers
+        ):
+            return None
+        for name in keys:
+            value = (source.get(name) or "").strip()
+            if value:
+                return value
         return None
 
     def sdk_env(self) -> dict[str, str]:
@@ -286,6 +280,16 @@ class AuthStore:
             elif auth.direct_api_key():
                 entries.append(f"{PROVIDER_TITLES[provider]}: API key (env)")
         return ", ".join(entries) if entries else "CLI logins (automatic)"
+
+    def short_summary_label(self) -> str:
+        entries: list[str] = []
+        for provider in PROVIDERS:
+            auth = self._providers[provider]
+            if auth.method != "cli":
+                entries.append(f"{provider}:{auth.method}")
+            elif auth.direct_api_key():
+                entries.append(f"{provider}:api_key(env)")
+        return ", ".join(entries) if entries else "cli"
 
     def public(
         self,
