@@ -583,12 +583,22 @@ def build_tools(session: "ExplorationSession"):
             "content": [{"type": "text", "text": output}, *_image_blocks(shown_encoded)]
         }
 
-    async def record_changed(kind, entry_id, text, **fields):
+    async def record_changed(
+        kind, entry_id, text, *, note: str | None = None, **fields
+    ):
         session.log_transcript(kind, entry_id=entry_id, text=text, **fields)
         await session.emit(
             "record_changed", kind=kind, entry_id=entry_id, text=text, **fields
         )
-        return _text_result(f"Recorded {entry_id}.")
+        reply = f"Recorded {entry_id}."
+        if note:
+            reply += f" {note}"
+        return _text_result(reply)
+
+    def current_session_id() -> str | None:
+        return (
+            None if session.workspace.session_pending else session.workspace.session_id
+        )
 
     @tool(
         "evidence",
@@ -608,7 +618,9 @@ def build_tools(session: "ExplorationSession"):
     async def evidence(args):
         try:
             links = session.workspace.evidence_sources(args["sources"])
-            entry_id = session.workspace.notes.add_evidence(args["text"], links)
+            entry_id = session.workspace.notes.add_evidence(
+                args["text"], links, session=current_session_id()
+            )
         except (ValueError, FileNotFoundError) as exc:
             return _failure(str(exc))
         session._results_since_note = 0
@@ -635,7 +647,7 @@ def build_tools(session: "ExplorationSession"):
     async def thought(args):
         try:
             entry_id = session.workspace.notes.add_thought(
-                args["text"], args["replaces"]
+                args["text"], args["replaces"], session=current_session_id()
             )
         except ValueError as exc:
             return _failure(str(exc))
@@ -651,12 +663,21 @@ def build_tools(session: "ExplorationSession"):
         {"entry_id": str},
     )
     async def strike_evidence(args):
+        entry_id = args["entry_id"]
         try:
-            session.workspace.notes.strike_evidence(args["entry_id"])
+            session.workspace.notes.strike_evidence(
+                entry_id, session=current_session_id()
+            )
         except ValueError as exc:
             return _failure(str(exc))
+        affected = session.workspace.notes.dependent_thoughts(entry_id)
+        note = (
+            f"Active thoughts still citing {entry_id}: {', '.join(affected)}."
+            if affected
+            else None
+        )
         return await record_changed(
-            "evidence_struck", args["entry_id"], "Evidence struck as invalid."
+            "evidence_struck", entry_id, "Evidence struck as invalid.", note=note
         )
 
     @tool(

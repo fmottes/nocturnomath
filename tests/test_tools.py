@@ -806,7 +806,8 @@ async def test_evidence_and_thought_tools_report_corrections(session):
     await tools["thought"].handler(
         {"text": "[E001] is consistent with a positive offset.", "replaces": []}
     )
-    await tools["strike_evidence"].handler({"entry_id": "E001"})
+    struck_reply = await tools["strike_evidence"].handler({"entry_id": "E001"})
+    assert "T001" in struck_reply["content"][0]["text"]
     await tools["thought"].handler(
         {
             "text": "[E001] is invalid, so the offset interpretation in [T001] lacks support.",
@@ -816,6 +817,9 @@ async def test_evidence_and_thought_tools_report_corrections(session):
     assert "<del>" in session.workspace.notes.entry("E001")
     assert "<del>" in session.workspace.notes.entry("T001")
     assert "<del>" not in session.workspace.notes.entry("T002")
+    evidence, thoughts = session.workspace.notes.records()
+    assert evidence["E001"].session == "S001"
+    assert thoughts["T002"].session == "S001"
     records = session.workspace.read_transcript(session.transcript_path)
     assert records[-1]["replaces"] == ["T001"]
     assert records[-1]["entry_id"] == "T002"
