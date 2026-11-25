@@ -99,6 +99,7 @@ export const elements = {
   btnInterrupt: document.getElementById("btn-interrupt"),
   workspacePill: document.getElementById("workspace-pill"),
   chatMessages: document.getElementById("chat-messages"),
+  btnJumpBottom: document.getElementById("btn-jump-bottom"),
   chatForm: document.getElementById("chat-form"),
   pendingPrompts: document.getElementById("pending-prompts"),
   promptInput: document.getElementById("prompt-input"),
@@ -164,4 +165,6 @@ export const elements = {
   lightboxImg: document.getElementById("lightbox-img"),
   lightboxCaption: document.getElementById("lightbox-caption"),
   lightboxClose: document.getElementById("lightbox-close"),
+  lightboxPrev: document.getElementById("lightbox-prev"),
+  lightboxNext: document.getElementById("lightbox-next"),
 };

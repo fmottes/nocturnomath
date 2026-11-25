@@ -1,11 +1,11 @@
 import { elements, state } from "./state.js";
 import { agentQuery, apiJson, initWebSocket, sendWs } from "./transport.js";
 import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, syncJumpButton } from "./chat.js";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js";
+import { refreshSendButton, setConnectionStatus, updateAgentStatus, updateKernelStatus } from "./status.js";
 import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js";
-import { cancelCreateFolder, cancelEdit, fetchDocuments, openDocument, saveEdit, saveFolder, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js";
+import { cancelCreateFolder, cancelEdit, fetchDocuments, finishEdit, flushAutosave, openDocument, saveEdit, saveFolder, scheduleAutosave, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -106,6 +106,7 @@ function restoreExplorerView(agent) {
   elements.chatMessages.scrollTop = state.followChat
     ? elements.chatMessages.scrollHeight
     : (agent.scrollTop || 0);
+  syncJumpButton(false);
 }
 
 function renderPendingPrompts(prompts = []) {
@@ -647,8 +648,19 @@ function setupEventListeners() {
       agent.scrollTop = log.scrollTop;
       agent.followChat = state.followChat;
     }
+    syncJumpButton(false);
   }, { passive: true });
-  elements.btnSettings.addEventListener("click", () => elements.settingsModal.classList.remove("hidden"));
+  elements.btnJumpBottom?.addEventListener("click", () => {
+    state.followChat = true;
+    const agent = state.agents.get(state.activeAgentId);
+    if (agent) agent.followChat = true;
+    elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+    syncJumpButton(false);
+  });
+  elements.btnSettings.addEventListener("click", () => {
+    elements.settingsModal.classList.remove("hidden");
+    elements.settingsClose.focus();
+  });
   elements.btnCompact.addEventListener("click", compactExplorer);
   [elements.btnAuth, elements.btnAuthLanding, elements.btnAuthSettings].forEach((button) => {
     button.addEventListener("click", openAuthModal);
@@ -792,14 +804,12 @@ function setupEventListeners() {
   document.addEventListener("click", (e) => {
     if (!elements.plotsFilter.contains(e.target)) togglePlotsFilterMenu(false);
   });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") togglePlotsFilterMenu(false);
-  });
 
   // Control Buttons
   elements.btnNewExplorer.addEventListener("click", createExplorer);
   elements.btnHistory.addEventListener("click", () => {
     elements.historyModal.classList.remove("hidden");
+    elements.historyModalClose.focus();
     loadSessions();
   });
   elements.btnDownloadNotebook.addEventListener("click", async () => {
@@ -886,7 +896,10 @@ function setupEventListeners() {
   document.getElementById("environment-managed").addEventListener("click", () => changeEnvironment("managed"));
 
   // Documents tab: list, reader, and editor
-  elements.documentsBack.addEventListener("click", () => showDocumentsView("list"));
+  elements.documentsBack.addEventListener("click", () => {
+    if (state.documentsView === "edit") finishEdit("list");
+    else showDocumentsView("list");
+  });
   elements.documentsNew.addEventListener("click", startCreate);
   elements.documentsNewFolder.addEventListener("click", startCreateFolder);
   elements.documentsFolderCancel.addEventListener("click", cancelCreateFolder);
@@ -900,8 +913,15 @@ function setupEventListeners() {
     e.preventDefault();
     saveEdit();
   });
+  elements.documentsEditorText.addEventListener("input", scheduleAutosave);
+  elements.documentsEditorText.addEventListener("blur", () => {
+    if (state.documentsView === "edit") flushAutosave();
+  });
   elements.documentsEditorText.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") cancelEdit();
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      cancelEdit();
+    }
   });
   elements.documentsDefaultToggle.addEventListener("change", (e) => {
     setDocumentsDefault(e.target.checked);
@@ -917,17 +937,45 @@ function setupEventListeners() {
     button.addEventListener("click", () => selectViewerTab(button.dataset.tab));
   });
 
-  // Lightbox
+  // Lightbox & modal Escape handling
   bindModalClose(elements.lightboxModal, closeLightbox, elements.lightboxClose);
+  elements.lightboxPrev?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    cycleLightbox(-1);
+  });
+  elements.lightboxNext?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    cycleLightbox(1);
+  });
   document.addEventListener("keydown", (e) => {
-    if (!isLightboxOpen()) return;
-    if (e.key === "Escape") {
+    if (isLightboxOpen()) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeLightbox();
+      } else if (e.key === "ArrowLeft") {
+        if (cycleLightbox(-1)) e.preventDefault();
+      } else if (e.key === "ArrowRight") {
+        if (cycleLightbox(1)) e.preventDefault();
+      }
+      return;
+    }
+    if (e.key !== "Escape") return;
+    if (!elements.folderModal.classList.contains("hidden")) {
       e.preventDefault();
-      closeLightbox();
-    } else if (e.key === "ArrowLeft") {
-      if (cycleLightbox(-1)) e.preventDefault();
-    } else if (e.key === "ArrowRight") {
-      if (cycleLightbox(1)) e.preventDefault();
+      closeFolderPicker();
+    } else if (!elements.authModal.classList.contains("hidden")) {
+      e.preventDefault();
+      closeAuthModal();
+    } else if (!elements.historyModal.classList.contains("hidden")) {
+      if (!state.historyLoading) {
+        e.preventDefault();
+        elements.historyModal.classList.add("hidden");
+      }
+    } else if (!elements.settingsModal.classList.contains("hidden")) {
+      e.preventDefault();
+      elements.settingsModal.classList.add("hidden");
+    } else if (!elements.plotsFilterMenu.classList.contains("hidden")) {
+      togglePlotsFilterMenu(false);
     }
   });
 
@@ -1087,6 +1135,7 @@ function openAuthModal() {
   elements.authError.classList.add("hidden");
   updateAuthForm(true);
   elements.authModal.classList.remove("hidden");
+  elements.authProvider.focus();
 }
 
 function closeAuthModal() {
@@ -1248,10 +1297,10 @@ document.addEventListener("DOMContentLoaded", () => {
   initWebSocket(
     handleServerEvent,
     () => {
-      if (state.workspace?.is_open) updateKernelStatus(true, false);
+      setConnectionStatus(true);
     },
     () => {
-      updateKernelStatus(false, false);
+      setConnectionStatus(false);
       document.getElementById("app-loading").textContent = "Connecting…";
     }
   );

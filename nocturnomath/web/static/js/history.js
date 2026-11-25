@@ -1,5 +1,5 @@
 import { elements, state } from "./state.js";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom, syncJumpButton } from "./chat.js";
 import { apiJson } from "./transport.js";
 
 // ============================================================================
@@ -154,6 +154,7 @@ export function clearChat(showWelcome = true) {
   state.currentProbeCard = null;
   state.lastProbeCard = null;
   state.probeCards.clear();
+  syncJumpButton(false);
 }
 
 // Rebuild the chat from the transcript the browser reconnected to, so a page

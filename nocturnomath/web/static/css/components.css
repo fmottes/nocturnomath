@@ -127,6 +127,7 @@
 }
 .status-dot.green { background: var(--blue); }
 .status-dot.busy { background-image: var(--hatch-dense); }
+.status-dot.reconnecting { background: transparent; border-color: var(--warn); border-style: dashed; }
 .status-dot.red { background: var(--danger); border-color: var(--danger); }
 
 /* --------------------------------------------------------------------------

@@ -20,10 +20,13 @@ function renderLightboxItem() {
 
   elements.lightboxImg.src = item.src;
   elements.lightboxImg.alt = item.caption || "Enlarged figure";
-  const position = state.lightboxItems.length > 1
+  const hasMultiple = state.lightboxItems.length > 1;
+  const position = hasMultiple
     ? ` (${state.lightboxIndex + 1}/${state.lightboxItems.length})`
     : "";
   elements.lightboxCaption.textContent = (item.caption || "Figure") + position;
+  elements.lightboxPrev?.classList.toggle("hidden", !hasMultiple);
+  elements.lightboxNext?.classList.toggle("hidden", !hasMultiple);
 }
 
 export function openLightbox(imgSrc, caption, items) {

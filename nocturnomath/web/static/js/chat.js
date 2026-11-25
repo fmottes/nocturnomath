@@ -6,8 +6,29 @@ import { rewriteDocumentLinks } from "./workspace.js";
 // ============================================================================
 // Chat UI Rendering
 // ============================================================================
+export function syncJumpButton(hasNew = false) {
+  const button = elements.btnJumpBottom;
+  if (!button) return;
+  const log = elements.chatMessages;
+  const scrollable = log.scrollHeight - log.clientHeight > 60;
+  const show = !state.followChat && scrollable;
+  button.classList.toggle("hidden", !show);
+  if (!show) {
+    button.classList.remove("has-new");
+    button.textContent = "↓ Latest";
+  } else if (hasNew) {
+    button.classList.add("has-new");
+    button.textContent = "↓ New output";
+  }
+}
+
 export function scrollChatToBottom() {
-  if (state.followChat) elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+  if (state.followChat) {
+    elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+    syncJumpButton(false);
+  } else {
+    syncJumpButton(true);
+  }
 }
 
 export function nowLabel() {

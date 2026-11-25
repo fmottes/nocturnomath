@@ -2,26 +2,25 @@ import { elements, state } from "./state.js";
 
 let kernelAlive = true;
 let kernelBusy = false;
+let wsConnected = true;
 let agentStatus = "idle";
 
 function syncInterruptButton() {
   const agentInterruptible = agentStatus === "thinking" || agentStatus === "probing" || agentStatus === "compacting";
   elements.btnInterrupt.classList.toggle(
     "hidden",
-    !(kernelAlive && kernelBusy) && !agentInterruptible,
+    !wsConnected || (!(kernelAlive && kernelBusy) && !agentInterruptible),
   );
 }
 
-// ============================================================================
-// Status Updaters
-// ============================================================================
-export function updateKernelStatus(alive, busy) {
-  kernelAlive = Boolean(alive);
-  kernelBusy = Boolean(busy);
-  if (!alive) {
+function renderKernelStatus() {
+  if (!wsConnected) {
+    elements.kernelDot.className = "status-dot reconnecting";
+    elements.kernelText.textContent = "Reconnecting…";
+  } else if (!kernelAlive) {
     elements.kernelDot.className = "status-dot red";
     elements.kernelText.textContent = "Kernel dead";
-  } else if (busy) {
+  } else if (kernelBusy) {
     elements.kernelDot.className = "status-dot busy";
     elements.kernelText.textContent = "Running code";
   } else {
@@ -29,6 +28,20 @@ export function updateKernelStatus(alive, busy) {
     elements.kernelText.textContent = "Kernel ready";
   }
   syncInterruptButton();
+}
+
+// ============================================================================
+// Status Updaters
+// ============================================================================
+export function setConnectionStatus(connected) {
+  wsConnected = Boolean(connected);
+  renderKernelStatus();
+}
+
+export function updateKernelStatus(alive, busy) {
+  kernelAlive = Boolean(alive);
+  kernelBusy = Boolean(busy);
+  renderKernelStatus();
 }
 
 // Re-derive the Send button from the current status after the model

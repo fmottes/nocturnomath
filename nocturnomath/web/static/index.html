@@ -135,20 +135,23 @@
         </div>
 
         <!-- Chat Messages -->
-        <div class="chat-messages" id="chat-messages">
-          <!-- Initial Welcome Card -->
-          <div class="message-card system-welcome" id="system-welcome">
-            <div class="welcome-header">
-              <h3>Scientific exploration mode</h3>
-            </div>
-            <p>I help you learn about systems quickly by proposing the simplest probe, executing it in the persistent Jupyter kernel, and assessing what it means.</p>
-            <div class="exploration-steps">
-              <div class="step-item"><strong>1. Idea</strong> One hypothesis and a concrete prediction</div>
-              <div class="step-item"><strong>2. Code</strong> Simplest readable probe, flat script, no machinery</div>
-              <div class="step-item"><strong>3. Result</strong> A plot or metric that answers the question</div>
-              <div class="step-item"><strong>4. Verdict</strong> Rule hypotheses in or out, plus notes</div>
+        <div class="chat-scroll-wrap">
+          <div class="chat-messages" id="chat-messages">
+            <!-- Initial Welcome Card -->
+            <div class="message-card system-welcome" id="system-welcome">
+              <div class="welcome-header">
+                <h3>Scientific exploration mode</h3>
+              </div>
+              <p>I help you learn about systems quickly by proposing the simplest probe, executing it in the persistent Jupyter kernel, and assessing what it means.</p>
+              <div class="exploration-steps">
+                <div class="step-item"><strong>1. Idea</strong> One hypothesis and a concrete prediction</div>
+                <div class="step-item"><strong>2. Code</strong> Simplest readable probe, flat script, no machinery</div>
+                <div class="step-item"><strong>3. Result</strong> A plot or metric that answers the question</div>
+                <div class="step-item"><strong>4. Verdict</strong> Rule hypotheses in or out, plus notes</div>
+              </div>
             </div>
           </div>
+          <button type="button" class="btn btn-xs chat-jump-bottom hidden" id="btn-jump-bottom" aria-label="Jump to latest messages">&darr; Latest</button>
         </div>
 
         <!-- Chat Input Form -->
@@ -397,8 +400,10 @@
     <!-- Image Lightbox Modal -->
     <div class="lightbox-backdrop hidden" id="lightbox-modal">
       <div class="lightbox-content">
-        <button class="lightbox-close" id="lightbox-close" type="button">&times;</button>
+        <button class="lightbox-close" id="lightbox-close" aria-label="Close figure" type="button">&times;</button>
+        <button class="lightbox-nav lightbox-prev hidden" id="lightbox-prev" aria-label="Previous figure" type="button">&lsaquo;</button>
         <img id="lightbox-img" src="" alt="Enlarged plot">
+        <button class="lightbox-nav lightbox-next hidden" id="lightbox-next" aria-label="Next figure" type="button">&rsaquo;</button>
         <div class="lightbox-caption" id="lightbox-caption"></div>
       </div>
     </div>

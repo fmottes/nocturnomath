@@ -10,6 +10,10 @@ import { agentQuery, apiJson } from "./transport.js";
 // ============================================================================
 
 let listSignature = null;
+const AUTOSAVE_DELAY_MS = 600;
+let autosaveTimer = null;
+let autosavePromise = null;
+let autosaveNeedsAnother = false;
 
 export function setDocuments(documents = [], documentsDefault = state.documentsDefault, folders = state.documentFolders) {
   state.documents = documents;
@@ -70,8 +74,9 @@ function renderBreadcrumbs() {
   });
 }
 
-export function navigateFolder(path) {
+export async function navigateFolder(path) {
   if (path && !state.documentFolders.includes(path)) return;
+  if (state.documentsView === "edit") await flushAutosave();
   state.documentsFolder = path;
   listSignature = null;
   showDocumentsView("list");
@@ -90,6 +95,8 @@ export function showDocumentsView(view) {
   elements.documentsMarkdown.classList.toggle("hidden", !reading);
   elements.documentsEditor.classList.toggle("hidden", !editing);
   elements.documentsEditorTitle.classList.toggle("hidden", view !== "create");
+  elements.documentsCancel.classList.toggle("hidden", view === "edit");
+  elements.documentsSave.textContent = view === "edit" ? "Done" : "Create";
   elements.documentsBack.classList.toggle("hidden", view === "list");
   elements.documentsNew.classList.toggle("hidden", view !== "list");
   elements.documentsNewFolder.classList.toggle("hidden", view !== "list");
@@ -98,7 +105,7 @@ export function showDocumentsView(view) {
   elements.documentsError.classList.add("hidden");
   elements.documentsTitle.textContent = view === "list" ? "Folder"
     : view === "create" ? "New document" : state.openDocument?.split("/").at(-1) || "";
-  if (!reading) elements.documentsMeta.textContent = "";
+  if (!reading && view !== "edit") elements.documentsMeta.textContent = "";
   renderBreadcrumbs();
 }
 
@@ -347,10 +354,96 @@ export function startModify() {
   if (!state.openDocument) return;
   elements.documentsEditorText.value = state.openDocumentContent || "";
   showDocumentsView("edit");
+  elements.documentsMeta.textContent = "Autosave on";
   elements.documentsEditorText.focus();
 }
 
-export function cancelEdit() {
+export function scheduleAutosave() {
+  if (state.documentsView !== "edit" || !state.openDocument) return;
+  clearTimeout(autosaveTimer);
+  elements.documentsMeta.textContent = "Unsaved…";
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
+    flushAutosave();
+  }, AUTOSAVE_DELAY_MS);
+}
+
+export async function flushAutosave() {
+  if (autosaveTimer !== null) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
+  if (state.documentsView !== "edit" || !state.openDocument) return null;
+  if (autosavePromise) {
+    autosaveNeedsAnother = true;
+    return autosavePromise;
+  }
+
+  const run = async () => {
+    let lastData = null;
+    do {
+      autosaveNeedsAnother = false;
+      const name = state.openDocument;
+      if (!name || state.documentsView !== "edit") break;
+      const text = elements.documentsEditorText.value;
+      if (text === state.openDocumentContent) break;
+      elements.documentsMeta.textContent = "Saving…";
+      elements.documentsError.classList.add("hidden");
+      try {
+        const data = await apiJson(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, {
+          method: "PUT",
+          body: { text },
+        });
+        lastData = data;
+        if (state.openDocument === name) {
+          state.openDocumentContent = data.content;
+          if (elements.documentsEditorText.value === data.content) {
+            elements.documentsMeta.textContent = `Saved · ${new Date(data.modified * 1000).toLocaleTimeString()}`;
+          }
+        }
+        fetchDocuments();
+      } catch (error) {
+        elements.documentsMeta.textContent = "Save failed";
+        showDocumentError(error.message);
+        throw error;
+      }
+    } while (autosaveNeedsAnother);
+    return lastData;
+  };
+
+  autosavePromise = run().finally(() => {
+    autosavePromise = null;
+  });
+  return autosavePromise;
+}
+
+export async function finishEdit(returnTo = "read") {
+  if (state.documentsView !== "edit" || !state.openDocument) {
+    showDocumentsView(returnTo === "list" ? "list" : (state.openDocument ? "read" : "list"));
+    return;
+  }
+  elements.documentsSave.disabled = true;
+  try {
+    const saved = await flushAutosave();
+    if (returnTo === "list") {
+      showDocumentsView("list");
+    } else if (saved) {
+      renderOpenDocument(state.openDocument, saved, { showView: true });
+    } else {
+      await openDocument(state.openDocument);
+    }
+  } catch {
+    // Error is already shown in #documents-error; stay in edit view.
+  } finally {
+    elements.documentsSave.disabled = false;
+  }
+}
+
+export async function cancelEdit() {
+  if (state.documentsView === "edit") {
+    await finishEdit("read");
+    return;
+  }
   showDocumentsView(state.openDocument ? "read" : "list");
 }
 
@@ -360,25 +453,19 @@ function showDocumentError(message) {
 }
 
 export async function saveEdit() {
+  if (state.documentsView === "edit") {
+    await finishEdit("read");
+    return;
+  }
   const text = elements.documentsEditorText.value;
-  const creating = state.documentsView === "create";
-  const url = creating ? `/api/documents${agentQuery()}` : `/api/documents/${encodeURIComponent(state.openDocument)}${agentQuery()}`;
-  const body = creating
-    ? { title: elements.documentsEditorTitle.value, text, folder: state.documentsFolder }
-    : { text };
   elements.documentsSave.disabled = true;
   try {
-    const data = await apiJson(url, {
-      method: creating ? "POST" : "PUT",
-      body,
+    const data = await apiJson(`/api/documents${agentQuery()}`, {
+      method: "POST",
+      body: { title: elements.documentsEditorTitle.value, text, folder: state.documentsFolder },
     });
-    if (creating) {
-      setDocuments(data.documents || [], data.documents_default, data.folders || []);
-      await openDocument(data.name);
-    } else {
-      await fetchDocuments();
-      renderOpenDocument(state.openDocument, data, { showView: true });
-    }
+    setDocuments(data.documents || [], data.documents_default, data.folders || []);
+    await openDocument(data.name);
   } catch (error) {
     showDocumentError(error.message);
   } finally {

@@ -2,7 +2,7 @@ import { elements, state } from "./state.js";
 import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js";
 import { openLightbox } from "./ui.js";
 import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js";
+import { fetchDocuments, flushAutosave, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js";
 import { agentQuery, apiJson } from "./transport.js";
 
 // ============================================================================
@@ -491,6 +491,7 @@ export function setPromptMode(mode) {
 }
 
 export function selectViewerTab(tab) {
+  if (state.documentsView === "edit") flushAutosave();
   const resetDocuments = tab === "documents" && state.activeTab === "documents";
   setViewerTab(tab);
   if (tab === "plots") return loadPlots();
@@ -841,6 +842,7 @@ export function openFolderPicker(mode = "open") {
     : "Choose another existing folder. The agent will start a fresh kernel and session using that workspace’s research environment.";
   elements.modalSubmit.textContent = opening ? "Open folder" : "Switch workspace";
   elements.folderModal.classList.remove("hidden");
+  elements.newFolderInput.focus();
   browseFolders(state.workspace?.path || state.navigatorRoot || ".");
 }
 

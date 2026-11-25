@@ -31,6 +31,28 @@
   color: var(--overlay-ink);
   cursor: pointer;
 }
+.lightbox-nav {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 10px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  font-size: 2rem;
+  line-height: 1;
+  color: var(--overlay-ink);
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.12s ease, border-color 0.12s ease;
+}
+.lightbox-nav:hover,
+.lightbox-nav:focus-visible {
+  opacity: 1;
+  border-color: var(--overlay-ink);
+  outline: none;
+}
+.lightbox-prev { left: 16px; }
+.lightbox-next { right: 16px; }
 .lightbox-caption { margin-top: 10px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--overlay-ink); }
 
 .hidden { display: none !important; }
