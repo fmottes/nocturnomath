@@ -14,6 +14,7 @@ const AUTOSAVE_DELAY_MS = 600;
 let autosaveTimer = null;
 let autosavePromise = null;
 let autosaveNeedsAnother = false;
+let lastSavedEditorText = null;
 
 export function setDocuments(documents = [], documentsDefault = state.documentsDefault, folders = state.documentFolders) {
   state.documents = documents;
@@ -353,6 +354,7 @@ export async function saveFolder() {
 export function startModify() {
   if (!state.openDocument) return;
   elements.documentsEditorText.value = state.openDocumentContent || "";
+  lastSavedEditorText = elements.documentsEditorText.value;
   showDocumentsView("edit");
   elements.documentsMeta.textContent = "Autosave on";
   elements.documentsEditorText.focus();
@@ -386,7 +388,7 @@ export async function flushAutosave() {
       const name = state.openDocument;
       if (!name || state.documentsView !== "edit") break;
       const text = elements.documentsEditorText.value;
-      if (text === state.openDocumentContent) break;
+      if (text === lastSavedEditorText || text === state.openDocumentContent) break;
       elements.documentsMeta.textContent = "Saving…";
       elements.documentsError.classList.add("hidden");
       try {
@@ -397,7 +399,8 @@ export async function flushAutosave() {
         lastData = data;
         if (state.openDocument === name) {
           state.openDocumentContent = data.content;
-          if (elements.documentsEditorText.value === data.content) {
+          lastSavedEditorText = text;
+          if (elements.documentsEditorText.value === text) {
             elements.documentsMeta.textContent = `Saved · ${new Date(data.modified * 1000).toLocaleTimeString()}`;
           }
         }
