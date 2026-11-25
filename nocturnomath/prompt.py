@@ -37,7 +37,7 @@ If the idea cannot be stated in three sentences, it is two ideas. Split it.
 - If you show a baseline or null, say in one sentence what it controls for. If you cannot
   say that, do not include it. Never invent a comparison that was not part of the idea.
 
-**4. Verdict.** Two to four sentences.
+**4. Verdict.** Two to four plain-text sentences (under ~80 words; no Markdown, lists, or TeX).
 - How good is it, or what kind of failure is it? Compare to what you expected.
 - What does this rule in or out?
 - Optionally, one next idea. One.

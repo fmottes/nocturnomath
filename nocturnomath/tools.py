@@ -684,8 +684,9 @@ def build_tools(session: "ExplorationSession"):
         "verdict",
         "Say what the last probe's result meant: how it came out against `expected`, "
         "and what it rules in or out. Every probe that produced a result needs one "
-        "before the next `run`. Two to four sentences; for a probe that only loaded "
-        "or inspected data, one line such as 'loaded as expected' is enough.",
+        "before the next `run`. Two to four plain-text sentences (under ~80 words; "
+        "no Markdown, lists, or TeX); for a probe that only loaded or inspected data, "
+        "one line such as 'loaded as expected' is enough.",
         {"text": str},
     )
     async def verdict(args):
