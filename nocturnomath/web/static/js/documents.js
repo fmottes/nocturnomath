@@ -1,7 +1,7 @@
-import { elements, state } from "./state.js?v=20261124-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20261124-2";
-import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js?v=20261124-2";
-import { agentQuery, apiJson } from "./transport.js?v=20261124-2";
+import { elements, state } from "./state.js";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js";
+import { rewriteDocumentLinks, rewriteEmbeddedImageUrls } from "./workspace.js";
+import { agentQuery, apiJson } from "./transport.js";
 
 // ============================================================================
 // Documents tab: a folder browser for .nocturnomath/documents/ with a checkbox that
@@ -127,7 +127,13 @@ function renderDocumentsList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "document-row-title";
-    button.textContent = `📁 ${path.split("/").at(-1)}`;
+    const icon = document.createElement("span");
+    icon.className = "document-folder-icon";
+    icon.innerHTML = FOLDER_ICON;
+    const label = document.createElement("span");
+    label.className = "document-folder-name";
+    label.textContent = path.split("/").at(-1);
+    button.append(icon, label);
     button.addEventListener("click", () => navigateFolder(path));
     row.append(button);
     list.append(row);
@@ -160,24 +166,72 @@ function renderDocumentsList() {
     remove.title = `Delete ${doc.name}`;
     remove.setAttribute("aria-label", `Delete ${doc.name}`);
     remove.innerHTML = TRASH_ICON;
-    remove.addEventListener("click", () => deleteDocument(doc.name));
+    remove.addEventListener("click", () => confirmDeleteDocument(row, doc.name));
 
     row.append(box, title, meta, remove);
     list.appendChild(row);
   });
 }
 
-// A small drafted bin: lid, body, two slats. Inherits the row's ink colour.
+// Drafted 1px line icons that inherit the row's ink colour.
+const FOLDER_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<path d="M2 4.2v8.3h12V5.8H7.6L6.3 4.2H2z"/></svg>';
+
 const TRASH_ICON = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">'
   + '<path d="M2.5 4.5h11M6 4.5V3h4v1.5M4 4.5l.7 9h6.6l.7-9M6.7 7v4.5M9.3 7v4.5"/></svg>';
 
-async function deleteDocument(name) {
-  if (!window.confirm(`Delete ${name}? This removes the file from .nocturnomath/documents/.`)) return;
+function clearDeleteConfirm(row) {
+  row.classList.remove("confirming-delete");
+  row.querySelector(".document-row-confirm")?.remove();
+}
+
+function confirmDeleteDocument(row, name) {
+  elements.documentsList.querySelectorAll(".document-row.confirming-delete").forEach(clearDeleteConfirm);
+  row.classList.add("confirming-delete");
+
+  const actions = document.createElement("span");
+  actions.className = "document-row-confirm";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.type = "button";
+  confirmBtn.className = "btn btn-xs btn-danger-outline";
+  confirmBtn.textContent = "Delete";
+  confirmBtn.setAttribute("aria-label", `Confirm delete ${name}`);
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn btn-xs btn-ghost";
+  cancelBtn.textContent = "Cancel";
+
+  const cancel = () => {
+    clearDeleteConfirm(row);
+    row.querySelector(".document-row-delete")?.focus();
+  };
+  cancelBtn.addEventListener("click", cancel);
+  actions.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  });
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    await deleteDocument(name, row);
+  });
+
+  actions.append(confirmBtn, cancelBtn);
+  row.append(actions);
+  confirmBtn.focus();
+}
+
+async function deleteDocument(name, row) {
   try {
     const data = await apiJson(`/api/documents/${encodeURIComponent(name)}${agentQuery()}`, { method: "DELETE" });
     setDocuments(data.documents || [], data.documents_default, data.folders || []);
   } catch (error) {
     console.error("Unable to delete document:", error);
+    if (row?.isConnected) clearDeleteConfirm(row);
     showDocumentError(error.message);
   }
 }

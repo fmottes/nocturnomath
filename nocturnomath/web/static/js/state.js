@@ -145,6 +145,7 @@ export const elements = {
   historyModalClose: document.getElementById("history-modal-close"),
   historyModalCancel: document.getElementById("history-modal-cancel"),
   sessionList: document.getElementById("session-list"),
+  historyError: document.getElementById("history-error"),
   historyLoading: document.getElementById("history-loading"),
   folderModal: document.getElementById("folder-modal"),
   modalClose: document.getElementById("modal-close"),

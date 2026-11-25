@@ -1,6 +1,6 @@
-import { elements, state } from "./state.js?v=20261124-2";
-import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js?v=20261124-2";
-import { apiJson } from "./transport.js?v=20261124-2";
+import { elements, state } from "./state.js";
+import { appendAssistantChunk, appendDocumentNotification, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, cancelAssistantDeltaRender, finalizeAssistantTurn, scrollChatToBottom } from "./chat.js";
+import { apiJson } from "./transport.js";
 
 // ============================================================================
 // Chat History (past sessions)
@@ -16,6 +16,8 @@ export function formatSessionDate(epochSeconds) {
 }
 
 export async function loadSessions() {
+  elements.historyError.textContent = "";
+  elements.historyError.classList.add("hidden");
   elements.sessionList.innerHTML = `<div class="empty-state">Loading sessions…</div>`;
   try {
     const data = await apiJson("/api/sessions");
@@ -104,6 +106,8 @@ export function renderSessions(sessions) {
 
 export async function resumeSession(sessionId, restoreKernel = false, openAgentId = null) {
   state.historyLoading = true;
+  elements.historyError.textContent = "";
+  elements.historyError.classList.add("hidden");
   elements.historyLoading.classList.remove("hidden");
   elements.historyModal.querySelectorAll("button, select").forEach((control) => {
     control.disabled = true;
@@ -126,7 +130,8 @@ export async function resumeSession(sessionId, restoreKernel = false, openAgentI
     // The chat is repainted by the "session_resumed" broadcast.
     elements.historyModal.classList.add("hidden");
   } catch (e) {
-    alert(`Failed to resume session: ${e.message}`);
+    elements.historyError.textContent = `Failed to resume session: ${e.message}`;
+    elements.historyError.classList.remove("hidden");
   } finally {
     state.historyLoading = false;
     elements.historyLoading.classList.add("hidden");

@@ -46,12 +46,6 @@
   --grain-opacity: 0.22;
   --grain-blend: multiply;
 
-  /* Legacy aliases still referenced from app.js */
-  --accent-success: var(--ok);
-  --accent-warning: var(--warn);
-  --accent-danger: var(--danger);
-  --text-secondary: var(--ink-soft);
-
   --font-hand: "Architects Daughter", "Segoe Print", cursive;
   --font-sans: Inter, "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;

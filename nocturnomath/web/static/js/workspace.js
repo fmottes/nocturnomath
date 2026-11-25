@@ -1,9 +1,9 @@
-import { elements, state } from "./state.js?v=20261124-2";
-import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js?v=20261124-2";
-import { openLightbox } from "./ui.js?v=20261124-2";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261124-2";
-import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js?v=20261124-2";
-import { agentQuery, apiJson } from "./transport.js?v=20261124-2";
+import { elements, state } from "./state.js";
+import { highlightBlocks, renderMarkdown, renderMath } from "./markdown.js";
+import { openLightbox } from "./ui.js";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js";
+import { fetchDocuments, refreshOpenDocument, setDocuments, showDocumentsView } from "./documents.js";
+import { agentQuery, apiJson } from "./transport.js";
 
 // ============================================================================
 // Workspace & Files Management

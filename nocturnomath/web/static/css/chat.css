@@ -73,11 +73,6 @@
 }
 .chat-header-actions > .chat-status-separator:first-child { margin-right: 0; }
 
-#context-control {
-  padding-right: 12px;
-  border-right: 1px solid var(--rule);
-}
-
 .chat-messages {
   flex: 1;
   overflow-y: auto;

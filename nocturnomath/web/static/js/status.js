@@ -1,4 +1,4 @@
-import { elements, state } from "./state.js?v=20261124-2";
+import { elements, state } from "./state.js";
 
 let kernelAlive = true;
 let kernelBusy = false;

@@ -1,4 +1,4 @@
-import { state } from "./state.js?v=20261124-2";
+import { state } from "./state.js";
 
 export function agentQuery(agentId = state.activeAgentId) {
   return agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";

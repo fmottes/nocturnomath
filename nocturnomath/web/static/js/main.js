@@ -1,11 +1,11 @@
-import { elements, state } from "./state.js?v=20261124-2";
-import { agentQuery, apiJson, initWebSocket, sendWs } from "./transport.js?v=20261124-2";
-import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js?v=20261124-2";
-import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js?v=20261124-2";
-import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js?v=20261124-2";
-import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js?v=20261124-2";
-import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js?v=20261124-2";
-import { cancelCreateFolder, cancelEdit, fetchDocuments, openDocument, saveEdit, saveFolder, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js?v=20261124-2";
+import { elements, state } from "./state.js";
+import { agentQuery, apiJson, initWebSocket, sendWs } from "./transport.js";
+import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js";
+import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn } from "./chat.js";
+import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js";
+import { refreshSendButton, updateAgentStatus, updateKernelStatus } from "./status.js";
+import { closeLightbox, cycleLightbox, isLightboxOpen } from "./ui.js";
+import { cancelCreateFolder, cancelEdit, fetchDocuments, openDocument, saveEdit, saveFolder, setDocuments, setDocumentsDefault, showDocumentsView, startCreate, startCreateFolder, startModify } from "./documents.js";
 
 const THEME_KEY = "nocturnomath.theme";
 
@@ -57,15 +57,12 @@ function renderExplorerTabs() {
     tab.setAttribute("role", "tab");
     tab.tabIndex = 0;
     tab.setAttribute("aria-selected", String(agent.agent_id === state.activeAgentId));
-    tab.title = `Explorer ${explorerLabel(agent)}`;
+    const labelText = explorerLabel(agent);
+    tab.title = `Explorer ${labelText}`;
+    tab.setAttribute("aria-label", `Explorer ${labelText}`);
     const title = document.createElement("span");
     title.className = "pane-title";
-    const label = document.createElement("span");
-    label.textContent = "Explorer";
-    const badge = document.createElement("span");
-    badge.className = "badge badge-sm";
-    badge.textContent = explorerLabel(agent);
-    title.append(label, badge);
+    title.textContent = labelText;
     const status = document.createElement("span");
     status.className = "explorer-tab-status";
     status.title = agent.is_busy ? "Running" : "Idle";
@@ -1158,25 +1155,55 @@ async function submitAuth(event) {
   }
 }
 
+const SPLIT_RATIO_KEY = "nocturnomath.split-ratio";
+
+function applySplitRatio(percent) {
+  elements.paneChat.style.flex = `0 0 ${percent}%`;
+  elements.paneViewer.style.flex = `0 0 ${100 - percent}%`;
+}
+
 function setupGutterResize() {
   let isDragging = false;
+  let currentRatio = null;
 
-  elements.gutter.addEventListener("mousedown", (e) => {
+  try {
+    const saved = Number.parseFloat(window.localStorage.getItem(SPLIT_RATIO_KEY) || "");
+    if (Number.isFinite(saved) && saved >= 25 && saved <= 75) {
+      currentRatio = saved;
+      applySplitRatio(saved);
+    }
+  } catch {
+    // Ignore storage errors and keep the default 50/50 split.
+  }
+
+  elements.gutter.addEventListener("mousedown", () => {
     isDragging = true;
     elements.gutter.classList.add("dragging");
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   });
 
+  elements.gutter.addEventListener("dblclick", () => {
+    currentRatio = null;
+    elements.paneChat.style.flex = "";
+    elements.paneViewer.style.flex = "";
+    try {
+      window.localStorage.removeItem(SPLIT_RATIO_KEY);
+    } catch {
+      // Ignore storage errors.
+    }
+  });
+
   window.addEventListener("mousemove", (e) => {
     if (!isDragging) return;
     const containerWidth = elements.paneChat.parentElement.clientWidth;
+    if (!containerWidth) return;
     const newLeftWidth = (e.clientX / containerWidth) * 100;
 
     // Limit resize between 25% and 75%
     if (newLeftWidth >= 25 && newLeftWidth <= 75) {
-      elements.paneChat.style.flex = `0 0 ${newLeftWidth}%`;
-      elements.paneViewer.style.flex = `0 0 ${100 - newLeftWidth}%`;
+      currentRatio = Math.round(newLeftWidth * 10) / 10;
+      applySplitRatio(currentRatio);
     }
   });
 
@@ -1186,6 +1213,13 @@ function setupGutterResize() {
       elements.gutter.classList.remove("dragging");
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      if (currentRatio !== null) {
+        try {
+          window.localStorage.setItem(SPLIT_RATIO_KEY, String(currentRatio));
+        } catch {
+          // Ignore storage errors.
+        }
+      }
     }
   });
 }

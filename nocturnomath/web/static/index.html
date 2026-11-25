@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>Nocturnomath</title>
   <meta name="description" content="Local web app dashboard for hypothesis-driven scientific exploration with persistent Jupyter kernel and live markdown reader.">
-  <script src="/static/js/theme-init.js?v=20260913-1"></script>
+  <script src="/static/js/theme-init.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -20,11 +20,11 @@
   <!-- Hand-drafted chrome: rough.js frames -->
   <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js" integrity="sha384-1NLkwxMO2sOqcq7rQkFBhIAUJtbt8ziLxhVKVgKfFGMEU8pF+GEq5LVogviveup6" crossorigin="anonymous"></script>
   <link rel="stylesheet" href="/static/css/base.css">
-  <link rel="stylesheet" href="/static/css/components.css?v=20261124-3">
+  <link rel="stylesheet" href="/static/css/components.css">
   <link rel="stylesheet" href="/static/css/layout.css">
-  <link rel="stylesheet" href="/static/css/chat.css?v=20261118-1">
+  <link rel="stylesheet" href="/static/css/chat.css">
   <link rel="stylesheet" href="/static/css/viewer.css">
-  <link rel="stylesheet" href="/static/css/modals.css?v=20261016-3">
+  <link rel="stylesheet" href="/static/css/modals.css">
   <link rel="stylesheet" href="/static/css/lightbox.css">
   <link rel="stylesheet" href="/static/css/responsive.css">
 </head>
@@ -383,6 +383,7 @@
           <div class="session-list" id="session-list">
             <div class="empty-state">Loading sessions&hellip;</div>
           </div>
+          <p class="folder-picker-error hidden" id="history-error" role="alert"></p>
           <div class="modal-actions">
             <span class="history-loading hidden" id="history-loading">Loading session...</span>
             <div class="modal-action-buttons">
@@ -494,7 +495,7 @@
     </div>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20261124-3"></script>
-  <script src="/static/js/sketch.js?v=20261124-2"></script>
+  <script type="module" src="/static/js/main.js"></script>
+  <script src="/static/js/sketch.js"></script>
 </body>
 </html>

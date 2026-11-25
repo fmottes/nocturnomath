@@ -34,6 +34,3 @@
 .lightbox-caption { margin-top: 10px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--overlay-ink); }
 
 .hidden { display: none !important; }
-
-/* Purely decorative motion, switched off by the header toggle or by the
-   system setting. Nothing here carries information on its own. */

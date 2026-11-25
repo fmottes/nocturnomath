@@ -426,6 +426,30 @@
   white-space: nowrap;
 }
 .document-row-title:hover { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }
+.document-folder-row .document-row-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.document-folder-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--blue);
+}
+.document-folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.document-row.confirming-delete .document-row-meta,
+.document-row.confirming-delete .document-row-delete { display: none; }
+.document-row-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
 .document-row-meta {
   flex-shrink: 0;
   font-family: var(--font-mono);
