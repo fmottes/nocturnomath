@@ -201,11 +201,14 @@
         </div>
 
         <!-- Document Viewer Content Area -->
-        <div class="viewer-content">
+        <div class="viewer-content" id="viewer-content">
           <!-- Document Reader Tab View -->
           <div class="tab-view active" id="view-doc">
             <div class="doc-header-info" id="doc-header-info">
-              <span class="doc-path-label" id="doc-path-label">.nocturnomath/kb/evidence.md</span>
+              <div class="doc-header-left">
+                <button class="btn btn-xs btn-ghost hidden" id="doc-back" type="button" title="Back" aria-label="Back">&larr; Back</button>
+                <span class="doc-path-label" id="doc-path-label">.nocturnomath/kb/evidence.md</span>
+              </div>
               <span class="doc-meta-label" id="doc-meta-label"></span>
             </div>
             <article class="markdown-body" id="markdown-container">

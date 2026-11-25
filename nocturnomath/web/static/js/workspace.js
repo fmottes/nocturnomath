@@ -18,6 +18,8 @@ export function applyWorkspace(ws) {
   if (state.workspace?.path !== ws.path) {
     state.documentContent = null;
     state.documentPath = null;
+    state.docHistory = [];
+    syncDocBackButton();
     state.openDocumentContent = null;
     state.documentsFolder = "";
     state.sessionDefaults = null;
@@ -490,8 +492,45 @@ export function setPromptMode(mode) {
   refreshSendButton();
 }
 
-export function selectViewerTab(tab) {
+function docHistoryLabel(entry) {
+  if (!entry) return "Back";
+  if (entry.tab === "plots") return "Figures";
+  if (entry.tab === "documents") return "Documents";
+  if (entry.path === state.workspace?.evidence_path) return "Evidence";
+  if (entry.path === state.workspace?.thoughts_path) return "Thoughts";
+  return entry.path?.split("/").at(-1) || "Back";
+}
+
+function syncDocBackButton() {
+  const button = elements.docBack;
+  if (!button) return;
+  const previous = state.docHistory.at(-1);
+  button.classList.toggle("hidden", !previous);
+  if (previous) {
+    const label = docHistoryLabel(previous);
+    button.textContent = `← ${label}`;
+    button.title = `Back to ${label}`;
+    button.setAttribute("aria-label", `Back to ${label}`);
+  }
+}
+
+export async function goBackDocument() {
+  const previous = state.docHistory.pop();
+  syncDocBackButton();
+  if (!previous) return;
+  if (previous.tab === "plots" || previous.tab === "documents") {
+    await selectViewerTab(previous.tab, { clearHistory: false });
+  } else {
+    await loadDocument(previous.path, "", false, previous.tab, { scrollTop: previous.scrollTop });
+  }
+}
+
+export function selectViewerTab(tab, { clearHistory = true } = {}) {
   if (state.documentsView === "edit") flushAutosave();
+  if (clearHistory) {
+    state.docHistory = [];
+    syncDocBackButton();
+  }
   const resetDocuments = tab === "documents" && state.activeTab === "documents";
   setViewerTab(tab);
   if (tab === "plots") return loadPlots();
@@ -537,7 +576,7 @@ export async function refreshDocuments() {
   } finally { refreshing = false; }
 }
 
-export async function loadDocument(filePath, anchor = "", quiet = false, tab = null) {
+export async function loadDocument(filePath, anchor = "", quiet = false, tab = null, { scrollTop = null } = {}) {
   if (!state.workspace?.is_open) return;
   if (!filePath) filePath = state.workspace.evidence_path;
   state.activeDoc = filePath;
@@ -564,7 +603,7 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
     const content = data.content || "";
     if (state.activeDoc !== filePath) return;
     if (quiet && window.getSelection()?.isCollapsed === false) return;
-    if (state.documentPath === filePath && state.documentContent === content && !anchor) return;
+    if (state.documentPath === filePath && state.documentContent === content && !anchor && scrollTop === null) return;
     state.documentPath = filePath;
     state.documentContent = content;
 
@@ -586,6 +625,10 @@ export async function loadDocument(filePath, anchor = "", quiet = false, tab = n
       const target = [...elements.markdownContainer.querySelectorAll("[id]")]
         .find((element) => element.id === anchor);
       target?.scrollIntoView({ block: "start" });
+    } else if (scrollTop !== null && elements.viewerContent) {
+      elements.viewerContent.scrollTop = scrollTop;
+    } else if (!quiet && elements.viewerContent) {
+      elements.viewerContent.scrollTop = 0;
     }
 
     // Metadata
@@ -622,6 +665,14 @@ export function rewriteDocumentLinks(container, documentPath) {
         if (plot) openLightbox(plot.url, plot.filename, state.plots);
         else openLightbox(link.href, path);
       } else {
+        if (path !== state.activeDoc || ["plots", "documents"].includes(state.activeTab)) {
+          state.docHistory.push({
+            path: state.activeDoc,
+            tab: state.activeTab,
+            scrollTop: elements.viewerContent?.scrollTop || 0,
+          });
+          syncDocBackButton();
+        }
         loadDocument(path, anchor);
       }
     });

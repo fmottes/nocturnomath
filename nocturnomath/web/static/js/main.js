@@ -1,6 +1,6 @@
 import { elements, state } from "./state.js";
 import { agentQuery, apiJson, initWebSocket, sendWs } from "./transport.js";
-import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js";
+import { openWorkspace, applyWorkspace, browseFolders, clearDraftSelection, closeFolderPicker, goBackDocument, loadDocument, loadPlots, openFolderPicker, rawModelId, setActiveModelAndEffort, setAuthStatus, setContextUsage, setEffortForModel, setExplorationPrompt, setModelCatalogue, setPromptMode, setSessionDefaults, selectViewerTab, refreshDocuments, setPlotsFilter, togglePlotsFilterMenu, setSessionId, syncDraftSelection } from "./workspace.js";
 import { appendAssistantChunk, appendAssistantDelta, appendDocumentNotification, appendErrorMessage, appendNoteNotification, appendProbeFinish, appendProbeStart, appendProbeVerdict, appendSystemMessage, appendUserMessage, finalizeAssistantTurn, syncJumpButton } from "./chat.js";
 import { clearChat, loadSessions, replaySession, restoreChat } from "./history.js";
 import { refreshSendButton, setConnectionStatus, updateAgentStatus, updateKernelStatus } from "./status.js";
@@ -936,6 +936,7 @@ function setupEventListeners() {
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => selectViewerTab(button.dataset.tab));
   });
+  elements.docBack?.addEventListener("click", goBackDocument);
 
   // Lightbox & modal Escape handling
   bindModalClose(elements.lightboxModal, closeLightbox, elements.lightboxClose);
