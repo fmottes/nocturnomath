@@ -9,20 +9,32 @@ Nocturnomath is a lightweight, hypothesis-driven scientific probing tool. It com
 
 ## Quick start
 
-Nocturnomath requires Python 3.12 or later, [uv](https://docs.astral.sh/uv/), and access to at least one supported provider (Anthropic, OpenAI, or Google) via either an API key (manual or environment variable, directly over HTTP with no CLI installed) or an installed provider CLI (`claude`, `codex`, or `agy`).
+1. **Install [uv](https://docs.astral.sh/uv/)** (Python 3.12+ is required; `uv` can manage it automatically).
+2. **Set up at least one model provider** (Anthropic, OpenAI, or Google):
+   - **Using a subscription:** install and sign in to the corresponding CLI — `claude` (Claude), `codex` (ChatGPT/Codex), or `agy` (Google Antigravity).
+   - **Using an API key:** no CLI is needed; export an API key or enter it in the app's **Auth** menu (`/auth` in the terminal). See [Model provider authentication](#model-provider-authentication) for details.
+3. **Install Nocturnomath** from GitHub:
 
-Install the current version directly from GitHub:
+   ```bash
+   uv tool install git+https://github.com/fmottes/nocturnomath.git
+   ```
 
-```bash
-uv tool install git+https://github.com/fmottes/nocturnomath.git
-nocturnomath
-```
+4. **Launch it** from the folder you want to work in:
 
-Update an installation made this way to the latest version:
+   ```bash
+   cd /path/to/project
+   nocturnomath
+   ```
+
+   Or pass `--path` / `-p` without changing directories (`nocturnomath --path /path/to/project`). By default, the web app confines its workspace picker to that directory tree, while `nocturnomath-cli` opens it directly.
+
+To update a `uv tool` installation later:
 
 ```bash
 uv tool upgrade nocturnomath
 ```
+
+On startup, Nocturnomath checks GitHub once for a newer version and shows an update notice when one is available; set `NOCTURNOMATH_NO_UPDATE_CHECK=1` to disable this check.
 
 For a local checkout:
 
@@ -31,19 +43,6 @@ git clone https://github.com/fmottes/nocturnomath.git
 cd nocturnomath
 uv sync
 uv run nocturnomath
-```
-
-By default, Nocturnomath uses the current directory: the web app confines its workspace picker to that directory tree, and the terminal client opens it directly. Change to the directory you want before launching:
-
-```bash
-cd /path/to/project
-nocturnomath
-```
-
-Alternatively, set that location without changing directories by passing `--path` / `-p`:
-
-```bash
-nocturnomath --path /path/to/project
 ```
 
 Both interfaces accept:
@@ -133,6 +132,7 @@ Nocturnomath stores its managed artifacts in the selected workspace:
 ```text
 .nocturnomath/
 ├── kb/
+│   ├── record.jsonl
 │   ├── evidence.md
 │   └── thoughts.md
 ├── documents/
@@ -155,7 +155,7 @@ outputs, plots, and other sensitive research context. If the selected workspace 
 version-controlled, add `.nocturnomath/` to that workspace's `.gitignore` before use;
 Nocturnomath does not modify the surrounding repository's ignore rules.
 
-`evidence.md` contains numbered observations (`E001`, `E002`, …), each limited to 250 characters plus generated source links. Observations state what happened and under which conditions. `thoughts.md` contains numbered interpretations (`T001`, `T002`, …), usually one 80–150-word paragraph, with citations such as `[E001]` and `[T001]`.
+`kb/record.jsonl` is the append-only source of truth for the scientific record, and `evidence.md` and `thoughts.md` are Markdown views rendered from it. `evidence.md` lists numbered observations (`E001`, `E002`, …), each limited to 250 characters plus generated source links, stating what happened and under which conditions. `thoughts.md` lists numbered interpretations (`T001`, `T002`, …), usually one 80–150-word paragraph, with citations such as `[E001]` and `[T001]`.
 
 Evidence links to its probe output or plots, code, and run metadata. The web reader follows citations and opens those artifacts; `/notes`, `/docs`, and `/plots` expose them in the terminal.
 
